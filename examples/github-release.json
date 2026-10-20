@@ -1,0 +1,23 @@
+{
+  "title": "deepseek-harness 动态",
+  "icon": "📦",
+  "height": "auto",
+  "sources": [],
+  "agent": {
+    "instruction": "查看 GitHub 仓库 deepseek-ai/deepseek-harness 的最新 release（https://api.github.com/repos/deepseek-ai/deepseek-harness/releases/latest）和 star 数（https://api.github.com/repos/deepseek-ai/deepseek-harness）。提交 {\"stars\": 数字, \"release\": {\"tag\": 字符串, \"name\": 字符串, \"date\": ISO 时间, \"url\": 网址, \"highlights\": [最多 3 条一句话要点]}}。highlights 用中文概括 release notes。",
+    "everyMinutes": 360
+  },
+  "html": "<div class=\"head\"><span class=\"tag\">—</span><span class=\"stars\"></span></div>\n<a class=\"name\" href=\"#\"></a>\n<ul class=\"hl\"></ul>",
+  "css": ".head{display:flex;justify-content:space-between;align-items:baseline}\n.tag{font-size:18px;font-weight:650;font-family:var(--pad-mono)}\n.stars{color:var(--pad-fg-2);font-size:12px;font-variant-numeric:tabular-nums}\n.name{display:block;margin-top:2px;font-size:12px}\n.hl{margin:8px 0 0;padding-left:16px;color:var(--pad-fg-2);font-size:12px}\n.hl li+li{margin-top:3px}",
+  "script": "dsh.onData((data) => {\n  const d = data.agent && data.agent.value\n  if (!d) return\n  document.querySelector('.tag').textContent = d.release.tag\n  document.querySelector('.stars').textContent = '★ ' + dsh.fmt.number(d.stars)\n  const a = document.querySelector('.name')\n  a.textContent = d.release.name + ' · ' + dsh.fmt.ago(d.release.date)\n  a.href = d.release.url\n  document.querySelector('.hl').innerHTML = (d.release.highlights || []).map((h) => '<li>' + dsh.escape(h) + '</li>').join('')\n})",
+  "data": {
+    "stars": 249184,
+    "release": {
+      "tag": "v0.2.1-alpha.2",
+      "name": "DeepSeek Harness 0.2.1 alpha 2",
+      "date": "2026-10-12T09:30:00Z",
+      "url": "https://github.com/deepseek-ai/deepseek-harness/releases",
+      "highlights": ["示例数据：插件 HMR 更稳定", "示例数据：Web 端右栏改版", "示例数据：修复若干审批问题"]
+    }
+  }
+}

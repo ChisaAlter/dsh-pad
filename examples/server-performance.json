@@ -1,0 +1,17 @@
+{
+  "title": "服务器性能",
+  "icon": "🖥️",
+  "height": "auto",
+  "sources": [
+    {
+      "id": "host",
+      "kind": "command",
+      "parse": "json",
+      "intervalSec": 3,
+      "command": "read _ u n s i w q sq _ < /proc/stat; set -- $(free -b | awk 'NR==2{print $2, $7}'); mt=$1; ma=$2; set -- $(df -B1 / | awk 'NR==2{print $2, $3}'); dt=$1; du=$2; read l1 l5 l15 _ < /proc/loadavg; read up _ < /proc/uptime; printf '{\"cpu\":[%s,%s],\"mem\":[%s,%s],\"disk\":[%s,%s],\"load\":[%s,%s,%s],\"cores\":%s,\"uptime\":%s}' $((u+n+s+q+sq)) $((u+n+s+i+w+q+sq)) $mt $ma $dt $du $l1 $l5 $l15 $(nproc) $up"
+    }
+  ],
+  "html": "<div class=\"grid\">\n  <section class=\"row\" id=\"cpu\"><div class=\"k\">CPU</div><div class=\"v\">—</div><div class=\"spark\"></div></section>\n  <section class=\"row\" id=\"mem\"><div class=\"k\">内存</div><div class=\"v\">—</div><div class=\"bar\"></div><div class=\"sub\"></div></section>\n  <section class=\"row\" id=\"disk\"><div class=\"k\">磁盘 /</div><div class=\"v\">—</div><div class=\"bar\"></div><div class=\"sub\"></div></section>\n  <section class=\"row\" id=\"load\"><div class=\"k\">负载</div><div class=\"v\">—</div><div class=\"sub\"></div></section>\n</div>\n<p class=\"err\" hidden></p>",
+  "css": ".grid{display:grid;gap:10px}\n.row{display:grid;grid-template-columns:1fr auto;align-items:baseline;row-gap:4px}\n.k{color:var(--pad-fg-2);font-size:12px}\n.v{font-size:15px;font-weight:600;font-variant-numeric:tabular-nums}\n.spark,.bar,.sub{grid-column:1/-1}\n.sub{color:var(--pad-fg-3);font-size:11px;font-variant-numeric:tabular-nums}\n.err{margin:8px 0 0;color:var(--pad-danger);font-size:12px}",
+  "script": "const $ = (sel) => document.querySelector(sel)\nfunction cpuPercent() {\n  const h = dsh.history('host')\n  const out = []\n  for (let i = 1; i < h.length; i++) {\n    const [b0, t0] = h[i - 1].value.cpu, [b1, t1] = h[i].value.cpu\n    if (t1 > t0) out.push((b1 - b0) / (t1 - t0))\n  }\n  return out\n}\ndsh.onData((data) => {\n  const r = data.sources.host\n  const err = $('.err')\n  if (!r) return\n  if (!r.ok) { err.hidden = false; err.textContent = r.error; return }\n  err.hidden = true\n  const v = r.value\n  const cpu = cpuPercent()\n  const now = cpu.length ? cpu[cpu.length - 1] : null\n  $('#cpu .v').textContent = now == null ? '…' : dsh.fmt.percent(now)\n  $('#cpu .v').style.color = now == null ? '' : dsh.tone(now)\n  $('#cpu .spark').innerHTML = dsh.chart.sparkline(cpu.map((x) => x * 100), { width: 280, height: 30, min: 0, max: 100 })\n  const [mt, ma] = v.mem, mu = (mt - ma) / mt\n  $('#mem .v').textContent = dsh.fmt.percent(mu)\n  $('#mem .bar').innerHTML = dsh.chart.bar(mu)\n  $('#mem .sub').textContent = dsh.fmt.bytes(mt - ma) + ' / ' + dsh.fmt.bytes(mt)\n  const [dt, du] = v.disk, df = du / dt\n  $('#disk .v').textContent = dsh.fmt.percent(df)\n  $('#disk .bar').innerHTML = dsh.chart.bar(df)\n  $('#disk .sub').textContent = dsh.fmt.bytes(du) + ' / ' + dsh.fmt.bytes(dt)\n  const [l1, l5, l15] = v.load\n  $('#load .v').textContent = l1.toFixed(2)\n  $('#load .v').style.color = dsh.tone(l1 / v.cores)\n  $('#load .sub').textContent = '5 分钟 ' + l5.toFixed(2) + ' · 15 分钟 ' + l15.toFixed(2) + ' · ' + v.cores + ' 核 · 已运行 ' + dsh.fmt.duration(v.uptime)\n})"
+}

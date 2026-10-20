@@ -1,0 +1,21 @@
+{
+  "title": "DeepSeek 余额",
+  "icon": "💳",
+  "height": "auto",
+  "sources": [
+    {
+      "id": "balance",
+      "kind": "http",
+      "parse": "json",
+      "intervalSec": 600,
+      "url": "https://api.deepseek.com/user/balance",
+      "headers": {
+        "Authorization": "Bearer {{env:DEEPSEEK_API_KEY}}",
+        "Accept": "application/json"
+      }
+    }
+  ],
+  "html": "<div class=\"top\"><div class=\"num\">—</div><span class=\"state\"></span></div>\n<div class=\"parts\"></div>",
+  "css": ".top{display:flex;align-items:baseline;justify-content:space-between;gap:8px}\n.num{font-size:24px;font-weight:650;letter-spacing:-.01em;font-variant-numeric:tabular-nums}\n.state{font-size:11px;padding:1px 7px;border-radius:999px;background:var(--pad-bg-2);color:var(--pad-fg-2)}\n.state.bad{color:var(--pad-danger)}\n.parts{display:grid;grid-template-columns:1fr auto;gap:2px 12px;margin-top:6px;font-size:12px;color:var(--pad-fg-2);font-variant-numeric:tabular-nums}\n.parts b{font-weight:500;color:var(--pad-fg)}\n.err{color:var(--pad-danger);font-size:12px}",
+  "script": "const sym = { CNY: '¥', USD: '$' }\ndsh.onData((data) => {\n  const r = data.sources.balance\n  if (!r) return\n  const num = document.querySelector('.num'), state = document.querySelector('.state'), parts = document.querySelector('.parts')\n  if (!r.ok) { num.textContent = '—'; state.textContent = ''; parts.innerHTML = '<span class=\"err\">' + dsh.escape(r.error) + '</span>'; return }\n  const info = (r.value.balance_infos || [])[0]\n  if (!info) { num.textContent = '—'; return }\n  const s = sym[info.currency] || info.currency + ' '\n  num.textContent = s + Number(info.total_balance).toFixed(2)\n  state.textContent = r.value.is_available ? '可用' : '余额不足'\n  state.className = 'state' + (r.value.is_available ? '' : ' bad')\n  parts.innerHTML = '<span>充值余额</span><b>' + s + dsh.escape(info.topped_up_balance) + '</b><span>赠送余额</span><b>' + s + dsh.escape(info.granted_balance) + '</b>'\n})"
+}
