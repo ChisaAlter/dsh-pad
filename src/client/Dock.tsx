@@ -7,7 +7,7 @@ import { composer } from './composer.ts'
 import type { PadKey } from './locales.ts'
 import { MAX_CAPSULE_Y, MAX_WIDTH, MIN_CAPSULE_Y, MIN_DOCK_HEIGHT, MIN_WIDTH, type PadClient, type PanelRowLayout } from './pad-client.ts'
 import type { HistoryPoint } from './pad-client.ts'
-import type { PanelView } from '../shared/types.ts'
+import type { PanelView, PadUpdateInfo } from '../shared/types.ts'
 import { PanelCard, type Translate, needsAttention } from './PanelCard.tsx'
 import { PanelFrame } from './PanelFrame.tsx'
 import { type ThemeSnapshot, readTheme, watchTheme } from './theme.ts'
@@ -38,6 +38,8 @@ const Icon = {
   grid: <svg viewBox="0 0 16 16" aria-hidden="true"><rect x="2" y="2" width="5" height="5" rx="1.2" /><rect x="9" y="2" width="5" height="5" rx="1.2" /><rect x="2" y="9" width="5" height="5" rx="1.2" /><rect x="9" y="9" width="5" height="5" rx="1.2" /></svg>,
   plus: <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 3v10M3 8h10" /></svg>,
   refresh: <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M13.5 8a5.5 5.5 0 1 1-1.6-3.9M13.5 2.5v3h-3" /></svg>,
+  download: <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 2.5v7.2M5 7l3 3 3-3M3 13.5h10" /></svg>,
+  close: <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M4 4l8 8M12 4l-8 8" /></svg>,
   collapse: <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M6 3.5L10.5 8 6 12.5" /></svg>,
   expand: <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M10 3.5L5.5 8 10 12.5" /></svg>,
 }
@@ -122,6 +124,10 @@ export function createDock(client: PadClient) {
     const [rows, setRows] = useState<PanelRowLayout[]>(snapshotRows)
     const [focusedId, setFocusedId] = useState<string>()
     const [closing, setClosing] = useState(false)
+    const [update, setUpdate] = useState<PadUpdateInfo>()
+    const [updateOpen, setUpdateOpen] = useState(false)
+    const [updateBusy, setUpdateBusy] = useState(false)
+    const [updateError, setUpdateError] = useState<string>()
     const closeTimer = useRef<ReturnType<typeof setTimeout>>()
     const focusedView = focusedId === undefined ? undefined : snap.panels.find(panel => panel.id === focusedId)
     const now = useNow(10_000)
@@ -203,6 +209,45 @@ export function createDock(client: PadClient) {
       const timer = setTimeout(() => setNotice(undefined), 4000)
       return () => clearTimeout(timer)
     }, [notice])
+
+    useEffect(() => {
+      let alive = true
+      const load = async (force: boolean): Promise<void> => {
+        try {
+          const info = await client.checkUpdate(force)
+          if (alive) setUpdate(info)
+        } catch {
+          // An older Host without the update route simply has no update info.
+        }
+      }
+      void load(false)
+      const timer = setInterval(() => void load(false), 30 * 60 * 1000)
+      return () => {
+        alive = false
+        clearInterval(timer)
+      }
+    }, [client])
+
+    const checkUpdate = async (force: boolean): Promise<void> => {
+      setUpdateBusy(true)
+      setUpdateError(undefined)
+      try {
+        setUpdate(await client.checkUpdate(force))
+      } catch (error) {
+        setUpdateError(error instanceof Error ? error.message : String(error))
+      } finally {
+        setUpdateBusy(false)
+      }
+    }
+
+    const applyUpdate = async (): Promise<void> => {
+      setUpdateBusy(true)
+      setUpdateError(undefined)
+      const result = await client.applyUpdate()
+      if (result.update !== undefined) setUpdate(result.update)
+      if (!result.ok) setUpdateError(t('update.applyFailed', { error: result.error ?? 'unknown' }))
+      setUpdateBusy(false)
+    }
 
     const ask = (text: string, submit: boolean, insert = false): boolean => {
       const result = insert ? composer.insert(text) : composer.fill(text, submit)
@@ -558,9 +603,62 @@ export function createDock(client: PadClient) {
             <button type="button" className="dshpad-icon-btn" title={t('dock.refreshAll')} aria-label={t('dock.refreshAll')}
               disabled={snap.panels.length === 0}
               onClick={() => { for (const panel of snap.panels) void client.act({ op: 'refresh', panelId: panel.id }) }}>{Icon.refresh}</button>
+            <button type="button" className={`dshpad-icon-btn dshpad-update-btn${update?.available ? ' has-update' : ''}`}
+              title={t('update.tooltip')} aria-label={t('update.tooltip')}
+              onClick={() => { setUpdateOpen(open => !open); if (update === undefined) void checkUpdate(false) }}>
+              {Icon.download}
+              {update?.available ? <i className="dshpad-dot" aria-hidden="true" /> : null}
+            </button>
             <button type="button" className="dshpad-collapse" title={t('dock.collapse')} aria-label={t('dock.collapse')}
               onClick={collapse}>{Icon.collapse}</button>
           </header>
+
+          {updateOpen
+            ? (
+              <section className="dshpad-update" role="dialog" aria-label={t('update.title')}>
+                <div className="dshpad-update-head">
+                  <strong>{update?.available ? t('update.available') : t('update.title')}</strong>
+                  <button type="button" className="dshpad-update-close" title={t('common.close')} aria-label={t('common.close')}
+                    onClick={() => setUpdateOpen(false)}>{Icon.close}</button>
+                </div>
+                {update === undefined
+                  ? <p className="dshpad-update-text">{t('update.unavailable')}</p>
+                  : update.applied !== undefined
+                    ? <p className="dshpad-update-text is-ok">{t('update.applied', { version: update.applied })}</p>
+                    : update.reason === 'disabled'
+                      ? <p className="dshpad-update-text">{t('update.disabled')}</p>
+                      : update.reason === 'error'
+                        ? <p className="dshpad-update-text is-error">{t('update.failed', { error: update.error ?? '' })}</p>
+                        : update.available
+                          ? (
+                            <>
+                              <p className="dshpad-update-text">
+                                {t('update.current', { current: update.current })}
+                                {update.latest === undefined ? '' : ` → ${t('update.latest', { latest: update.latest })}`}
+                              </p>
+                              {update.reason === 'source' ? <p className="dshpad-update-text">{t('update.source')}</p> : null}
+                            </>
+                            )
+                          : <p className="dshpad-update-text">{t('update.upToDate', { version: update.current })}</p>}
+                {updateError === undefined ? null : <p className="dshpad-update-text is-error">{updateError}</p>}
+                <div className="dshpad-update-actions">
+                  {update?.available === true && update.canApply
+                    ? <button type="button" className="dshpad-update-primary" disabled={updateBusy} onClick={() => void applyUpdate()}>
+                        {updateBusy ? t('update.applying') : t('update.apply')}
+                      </button>
+                    : (
+                      <button type="button" className="dshpad-update-secondary" disabled={updateBusy} onClick={() => void checkUpdate(true)}>
+                        {updateBusy ? t('update.checking') : t('update.check')}
+                      </button>
+                      )}
+                  {update?.url === undefined
+                    ? null
+                    : <a className="dshpad-update-link" href={update.url} target="_blank" rel="noreferrer">{t('update.release')}</a>}
+                  <button type="button" className="dshpad-update-secondary" onClick={() => setUpdateOpen(false)}>{t('update.later')}</button>
+                </div>
+              </section>
+              )
+            : null}
 
           {snap.loaded && !snap.connected ? <p className="dshpad-banner">{t('dock.offline')}</p> : null}
           {notice ? <p className="dshpad-banner">{notice}</p> : null}

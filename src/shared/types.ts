@@ -162,6 +162,39 @@ export interface PanelRunResult {
   readonly error?: string
 }
 
+/** Why the updater has (or has not) found a newer release. */
+export type PadUpdateReason =
+  | 'disabled'
+  | 'unchecked'
+  | 'up-to-date'
+  | 'available'
+  | 'source'
+  | 'applied'
+  | 'error'
+
+/** Update state shown by the dock; replacing files is a separate click. */
+export interface PadUpdateInfo {
+  readonly current: string
+  readonly latest?: string
+  readonly available: boolean
+  readonly canApply: boolean
+  readonly reason: PadUpdateReason
+  readonly url?: string
+  readonly notes?: string
+  readonly checkedAt?: string
+  readonly error?: string
+  /** Version written to disk; it takes effect after dsh restarts. */
+  readonly applied?: string
+  readonly requiresRestart?: boolean
+}
+
+/** Result of checking or applying an update. */
+export interface PadUpdateResponse {
+  readonly ok: boolean
+  readonly update: PadUpdateInfo
+  readonly error?: string
+}
+
 /** Server-sent events on `/api/dsh-pad.stream`. */
 export type StreamEvent =
   | { readonly type: 'panels', readonly panels: readonly PanelView[] }
@@ -184,4 +217,5 @@ export const ROUTES = {
   action: '/api/dsh-pad.action',
   models: '/api/dsh-pad.models',
   run: '/api/dsh-pad.run',
+  update: '/api/dsh-pad.update',
 } as const

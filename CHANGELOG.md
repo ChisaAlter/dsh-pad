@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.0 — 2026-10-20
+
+- 自动检查 GitHub Release：启动约 7 秒后查一次，之后每 6 小时一次；坞顶下载图标出现圆点。
+- 点击更新：下载 Release 里构建好的 `lib/`，先备份到 `.dsh-pad-update-backup/`；重启 dsh 生效。
+- 开发目录（含 `.git/`）只提示新版本，不覆盖源码。
+- 新增 `updateCheck` / `updateCheckHours` 配置。
+- README 增加 Linux.do（L 站）致谢。
+
 ## 0.1.1 — 2026-10-20
 
 首个公开版本。

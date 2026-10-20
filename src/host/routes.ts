@@ -6,6 +6,8 @@
  * - GET  /api/dsh-pad.stream?watch=id,id — server-sent events; polling runs
  *   for the watched panels while the stream is open.
  * - POST /api/dsh-pad.action — user actions from the dock.
+ * - GET  /api/dsh-pad.update — latest GitHub release vs the loaded version.
+ * - POST /api/dsh-pad.update — `check` or `apply` (downloads the release).
  */
 import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-client-connection'
@@ -15,6 +17,7 @@ import type { DataHub, Subscriber } from './hub.ts'
 import { assertModel, modelCatalog } from './models.ts'
 import { PanelRunner, type PanelRunOptions } from './run.ts'
 import { PanelNotFoundError, type PanelStore } from './store.ts'
+import type { UpdateService } from './update.ts'
 
 const HEARTBEAT_MS = 20_000
 
@@ -74,13 +77,14 @@ export interface RouteDeps {
   readonly hub: DataHub
   readonly refresher: AgentRefresher | undefined
   readonly runOptions?: PanelRunOptions
+  readonly update?: UpdateService
 }
 
 /**
  * Register the routes; each registration is a Cordis effect removed on unload.
  * @param deps - services.
  */
-export function registerRoutes({ ctx, store, hub, runOptions }: RouteDeps): void {
+export function registerRoutes({ ctx, store, hub, runOptions, update }: RouteDeps): void {
   const connection = ctx.connection
   const runner = new PanelRunner(ctx, runOptions)
 
@@ -154,6 +158,30 @@ export function registerRoutes({ ctx, store, hub, runOptions }: RouteDeps): void
     requestBody: 'buffered',
     fetch: async () => json(await modelCatalog(ctx)),
   }), 'dsh-pad: models route')
+
+  if (update !== undefined) {
+    ctx.effect(() => connection.fetch.register({
+      path: ROUTES.update,
+      methods: ['GET', 'POST'],
+      requestBody: 'buffered',
+      fetch: async (request) => {
+        if (request.method === 'GET') {
+          const force = new URL(request.url).searchParams.get('force') === '1'
+          return json(force ? await update.check(true) : await update.ensure())
+        }
+        let body: unknown
+        try {
+          body = await request.json()
+        } catch {
+          body = undefined
+        }
+        const action = typeof body === 'object' && body !== null ? (body as Record<string, unknown>)['action'] : undefined
+        if (action === 'check') return json(await update.check(true))
+        if (action === 'apply') return json(await update.apply())
+        return json({ ok: false, error: 'unknown update action' }, 400)
+      },
+    }), 'dsh-pad: update route')
+  }
 
   ctx.effect(() => connection.fetch.register({
     path: ROUTES.run,

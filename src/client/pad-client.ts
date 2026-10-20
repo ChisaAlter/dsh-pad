@@ -3,7 +3,7 @@
  * per-source reading history, and the dock's own view state (expanded,
  * width, capsule position) persisted per device.
  */
-import { type Json, type PanelAction, type PanelData, type PanelModelCatalog, type PanelRunResult, type PanelView, ROUTES, type StreamEvent } from '../shared/types.ts'
+import { type Json, type PanelAction, type PanelData, type PanelModelCatalog, type PanelRunResult, type PanelView, type PadUpdateInfo, ROUTES, type StreamEvent } from '../shared/types.ts'
 
 export const HISTORY_LIMIT = 120
 
@@ -248,6 +248,33 @@ export class PadClient {
         ok: body.ok === true,
         ...(typeof body.text === 'string' ? { text: body.text } : {}),
         ...(typeof body.error === 'string' ? { error: body.error } : {}),
+      }
+    } catch (error) {
+      return { ok: false, error: error instanceof Error ? error.message : String(error) }
+    }
+  }
+
+  /** Latest GitHub release compared with the version loaded by the Host. */
+  async checkUpdate(force = false): Promise<PadUpdateInfo> {
+    const response = await fetch(`${routeUrl(ROUTES.update)}${force ? '?force=1' : ''}`, { credentials: 'same-origin' })
+    if (!response.ok) throw new Error(`HTTP ${response.status}`)
+    return await response.json() as PadUpdateInfo
+  }
+
+  /** Download the release and replace this plugin; the next dsh start loads it. */
+  async applyUpdate(): Promise<{ ok: boolean, error?: string, update?: PadUpdateInfo }> {
+    try {
+      const response = await fetch(routeUrl(ROUTES.update), {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ action: 'apply' }),
+        credentials: 'same-origin',
+      })
+      const body = await response.json().catch(() => ({})) as { ok?: boolean, error?: string, update?: PadUpdateInfo }
+      return {
+        ok: response.ok && body.ok === true,
+        ...(typeof body.error === 'string' ? { error: body.error } : {}),
+        ...(body.update === undefined ? {} : { update: body.update }),
       }
     } catch (error) {
       return { ok: false, error: error instanceof Error ? error.message : String(error) }

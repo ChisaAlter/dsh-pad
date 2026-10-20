@@ -6,6 +6,7 @@
  */
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-agent'
 import type {} from '@deepseek-ai/dsh-client-connection'
@@ -17,6 +18,7 @@ import { DataHub } from './host/hub.ts'
 import { registerRoutes } from './host/routes.ts'
 import { PanelStore } from './host/store.ts'
 import { registerTools } from './host/tools.ts'
+import { readPluginVersion, UpdateService } from './host/update.ts'
 
 export const name = 'dsh-pad'
 export const inject = ['tools', 'connection']
@@ -46,6 +48,10 @@ export interface Config {
   runMaxTokens: number
   /** Concurrent `dsh.run` calls allowed for one panel. */
   runConcurrency: number
+  /** Check the GitHub release feed in the background. */
+  updateCheck: boolean
+  /** Hours between automatic update checks. */
+  updateCheckHours: number
 }
 
 export const Config: Schema<Config> = Schema.object({
@@ -61,6 +67,8 @@ export const Config: Schema<Config> = Schema.object({
   runTimeoutSec: Schema.natural().min(5).max(300).default(120).description('一次 dsh.run 最多用多久（秒）'),
   runMaxTokens: Schema.natural().min(128).default(2048).description('一次 dsh.run 最多生成多少 token'),
   runConcurrency: Schema.natural().min(1).max(8).default(2).description('同一张面板同时进行的 dsh.run 数量'),
+  updateCheck: Schema.boolean().default(true).description('启动后在后台检查 dsh-pad 的 GitHub 最新 Release'),
+  updateCheckHours: Schema.natural().min(1).max(168).default(6).description('自动检查更新的间隔（小时）'),
 })
 
 function defaultDataFile(): string {
@@ -128,11 +136,24 @@ async function start(ctx: Context, config: Config): Promise<void> {
     }
   }, 'dsh-pad: schedulers')
 
+  const root = fileURLToPath(new URL('../', import.meta.url))
+  const update = new UpdateService({
+    current: await readPluginVersion(root),
+    root,
+    enabled: config.updateCheck,
+    checkHours: config.updateCheckHours,
+  })
+  ctx.effect(() => {
+    update.start()
+    return () => update.dispose()
+  }, 'dsh-pad: updater')
+
   registerRoutes({
     ctx,
     store,
     hub,
     refresher,
+    update,
     runOptions: {
       enabled: config.interactiveModel,
       timeoutMs: config.runTimeoutSec * 1000,

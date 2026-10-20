@@ -9,6 +9,7 @@
 - **悬浮坞**：右侧一个可拖动的胶囊，点开是面板列表。宽屏下展开时会给对话区让出位置，不会挡住输入框；可以拖左边缘调宽度，拖标题栏整体上下移动，拖上、下边缘调整整体高度（收起后胶囊停在同一个高度，位置记在浏览器里）。
 - **AI 生成**：模型通过 `pad_*` 工具创建和修改面板。面板是跑在沙箱 iframe 里的 HTML / CSS / JS，颜色跟随 dsh 的亮色 / 暗色主题。
 - **自由平铺**：把一张卡片拖到另一张上，两张自动并排、默认各占一半；中间分隔条拖动调比例，一行最多 3 张。不会再出现自由定位的重叠和大段空隙。
+- **自动检查更新**：启动后在后台查 GitHub 最新 Release（默认每 6 小时）；有新版本时坞顶下载图标出现圆点，点开即可更新，重启 dsh 生效。开发目录安装只提示、不覆盖源码。
 - **两种取数方式**
   - **直接数据源**：在本机跑 shell 命令，或者从本机请求 HTTP 接口，按秒级间隔刷新，不消耗 token。适合服务器性能、套餐余额这类接口数据。
   - **AI 刷新**：按间隔在后台跑一轮 agent，让它重新取数后提交。适合只能靠搜索、读网页、多步推理才拿得到的数据。
@@ -37,6 +38,17 @@ dsh plugin --profile web add github:ChisaAlter/dsh-pad#2b2bb06eccd091995ffbfba17
 `lib/index.js` 与 `lib/client.js` 是唯一的运行入口，本仓库把它们提交进 git，就是为了让 GitHub 安装不依赖构建脚本（pnpm 会默认拒绝执行依赖的构建脚本）。改了源码就先在插件目录跑 `npm install && npm run build`，再安装。
 
 装好后重启 `dsh web` / 鲸屿。卸载：`dsh plugin --profile web remove dsh-pad`。
+
+## 更新
+
+插件启动后会在后台检查 [GitHub Release](https://github.com/ChisaAlter/dsh-pad/releases)（默认每 6 小时，启动约 7 秒后第一次）。有新版本时：
+
+1. 面板坞顶部的下载图标出现圆点；
+2. 点开，看到当前版本和新版本，点「更新」；
+3. 插件从 Release 下载构建好的 `lib/index.js`、`lib/client.js`、`package.json` 和 `cordis.patch.yml`，先备份到 `.dsh-pad-update-backup/`；
+4. 重启 `dsh web` / 鲸屿后生效。
+
+如果当前是**开发目录链接**安装（插件目录里有 `.git/`），自动更新只提示新版本，不会覆盖源码；请在插件目录执行 `git pull && npm run build`。更新面板里的「重新检查」可以立即查一次；关闭后台检查设 `updateCheck: false`。
 
 ### 装坏了怎么恢复
 
@@ -149,13 +161,15 @@ dsh plugin --profile web add github:ChisaAlter/dsh-pad#2b2bb06eccd091995ffbfba17
 | `runTimeoutSec` | `120` | 一次 `dsh.run` 的最长时间（秒） |
 | `runMaxTokens` | `2048` | 一次 `dsh.run` 最多生成多少 token |
 | `runConcurrency` | `2` | 同一张面板同时进行的 `dsh.run` 数量 |
+| `updateCheck` | `true` | 后台检查 GitHub 最新 Release |
+| `updateCheckHours` | `6` | 自动检查间隔（小时，1–168） |
 
 ## 数据与已知限制
 
 - 面板存在 `$DSH_HOME/dsh-pad/panels.json`；面板坞的宽度、位置、行分组/分隔比例和展开状态按浏览器存在 localStorage。
 - 每次 AI 刷新都是一个独立的 dsh 会话，工作目录是 `$DSH_HOME/dsh-pad/refresh`。dsh 目前不提供删除会话的接口，所以这些会话日志会留在 `$DSH_HOME/sessions/` 下对应这个目录的子目录里（每轮大约十几 KB）。它们不会出现在侧栏，需要清理时手动删除即可。
 - 后台刷新的 agent 没有人在线审批，所以需要审批的工具调用（比如 workspace-write 模式下的 shell 命令）会被拒绝。AI 刷新适合用 web_fetch / web_search 取数；本机命令请用直接数据源。
-- 在 dsh 0.2.1-rc.2 的 Web 界面（`dsh web`）与鲸屿桌面端上验证过：安装后宿主半激活、8 个 `pad_*` 工具注册、五个 `/api/dsh-pad.*` 路由可用，客户端面板坞在无头 Chrome 中渲染无异常。dsh 的插件 API 还在快速变化。悬浮坞挂在 dsh 的 `shell.overlay` 槽位；宽屏让位依赖外框上的 `data-rightbar-collapsed` 属性，dsh 以后改了这个属性也只是退化成纯悬浮，不会坏。
+- 在 dsh 0.2.1-rc.2 的 Web 界面（`dsh web`）与鲸屿桌面端上验证过：安装后宿主半激活、8 个 `pad_*` 工具注册、六个 `/api/dsh-pad.*` 路由可用，客户端面板坞在无头 Chrome 中渲染无异常。dsh 的插件 API 还在快速变化。悬浮坞挂在 dsh 的 `shell.overlay` 槽位；宽屏让位依赖外框上的 `data-rightbar-collapsed` 属性，dsh 以后改了这个属性也只是退化成纯悬浮，不会坏。
 
 ## 开发
 
@@ -178,9 +192,10 @@ src/
     agent-refresh.ts  后台 AI 刷新
     models.ts         模型目录与选择校验
     run.ts            面板内 dsh.run 的一次性模型调用
+    update.ts         检查 GitHub Release，按点击下载替换 lib/
     tools.ts          pad_* 工具
     guide.ts          给模型的编写指南
-    routes.ts         /api/dsh-pad.{panels,stream,action,models,run}（经 dsh Connection 认证）
+    routes.ts         /api/dsh-pad.{panels,stream,action,models,run,update}（经 dsh Connection 认证）
   client/
     index.ts          浏览器插件入口：shell.overlay 悬浮坞 + 输入框桥接
     Dock.tsx          胶囊 / 面板坞
@@ -192,6 +207,10 @@ src/
 examples/             面板定义示例
 tests/                单元测试（vitest）
 ```
+
+## 致谢
+
+感谢 [Linux.do](https://linux.do)（L 站）社区的支持、讨论和反馈，也感谢 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) 与 [ChisaBot](https://github.com/ChisaAlter/ChisaBot) 在面板形态上的启发。
 
 ## 许可
 

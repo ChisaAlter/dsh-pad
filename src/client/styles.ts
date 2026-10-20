@@ -61,6 +61,23 @@ export const DOCK_CSS = `
 .dshpad-icon-btn{flex:none;display:grid;place-items:center;width:28px;height:28px;padding:0;border:0;border-radius:8px;background:transparent;color:var(--dshpad-fg-2)!important;cursor:pointer;transition:background-color .15s,color .15s}
 .dshpad-icon-btn:hover:not(:disabled),.dshpad-icon-btn.is-active{background:var(--dshpad-hover);color:var(--dshpad-fg)!important}
 .dshpad-icon-btn:disabled{opacity:.4;cursor:default}
+.dshpad-update-btn{position:relative}
+.dshpad-update-btn .dshpad-dot{top:4px;right:4px;width:6px;height:6px;background:var(--dshpad-accent)}
+.dshpad-update{flex:none;margin:0 6px 5px;padding:8px 9px;border-radius:11px;background:color-mix(in srgb, var(--dshpad-surface) 55%, transparent);
+  box-shadow:inset 0 0 0 .5px var(--dshpad-border);font-size:12px}
+.dshpad-update-head{display:flex;align-items:center;justify-content:space-between;gap:6px}
+.dshpad-update-close{display:grid;place-items:center;width:22px;height:22px;padding:0;border:0;border-radius:6px;background:transparent;color:var(--dshpad-fg-3);cursor:pointer}
+.dshpad-update-close:hover{background:var(--dshpad-hover);color:var(--dshpad-fg)}
+.dshpad-update-text{margin:5px 0 0;color:var(--dshpad-fg-2);line-height:1.45}
+.dshpad-update-text.is-error{color:var(--dshpad-danger)}
+.dshpad-update-text.is-ok{color:var(--dsw-alias-state-success-primary,#16a34a)}
+.dshpad-update-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:7px}
+.dshpad-update-primary{padding:4px 10px;border:0;border-radius:7px;background:var(--dshpad-accent);color:#fff;font-size:12px;cursor:pointer}
+.dshpad-update-primary:disabled{opacity:.55;cursor:default}
+.dshpad-update-secondary{padding:3px 8px;border:0;border-radius:7px;background:transparent;color:var(--dshpad-fg-2);font-size:12px;cursor:pointer}
+.dshpad-update-secondary:hover{background:var(--dshpad-hover);color:var(--dshpad-fg)}
+.dshpad-update-link{color:var(--dshpad-accent);text-decoration:none;font-size:12px}
+.dshpad-update-link:hover{text-decoration:underline}
 .dshpad-root :focus-visible{outline:2px solid var(--dshpad-accent);outline-offset:1px}
 
 .dshpad-banner{margin:0 6px 4px;padding:4px 5px;border-radius:8px;background:var(--dsw-alias-state-warn-tertiary,rgba(217,119,6,.1));color:var(--dsw-alias-state-warn-label,var(--dshpad-fg));font-size:12px;flex:none}
