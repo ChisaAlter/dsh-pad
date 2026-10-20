@@ -603,12 +603,15 @@ export function createDock(client: PadClient) {
             <button type="button" className="dshpad-icon-btn" title={t('dock.refreshAll')} aria-label={t('dock.refreshAll')}
               disabled={snap.panels.length === 0}
               onClick={() => { for (const panel of snap.panels) void client.act({ op: 'refresh', panelId: panel.id }) }}>{Icon.refresh}</button>
-            <button type="button" className={`dshpad-icon-btn dshpad-update-btn${update?.available ? ' has-update' : ''}`}
-              title={t('update.tooltip')} aria-label={t('update.tooltip')}
-              onClick={() => { setUpdateOpen(open => !open); if (update === undefined) void checkUpdate(false) }}>
-              {Icon.download}
-              {update?.available ? <i className="dshpad-dot" aria-hidden="true" /> : null}
-            </button>
+            {update?.available === true
+              ? (
+                <button type="button" className="dshpad-icon-btn dshpad-update-btn"
+                  title={t('update.tooltip')} aria-label={t('update.tooltip')}
+                  onClick={() => setUpdateOpen(open => !open)}>
+                  {Icon.download}
+                </button>
+                )
+              : null}
             <button type="button" className="dshpad-collapse" title={t('dock.collapse')} aria-label={t('dock.collapse')}
               onClick={collapse}>{Icon.collapse}</button>
           </header>
