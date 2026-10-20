@@ -32,7 +32,7 @@ node scripts/doctor.mjs
 dsh plugin --profile web add /path/to/dsh-pad
 
 # 从 GitHub（仓库里带着构建好的 lib/，不需要跑构建脚本）
-dsh plugin --profile web add github:ChisaAlter/dsh-pad#2b2bb06eccd091995ffbfba17bc62e612d38b73c
+dsh plugin --profile web add github:ChisaAlter/dsh-pad#577e0b7a87c08b07a5aad9a475edbe5c30f63859
 ```
 
 `lib/index.js` 与 `lib/client.js` 是唯一的运行入口，本仓库把它们提交进 git，就是为了让 GitHub 安装不依赖构建脚本（pnpm 会默认拒绝执行依赖的构建脚本）。改了源码就先在插件目录跑 `npm install && npm run build`，再安装。
