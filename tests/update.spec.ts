@@ -22,12 +22,13 @@ async function pluginRoot(version = '0.1.1', source = false): Promise<string> {
 function releaseFetch(files: Record<string, string> = {}): typeof fetch {
   return (async (input: RequestInfo | URL) => {
     const url = String(input)
-    if (url.endsWith('/releases/latest')) {
-      return new Response(JSON.stringify({
-        tag_name: 'v0.2.0',
-        html_url: 'https://github.com/ChisaAlter/dsh-pad/releases/tag/v0.2.0',
-        body: 'notes',
-      }), { status: 200 })
+    if (url.endsWith('/releases.atom')) {
+      return new Response([
+        '<?xml version="1.0"?><feed>',
+        '<entry><link rel="alternate" type="text/html" href="https://github.com/ChisaAlter/dsh-pad/releases/tag/v0.2.0"/>',
+        '<title>v0.2.0 — test</title></entry>',
+        '</feed>',
+      ].join(''), { status: 200 })
     }
     const match = /raw\.githubusercontent\.com\/ChisaAlter\/dsh-pad\/v0\.2\.0\/(.+)$/.exec(url)
     const file = match?.[1]

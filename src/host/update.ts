@@ -10,17 +10,11 @@ import { dirname, join } from 'node:path'
 import type { PadUpdateInfo, PadUpdateResponse } from '../shared/types.ts'
 
 const REPO = 'ChisaAlter/dsh-pad'
-const RELEASE_API = `https://api.github.com/repos/${REPO}/releases/latest`
+const RELEASE_FEED = `https://github.com/${REPO}/releases.atom`
 const RAW_ROOT = `https://raw.githubusercontent.com/${REPO}`
 const REQUEST_TIMEOUT_MS = 15_000
 const FIRST_CHECK_DELAY_MS = 7_000
 const UPDATE_FILES = ['lib/index.js', 'lib/client.js', 'package.json', 'cordis.patch.yml'] as const
-
-interface ReleasePayload {
-  readonly tag_name?: unknown
-  readonly html_url?: unknown
-  readonly body?: unknown
-}
 
 interface ParsedVersion {
   readonly parts: readonly [number, number, number]
@@ -140,23 +134,21 @@ export class UpdateService {
   }
 
   private async fetchLatest(): Promise<PadUpdateInfo> {
-    const headers: Record<string, string> = {
-      accept: 'application/vnd.github+json',
-      'user-agent': `dsh-pad/${this.current}`,
-    }
-    const token = process.env['GITHUB_TOKEN']
-    if (token !== undefined && token.trim() !== '') headers['authorization'] = `Bearer ${token.trim()}`
     try {
-      const response = await this.fetchImpl(RELEASE_API, {
-        headers,
+      const response = await this.fetchImpl(RELEASE_FEED, {
+        headers: {
+          accept: 'application/atom+xml',
+          'user-agent': `dsh-pad/${this.current}`,
+        },
         signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
       })
       if (!response.ok) throw new Error(`GitHub ${response.status}`)
-      const release = await response.json() as ReleasePayload
-      const tag = typeof release.tag_name === 'string' ? release.tag_name : ''
+      const xml = await response.text()
+      // The newest entry is first; its <link> is the release tag page.
+      const match = /<entry>[\s\S]*?<link[^>]+href="([^"]+\/releases\/tag\/([^"/]+))"/.exec(xml)
+      const tag = match?.[2] ?? ''
+      const url = match?.[1] ?? `https://github.com/${REPO}/releases`
       const latest = tag.replace(/^v/i, '')
-      const url = typeof release.html_url === 'string' ? release.html_url : `https://github.com/${REPO}/releases`
-      const notes = typeof release.body === 'string' ? release.body.slice(0, 2000) : undefined
       const available = latest !== '' && compareVersions(latest, this.current) > 0
       this.tag = tag
       this.state = {
@@ -166,7 +158,6 @@ export class UpdateService {
         canApply: available && !this.source,
         reason: available ? (this.source ? 'source' : 'available') : 'up-to-date',
         url,
-        ...(notes === undefined ? {} : { notes }),
         checkedAt: new Date().toISOString(),
       }
     } catch (error) {
