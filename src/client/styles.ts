@@ -185,11 +185,23 @@ export const DOCK_CSS = `
 .dshpad-example{display:block;width:100%;margin:3px 0 0;padding:4px 6px;border:0;border-radius:10px;background:var(--dshpad-hover);text-align:left;font-size:12px;line-height:17px;cursor:pointer;transition:background-color .15s}
 .dshpad-example:hover{background:var(--dsw-alias-interactive-bg-active,var(--dshpad-hover))}
 
-/* Wide windows: the expanded dock reserves its column so it never covers the conversation. */
+/* Wide windows: the expanded dock reserves its own column. Padding the frame
+   pushes the conversation and the (optional) right panel left, so the dock sits
+   in the gap and covers neither — the panel no longer disappears under it. */
 @media (min-width:1280px){
-  html.dshpad-reserve [data-rightbar-collapsed]{padding-right:var(--dshpad-reserve,0px)}
+  html.dshpad-reserve [data-titlebar-density]{padding-right:var(--dshpad-reserve,0px)}
+  /* The right panel's drag handle is positioned from viewport pixels, so pull it
+     back onto the panel's edge while the dock holds that column. */
+  html.dshpad-reserve [data-titlebar-density] [data-side=rightbar]{transform:translateX(calc(var(--dshpad-reserve,0px) * -1))}
+  /* dsh hides the turn rail (the jump-to-turn column on the conversation's right
+     edge) below a 900px conversation. While the dock has reserved its column the
+     rail still sits in the conversation margin, left of the dock, so keep it as
+     soon as there is room for it — opening the dock must not take it away. */
+  @container (width >= 800px){
+    html.dshpad-reserve [class*="_slot"]>nav[class*="_frame"]{display:block}
+  }
 }
-[data-rightbar-collapsed]{transition:padding-right .26s cubic-bezier(.22,.8,.24,1)}
+[data-titlebar-density]{transition:padding-right .26s cubic-bezier(.22,.8,.24,1)}
 
 @keyframes dshpad-slide{from{opacity:0;transform:translateX(12px) scale(.94)}to{opacity:1;transform:none}}
 @keyframes dshpad-close{to{opacity:0;transform:translateX(10px) scale(.94)}}
