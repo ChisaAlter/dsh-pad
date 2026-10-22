@@ -136,7 +136,18 @@ export class PanelStore {
     const current = this.get(id)
     if (current.previous === undefined) throw new Error('这个面板没有可以撤销的修改')
     const { previous: _dropped, ...rest } = current
-    const next: PanelRecord = { ...rest, version: current.version + 1, updatedAt: new Date().toISOString(), definition: current.previous }
+    const previous = current.previous
+    const now = new Date().toISOString()
+    const scheduleChanged = JSON.stringify(current.definition.agent ?? null) !== JSON.stringify(previous.agent ?? null)
+    const next: PanelRecord = {
+      ...rest,
+      version: current.version + 1,
+      updatedAt: now,
+      definition: previous,
+      ...(scheduleChanged
+        ? { agentRun: previous.agent ? { status: 'idle' as const, nextRunAt: nextRun(previous, now) } : undefined }
+        : {}),
+    }
     await this.replace(next)
     return next
   }

@@ -1,47 +1,89 @@
 /**
- * The floating dock on the right edge: a draggable capsule when collapsed,
- * a resizable column of panel cards when expanded.
+ * The pad's floating layer: a draggable ball when closed, a freely placed
+ * window with nested card splits when open.
+ *
+ * Panels are arranged as a tree (see `layout.ts`). A card dragged onto an edge
+ * of another card splits that card's area; a card dropped in the middle swaps
+ * places with it; a card dropped on empty dock space moves to the bottom.
  */
-import { Fragment, type KeyboardEvent as ReactKeyboardEvent, type PointerEvent as ReactPointerEvent, useEffect, useRef, useState, useSyncExternalStore } from 'react'
+import {
+  Fragment,
+  type KeyboardEvent as ReactKeyboardEvent,
+  type PointerEvent as ReactPointerEvent,
+  type ReactNode,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  useSyncExternalStore,
+} from 'react'
 import { composer } from './composer.ts'
-import type { PadKey } from './locales.ts'
-import { MAX_CAPSULE_Y, MAX_WIDTH, MIN_CAPSULE_Y, MIN_DOCK_HEIGHT, MIN_WIDTH, type PadClient, type PanelRowLayout } from './pad-client.ts'
+import {
+  BALL_MARGIN,
+  BALL_SIZE,
+  BALL_SNAP_INSET,
+  MAX_WIDTH,
+  MIN_DOCK_HEIGHT,
+  MIN_WIDTH,
+  type PadClient,
+  type Point,
+} from './pad-client.ts'
 import type { HistoryPoint } from './pad-client.ts'
-import type { PanelView, PadUpdateInfo } from '../shared/types.ts'
+import {
+  type DropZone,
+  type LayoutNode,
+  type LayoutSplit,
+  dropOnLeaf,
+  dropZoneFor,
+  moveToRoot,
+  nodeAtPath,
+  normalizeTree,
+  totalWeight,
+  withWeightsAtPath,
+} from './layout.ts'
+import type { PadUpdateInfo } from '../shared/types.ts'
 import { PanelCard, type Translate, needsAttention } from './PanelCard.tsx'
+import type { PadKey } from './locales.ts'
 import { PanelFrame } from './PanelFrame.tsx'
 import { type ThemeSnapshot, readTheme, watchTheme } from './theme.ts'
 
 const DRAG_THRESHOLD = 4
-/** The expanded dock keeps this much of the window below it, and this much above. */
-const MIN_DOCK_TOP = 52
-const DOCK_BOTTOM_ROOM = 240
-/** Gap kept between the dock and the window's bottom edge. */
-const EDGE_GAP = 6
-/** Compact dock header; its centre lines up with the capsule centre. */
-const HEADER_H = 32
-const HEADER_HALF = HEADER_H / 2
-
-/**
- * Vertical band the expanded dock may occupy. It is tied to the capsule band,
- * since the capsule is where the dock collapses back to.
- * @param viewportH - current window height.
- * @returns the lowest and highest allowed `top` in px.
- */
-function dockLimits(viewportH: number): { min: number, max: number } {
-  const min = Math.max(MIN_DOCK_TOP, Math.ceil(MIN_CAPSULE_Y * viewportH) - HEADER_HALF)
-  const max = Math.max(min, Math.min(viewportH - DOCK_BOTTOM_ROOM, Math.floor(MAX_CAPSULE_Y * viewportH) - HEADER_HALF))
-  return { min, max }
-}
+/** Distance from a viewport edge at which the ball snaps against it. */
+const SNAP_DISTANCE = 26
+/** Gap kept between the floating layer and the window edges. */
+const EDGE_GAP = 8
+const SPLITTER_W = 6
+const MIN_PANE = 80
+/** The dock's collapse button: its centre is the floating ball's anchor. */
+const COLLAPSE_RIGHT = 9
+const COLLAPSE_TOP = 2
+const COLLAPSE_SIZE = 28
+const COLLAPSE_CENTER_FROM_RIGHT = COLLAPSE_RIGHT + COLLAPSE_SIZE / 2
+const COLLAPSE_CENTER_Y = COLLAPSE_TOP + COLLAPSE_SIZE / 2
 
 const Icon = {
-  grid: <svg viewBox="0 0 16 16" aria-hidden="true"><rect x="2" y="2" width="5" height="5" rx="1.2" /><rect x="9" y="2" width="5" height="5" rx="1.2" /><rect x="2" y="9" width="5" height="5" rx="1.2" /><rect x="9" y="9" width="5" height="5" rx="1.2" /></svg>,
   plus: <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 3v10M3 8h10" /></svg>,
   refresh: <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M13.5 8a5.5 5.5 0 1 1-1.6-3.9M13.5 2.5v3h-3" /></svg>,
   download: <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 2.5v7.2M5 7l3 3 3-3M3 13.5h10" /></svg>,
   close: <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M4 4l8 8M12 4l-8 8" /></svg>,
-  collapse: <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M6 3.5L10.5 8 6 12.5" /></svg>,
-  expand: <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M10 3.5L5.5 8 10 12.5" /></svg>,
+}
+
+const STAR_PATH = 'M14 6.3C14.8 10.8 17.2 13.2 21.7 14C17.2 14.8 14.8 17.2 14 21.7C13.2 17.2 10.8 14.8 6.3 14C10.8 13.2 13.2 10.8 14 6.3Z'
+
+/** The ball's circular surface, without the star (the star is a persistent
+ * overlay so it can stay put while the ball and the dock cross-fade). */
+function BallDisc() {
+  return (
+    <svg className="dshpad-ball-disc" viewBox="0 0 28 28" width="28" height="28" aria-hidden="true" focusable="false">
+      <defs>
+        <linearGradient id="dshpad-ball-surface" x1="3" y1="2" x2="25" y2="27" gradientUnits="userSpaceOnUse">
+          <stop offset="0" className="dshpad-ball-stop-a" />
+          <stop offset="1" className="dshpad-ball-stop-b" />
+        </linearGradient>
+      </defs>
+      <circle className="dshpad-ball-fill" cx="14" cy="14" r="13.5" />
+    </svg>
+  )
 }
 
 function useNow(intervalMs: number): number {
@@ -53,44 +95,72 @@ function useNow(intervalMs: number): number {
   return now
 }
 
-/** Keep every panel in exactly one row of at most three, appending new panels. */
-function sanitizeRows(raw: readonly PanelRowLayout[] | undefined, panels: readonly PanelView[]): PanelRowLayout[] {
-  const known = new Set(panels.map(panel => panel.id))
-  const seen = new Set<string>()
-  const rows: PanelRowLayout[] = []
-  const pushRow = (ids: string[], weights: number[]): void => {
-    for (let start = 0; start < ids.length; start += 3) {
-      const sliceIds = ids.slice(start, start + 3)
-      if (sliceIds.length > 0) rows.push({ ids: sliceIds, weights: weights.slice(start, start + 3) })
-    }
-  }
-  for (const row of raw ?? []) {
-    const ids: string[] = []
-    const weights: number[] = []
-    row.ids.forEach((id, index) => {
-      if (!known.has(id) || seen.has(id)) return
-      seen.add(id)
-      ids.push(id)
-      const weight = row.weights[index]
-      weights.push(typeof weight === 'number' && Number.isFinite(weight) && weight > 0 ? weight : 1)
-    })
-    pushRow(ids, weights)
-  }
-  for (const panel of panels) {
-    if (seen.has(panel.id)) continue
-    seen.add(panel.id)
-    rows.push({ ids: [panel.id], weights: [1] })
-  }
-  return rows
+function clamp(value: number, min: number, max: number): number {
+  return Math.max(min, Math.min(max, value))
 }
 
-function rowTemplate(row: PanelRowLayout): string {
+/** Keep a box of `size` px fully inside the viewport, with a margin. */
+function clampBall(point: Point, width: number, height: number): Point {
+  return {
+    x: Math.round(clamp(point.x, BALL_MARGIN, Math.max(BALL_MARGIN, width - BALL_SIZE - BALL_MARGIN))),
+    y: Math.round(clamp(point.y, BALL_MARGIN, Math.max(BALL_MARGIN, height - BALL_SIZE - BALL_MARGIN))),
+  }
+}
+
+/** Snap a ball dropped near one of the four edges against that edge. */
+function snapBall(point: Point, width: number, height: number): Point {
+  const right = Math.max(BALL_SNAP_INSET, width - BALL_SIZE - BALL_SNAP_INSET)
+  const bottom = Math.max(BALL_SNAP_INSET, height - BALL_SIZE - BALL_SNAP_INSET)
+  let { x, y } = clampBall(point, width, height)
+  if (x - BALL_SNAP_INSET < SNAP_DISTANCE) x = BALL_SNAP_INSET
+  else if (right - x < SNAP_DISTANCE) x = right
+  if (y - BALL_SNAP_INSET < SNAP_DISTANCE) y = BALL_SNAP_INSET
+  else if (bottom - y < SNAP_DISTANCE) y = bottom
+  return { x, y }
+}
+
+/** Where the window opens when it has not been dragged yet: its collapse
+ * button centred on the ball, so the ball and the button are the same spot. */
+function defaultDockPoint(ball: Point, width: number, viewport: Viewport, heightHint: number): Point {
+  const height = clamp(heightHint, MIN_DOCK_HEIGHT, Math.max(MIN_DOCK_HEIGHT, viewport.height - EDGE_GAP * 2))
+  const x = ball.x + BALL_SIZE / 2 - (width - COLLAPSE_CENTER_FROM_RIGHT)
+  const y = ball.y + BALL_SIZE / 2 - COLLAPSE_CENTER_Y
+  return {
+    x: Math.round(clamp(x, EDGE_GAP, Math.max(EDGE_GAP, viewport.width - width - EDGE_GAP))),
+    y: Math.round(clamp(y, EDGE_GAP, Math.max(EDGE_GAP, viewport.height - height - EDGE_GAP))),
+  }
+}
+
+function clampDock(point: Point, width: number, viewport: Viewport, heightHint: number): Point {
+  const height = clamp(heightHint, MIN_DOCK_HEIGHT, Math.max(MIN_DOCK_HEIGHT, viewport.height - EDGE_GAP * 2))
+  return {
+    x: Math.round(clamp(point.x, EDGE_GAP, Math.max(EDGE_GAP, viewport.width - width - EDGE_GAP))),
+    y: Math.round(clamp(point.y, EDGE_GAP, Math.max(EDGE_GAP, viewport.height - height - EDGE_GAP))),
+  }
+}
+
+function rowTemplate(split: LayoutSplit): string {
   const parts: string[] = []
-  row.ids.forEach((_, index) => {
-    if (index > 0) parts.push('6px')
-    parts.push(`${row.weights[index] ?? 1}fr`)
+  split.children.forEach((_, index) => {
+    if (index > 0) parts.push(`${SPLITTER_W}px`)
+    parts.push(`${split.weights[index] ?? 1}fr`)
   })
   return parts.join(' ')
+}
+
+const DROP_LABEL: Record<DropZone | 'root' | 'hint', PadKey> = {
+  left: 'drop.left',
+  right: 'drop.right',
+  top: 'drop.top',
+  bottom: 'drop.bottom',
+  center: 'drop.center',
+  root: 'drop.root',
+  hint: 'drop.hint',
+}
+
+interface Viewport {
+  readonly width: number
+  readonly height: number
 }
 
 export interface DockProps {
@@ -108,65 +178,71 @@ export function createDock(client: PadClient) {
     const snap = useSyncExternalStore(client.subscribe, client.getSnapshot)
     const rootRef = useRef<HTMLDivElement>(null)
     const asideRef = useRef<HTMLElement>(null)
+    const shieldRef = useRef<HTMLDivElement>(null)
     const [theme, setTheme] = useState<ThemeSnapshot>({ mode: 'light', css: ':root{}' })
     const [notice, setNotice] = useState<string>()
-    const [dragY, setDragY] = useState<number>()
-    const [dragTop, setDragTop] = useState<number>()
+    const [viewport, setViewport] = useState<Viewport>(() => ({ width: window.innerWidth, height: window.innerHeight }))
+    const [ballDrag, setBallDrag] = useState<Point>()
+    const [dockDrag, setDockDrag] = useState<Point>()
+    const [dragHeight, setDragHeight] = useState<number>()
     const [dragWidth, setDragWidth] = useState<number>()
-    /** Height cap frozen while the dock stays expanded, so moving it never resizes it. */
-    const [dockCap, setDockCap] = useState<number>()
-    /** Height chosen with the top/bottom edge handles; `undefined` means auto. */
-    const [dockHeight, setDockHeight] = useState<number>()
-    const [viewportH, setViewportH] = useState(() => window.innerHeight)
-    const [drag, setDrag] = useState<{ id: string, x: number, y: number, target?: string }>()
-    const snapshotRows = sanitizeRows(snap.layout.rows, snap.panels)
-    const rowsSignature = JSON.stringify(snapshotRows)
-    const [rows, setRows] = useState<PanelRowLayout[]>(snapshotRows)
+    const [drag, setDrag] = useState<{ id: string, x: number, y: number, target?: string, zone?: DropZone, blank: boolean }>()
     const [focusedId, setFocusedId] = useState<string>()
     const [closing, setClosing] = useState(false)
+    const [ballTransition, setBallTransition] = useState<{ point: Point, mode: 'opening' | 'closing' }>()
     const [update, setUpdate] = useState<PadUpdateInfo>()
     const [updateOpen, setUpdateOpen] = useState(false)
     const [updateBusy, setUpdateBusy] = useState(false)
     const [updateError, setUpdateError] = useState<string>()
     const closeTimer = useRef<ReturnType<typeof setTimeout>>()
+    const transitionTimer = useRef<ReturnType<typeof setTimeout>>()
+    const holdTimer = useRef<ReturnType<typeof setTimeout>>()
+    const suppressCollapseClick = useRef(false)
+    const collapsePressToken = useRef(0)
     const focusedView = focusedId === undefined ? undefined : snap.panels.find(panel => panel.id === focusedId)
     const now = useNow(10_000)
     const lang = t('dock.title') === '面板' ? 'zh-CN' : 'en'
 
+    const panelIdsKey = snap.panels.map(panel => panel.id).join('\u0000')
+    const snapshotTree = useMemo(
+      () => normalizeTree(snap.layout.tree, snap.panels.map(panel => panel.id)),
+      // eslint-disable-next-line react-hooks/exhaustive-deps
+      [snap.layout.tree, panelIdsKey],
+    )
+    const treeSignature = JSON.stringify(snapshotTree)
+    const [tree, setTree] = useState<LayoutNode | null>(snapshotTree)
+
     useEffect(() => {
-      const onResize = (): void => setViewportH(window.innerHeight)
+      setTree(snapshotTree)
+      // The signature changes only when the tree or panel set really changes,
+      // not on every SSE data tick.
+      // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [treeSignature])
+
+    useEffect(() => {
+      const onResize = (): void => setViewport({ width: window.innerWidth, height: window.innerHeight })
       window.addEventListener('resize', onResize)
       return () => window.removeEventListener('resize', onResize)
     }, [])
 
-    useEffect(() => {
-      setRows(sanitizeRows(snap.layout.rows, snap.panels))
-      // The signature changes only when rows or panels really change, not on
-      // every SSE data tick.
-      // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [rowsSignature])
-
     useEffect(() => () => {
       if (closeTimer.current !== undefined) clearTimeout(closeTimer.current)
+      if (transitionTimer.current !== undefined) clearTimeout(transitionTimer.current)
+      if (holdTimer.current !== undefined) clearTimeout(holdTimer.current)
     }, [])
 
-    // Freeze the height cap when the dock opens: the dock keeps that height
-    // while it is dragged, so the gesture translates the box instead of
-    // squeezing it against the bottom of the window.
+    // The star button disappears when the dock collapses; never let a pending
+    // long-press fire against the now-hidden window.
     useEffect(() => {
-      if (!snap.layout.expanded) {
-        setDockCap(undefined)
-        setDockHeight(undefined)
-        return
+      if (snap.layout.expanded) return
+      // Invalidate any pointer press that belonged to the hidden star button.
+      collapsePressToken.current += 1
+      if (holdTimer.current !== undefined) {
+        clearTimeout(holdTimer.current)
+        holdTimer.current = undefined
       }
-      const { min, max } = dockLimits(viewportH)
-      const opening = Math.min(max, Math.max(min, Math.round(snap.layout.capsuleY * viewportH) - HEADER_HALF))
-      setDockCap(Math.max(200, viewportH - opening - EDGE_GAP))
-      const saved = snap.layout.dockHeight
-      setDockHeight(saved === undefined ? undefined : Math.min(saved, Math.max(MIN_DOCK_HEIGHT, viewportH - opening - EDGE_GAP)))
-      // capsuleY changes on drop; the cap must stay put for that drag.
-      // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [snap.layout.expanded, viewportH])
+      suppressCollapseClick.current = false
+    }, [snap.layout.expanded])
 
     useEffect(() => {
       if (focusedId === undefined) return
@@ -183,26 +259,14 @@ export function createDock(client: PadClient) {
     }, [focusedId, focusedView])
 
     useEffect(() => {
-      const update = (): void => {
+      const updateTheme = (): void => {
         if (rootRef.current === null) return
         const next = readTheme(rootRef.current)
         setTheme(prev => (prev.css === next.css ? prev : next))
       }
-      update()
-      return watchTheme(update)
+      updateTheme()
+      return watchTheme(updateTheme)
     }, [snap.layout.expanded])
-
-    // Reserve the dock's column on wide windows (see styles.ts).
-    const reserve = snap.layout.expanded ? (dragWidth ?? snap.layout.width) + 12 : 0
-    useEffect(() => {
-      const root = document.documentElement
-      root.classList.toggle('dshpad-reserve', reserve > 0)
-      root.style.setProperty('--dshpad-reserve', `${reserve}px`)
-    }, [reserve])
-    useEffect(() => () => {
-      document.documentElement.classList.remove('dshpad-reserve')
-      document.documentElement.style.removeProperty('--dshpad-reserve')
-    }, [])
 
     useEffect(() => {
       if (notice === undefined) return
@@ -261,58 +325,99 @@ export function createDock(client: PadClient) {
     }
 
     const attention = snap.panels.some(needsAttention)
+    const ballPoint = clampBall(ballDrag ?? snap.layout.ball, viewport.width, viewport.height)
+    const widthLimit = Math.max(120, viewport.width - EDGE_GAP * 2)
+    const dockWidth = Math.min(dragWidth ?? snap.layout.width, widthLimit)
+    const openHeight = snap.layout.dockHeight ?? Math.min(560, Math.max(MIN_DOCK_HEIGHT, viewport.height - EDGE_GAP * 2))
+    const ballAnchorTop = ballPoint.y + BALL_SIZE / 2 - COLLAPSE_CENTER_Y
+    const belowBall = viewport.height - EDGE_GAP - ballAnchorTop
+    // A window opened from a ball keeps the button under it by shortening the
+    // window when at least a minimum-height dock fits. Near the bottom edge
+    // that is impossible, so it opens above the edge as before.
+    const defaultOpenHeight = belowBall >= MIN_DOCK_HEIGHT
+      ? Math.max(MIN_DOCK_HEIGHT, Math.min(openHeight, belowBall))
+      : openHeight
+    const baseDock = snap.layout.dock ?? defaultDockPoint(ballPoint, dockWidth, viewport, defaultOpenHeight)
+    const savedHeight = dragHeight ?? snap.layout.dockHeight
+    const dockPoint = dockDrag ?? clampDock(
+      baseDock,
+      dockWidth,
+      viewport,
+      snap.layout.dock === null ? defaultOpenHeight : savedHeight ?? MIN_DOCK_HEIGHT,
+    )
+    const starPoint = snap.layout.expanded
+      ? {
+          x: dockPoint.x + dockWidth - COLLAPSE_RIGHT - COLLAPSE_SIZE,
+          y: dockPoint.y + COLLAPSE_TOP,
+        }
+      : ballPoint
+    const starAnchor = (
+      <div className="dshpad-star-anchor" style={{ left: starPoint.x, top: starPoint.y }} aria-hidden="true">
+        <svg viewBox="0 0 28 28" width="28" height="28" focusable="false">
+          <path d={STAR_PATH} />
+        </svg>
+      </div>
+    )
+    const availableHeight = Math.max(MIN_DOCK_HEIGHT, viewport.height - dockPoint.y - EDGE_GAP)
+    const renderedHeight = savedHeight === undefined ? undefined : Math.min(savedHeight, availableHeight)
+    const maxHeight = renderedHeight ?? availableHeight
+    const dockStyle = {
+      left: dockPoint.x,
+      top: dockPoint.y,
+      width: dockWidth,
+      height: renderedHeight,
+      maxHeight,
+    }
+    const reserve = snap.layout.expanded
+      && dockPoint.x + dockWidth >= viewport.width - EDGE_GAP - 2
+      ? Math.round(dockWidth) + 12
+      : 0
 
-    const tile = (sourceId: string, targetId: string): void => {
-      if (sourceId === targetId) return
-      const next = rows.map(row => ({ ids: [...row.ids], weights: [...row.weights] }))
-      const sourceIndex = next.findIndex(row => row.ids.includes(sourceId))
-      if (sourceIndex < 0) return
-      const sourcePosition = next[sourceIndex]!.ids.indexOf(sourceId)
-      next[sourceIndex]!.ids.splice(sourcePosition, 1)
-      next[sourceIndex]!.weights.splice(sourcePosition, 1)
-      if (next[sourceIndex]!.ids.length === 0) next.splice(sourceIndex, 1)
-      const targetRow = next.find(row => row.ids.includes(targetId))
-      if (targetRow === undefined) return
-      if (targetRow.ids.length >= 3) {
-        next.splice(next.indexOf(targetRow) + 1, 0, { ids: [sourceId], weights: [1] })
-      } else {
-        targetRow.ids.push(sourceId)
-        targetRow.weights.push(1)
-      }
-      const updated = sanitizeRows(next, snap.panels)
-      setRows(updated)
-      client.setRows(updated)
+    useEffect(() => {
+      const root = document.documentElement
+      root.classList.toggle('dshpad-reserve', reserve > 0)
+      root.style.setProperty('--dshpad-reserve', `${reserve}px`)
+    }, [reserve])
+    useEffect(() => () => {
+      document.documentElement.classList.remove('dshpad-reserve')
+      document.documentElement.style.removeProperty('--dshpad-reserve')
+    }, [])
+
+    /**
+     * Persist a layout edit and normalize it against the current panels, so a
+     * split can never lose or duplicate a card.
+     */
+    const commitTree = (next: LayoutNode): void => {
+      const normalized = normalizeTree(next, snap.panels.map(panel => panel.id))
+      if (normalized === null) return
+      setTree(normalized)
+      client.setTree(normalized)
     }
 
-    const detach = (sourceId: string): void => {
-      const next = rows.map(row => ({ ids: [...row.ids], weights: [...row.weights] }))
-      const sourceIndex = next.findIndex(row => row.ids.includes(sourceId))
-      if (sourceIndex < 0) return
-      const sourceRow = next[sourceIndex]!
-      if (sourceRow.ids.length <= 1) return
-      const sourcePosition = sourceRow.ids.indexOf(sourceId)
-      sourceRow.ids.splice(sourcePosition, 1)
-      sourceRow.weights.splice(sourcePosition, 1)
-      next.splice(Math.min(next.length, sourceIndex + 1), 0, { ids: [sourceId], weights: [1] })
-      const updated = sanitizeRows(next, snap.panels)
-      setRows(updated)
-      client.setRows(updated)
+    /** The card under a client point, with its box for a drop-zone check. */
+    const cardAt = (x: number, y: number): { id: string, rect: DOMRect } | undefined => {
+      // The drag shield keeps pointer events out of panel iframes. Hide it for
+      // this synchronous hit test, then put it straight back.
+      const shield = shieldRef.current
+      if (shield !== null) shield.style.pointerEvents = 'none'
+      const node = document.elementFromPoint(x, y)
+      if (shield !== null) shield.style.pointerEvents = ''
+      const card = node instanceof Element ? node.closest('[data-panel-id]') : null
+      if (card === null) return undefined
+      const id = card.getAttribute('data-panel-id')
+      if (id === null || id === '') return undefined
+      return { id, rect: card.getBoundingClientRect() }
     }
 
     const startCardDrag = (sourceId: string, event: ReactPointerEvent<HTMLElement>): void => {
       if (event.button !== 0) return
-      const cardAt = (x: number, y: number): string | undefined => {
-        const node = document.elementFromPoint(x, y)
-        const card = node instanceof Element ? node.closest('[data-panel-id]') : null
-        return card?.getAttribute('data-panel-id') ?? undefined
-      }
       const startX = event.clientX
       const startY = event.clientY
       const pointerId = event.pointerId
       const capture = event.currentTarget
       let moved = false
       const move = (pointer: PointerEvent): void => {
-        if (!moved && Math.hypot(pointer.clientX - startX, pointer.clientY - startY) <= 4) return
+        if (!moved && Math.hypot(pointer.clientX - startX, pointer.clientY - startY) <= DRAG_THRESHOLD) return
         if (!moved) {
           // Keep receiving pointer events when the cursor crosses a panel iframe.
           try {
@@ -324,7 +429,18 @@ export function createDock(client: PadClient) {
         }
         moved = true
         const under = cardAt(pointer.clientX, pointer.clientY)
-        setDrag({ id: sourceId, x: pointer.clientX, y: pointer.clientY, target: under !== sourceId ? under : undefined })
+        const target = under !== undefined && under.id !== sourceId ? under.id : undefined
+        const zone = target === undefined || under === undefined
+          ? undefined
+          : dropZoneFor(under.rect, pointer.clientX, pointer.clientY)
+        setDrag({
+          id: sourceId,
+          x: pointer.clientX,
+          y: pointer.clientY,
+          target,
+          ...(zone === undefined ? {} : { zone }),
+          blank: under === undefined,
+        })
       }
       const suppressClick = (click: MouseEvent): void => {
         click.preventDefault()
@@ -336,13 +452,14 @@ export function createDock(client: PadClient) {
         cleanup()
         setDrag(undefined)
         if (!moved) return
-        // A dragged pointer must not also collapse the card on the ensuing click.
+        // A dragged pointer must not also fold or expand the card on the click.
         document.addEventListener('click', suppressClick, { capture: true, once: true })
         setTimeout(() => document.removeEventListener('click', suppressClick, true), 160)
-        if (under !== undefined && under !== sourceId) {
-          tile(sourceId, under)
-        } else if (under !== sourceId) {
-          detach(sourceId)
+        if (tree === null) return
+        if (under === undefined) {
+          commitTree(moveToRoot(tree, sourceId))
+        } else if (under.id !== sourceId) {
+          commitTree(dropOnLeaf(tree, sourceId, under.id, dropZoneFor(under.rect, pointer.clientX, pointer.clientY)))
         }
       }
       const cancel = (): void => {
@@ -359,241 +476,471 @@ export function createDock(client: PadClient) {
       document.addEventListener('pointercancel', cancel)
     }
 
-    const startSplit = (rowIndex: number, boundary: number, event: ReactPointerEvent<HTMLDivElement>): void => {
+    const startSplit = (path: readonly number[], boundary: number, event: ReactPointerEvent<HTMLDivElement>): void => {
       if (event.button !== 0) return
       event.preventDefault()
       event.stopPropagation()
-      const rowElement = event.currentTarget.parentElement
-      const row = rows[rowIndex]
-      if (rowElement === null || row === undefined || boundary + 1 >= row.ids.length) return
-      const rect = rowElement.getBoundingClientRect()
-      const splitterWidth = 6 * (row.ids.length - 1)
-      const cardArea = Math.max(1, rect.width - splitterWidth)
-      const totalWeight = row.weights.reduce((sum, weight) => sum + weight, 0)
-      const pairWeight = (row.weights[boundary] ?? 1) + (row.weights[boundary + 1] ?? 1)
-      const startWidth = ((row.weights[boundary] ?? 1) / totalWeight) * cardArea
-      const pairWidth = (pairWeight / totalWeight) * cardArea
+      try {
+        event.currentTarget.setPointerCapture(event.pointerId)
+      } catch {
+        // Synthetic pointers cannot be captured; document listeners still work.
+      }
+      if (tree === null) return
+      const baseTree = tree
+      const split = nodeAtPath(baseTree, path)
+      const areaElement = event.currentTarget.parentElement
+      if (split === null || split.kind !== 'split' || split.dir !== 'row' || areaElement === null) return
+      if (boundary + 1 >= split.children.length) return
+      const rect = areaElement.getBoundingClientRect()
+      const gaps = SPLITTER_W * (split.children.length - 1)
+      const cardArea = Math.max(1, rect.width - gaps)
+      const total = totalWeight(split)
+      const pairWeight = (split.weights[boundary] ?? 1) + (split.weights[boundary + 1] ?? 1)
+      const startPx = ((split.weights[boundary] ?? 1) / total) * cardArea
+      const pairPx = (pairWeight / total) * cardArea
+      const minLeft = Math.min(MIN_PANE, pairPx / 2)
+      const maxLeft = Math.max(minLeft, pairPx - MIN_PANE)
       const startX = event.clientX
-      const target = event.currentTarget
-      target.setPointerCapture(event.pointerId)
-      let final = rows
+      let final = baseTree
       const move = (pointer: PointerEvent): void => {
-        const width = Math.max(80, Math.min(Math.max(80, pairWidth - 80), startWidth + pointer.clientX - startX))
-        const weight = totalWeight * width / cardArea
-        const rightWeight = pairWeight - weight
-        final = rows.map((current, index) => index === rowIndex
-          ? { ids: [...current.ids], weights: current.weights.map((value, position) => position === boundary ? weight : position === boundary + 1 ? rightWeight : value) }
-          : current)
-        setRows(final)
+        const leftPx = clamp(startPx + pointer.clientX - startX, minLeft, maxLeft)
+        const leftWeight = (leftPx / cardArea) * total
+        const weights = split.weights.map((weight, index) => index === boundary
+          ? leftWeight
+          : index === boundary + 1
+            ? pairWeight - leftWeight
+            : weight)
+        final = withWeightsAtPath(baseTree, path, weights)
+        setTree(final)
       }
       const up = (): void => {
-        target.removeEventListener('pointermove', move)
-        target.removeEventListener('pointerup', up)
-        target.removeEventListener('pointercancel', up)
-        client.setRows(final)
+        cleanup()
+        setTree(final)
+        client.setTree(final)
       }
-      target.addEventListener('pointermove', move)
-      target.addEventListener('pointerup', up)
-      target.addEventListener('pointercancel', up)
+      const cleanup = (): void => {
+        document.removeEventListener('pointermove', move)
+        document.removeEventListener('pointerup', up)
+        document.removeEventListener('pointercancel', up)
+      }
+      document.addEventListener('pointermove', move)
+      document.addEventListener('pointerup', up)
+      document.addEventListener('pointercancel', up)
     }
 
-    // Let the dock play its exit before the capsule takes its place.
+    // Let the window play its exit before the ball takes its place. The ball
+    // lands exactly on the header's collapse button, so the control does not
+    // jump when the window folds away.
     const collapse = (): void => {
       if (closing) return
+      const buttonRect = asideRef.current?.querySelector<HTMLElement>('.dshpad-collapse')?.getBoundingClientRect()
+      const center = buttonRect === undefined
+        ? { x: dockPoint.x + dockWidth - COLLAPSE_CENTER_FROM_RIGHT, y: dockPoint.y + COLLAPSE_CENTER_Y }
+        : { x: buttonRect.left + buttonRect.width / 2, y: buttonRect.top + buttonRect.height / 2 }
+      const nextBall = clampBall(
+        { x: center.x - BALL_SIZE / 2, y: center.y - BALL_SIZE / 2 },
+        viewport.width,
+        viewport.height,
+      )
+      if (transitionTimer.current !== undefined) {
+        clearTimeout(transitionTimer.current)
+        transitionTimer.current = undefined
+      }
+      setBallTransition({ point: nextBall, mode: 'closing' })
       setClosing(true)
       closeTimer.current = setTimeout(() => {
         setClosing(false)
-        client.setLayout({ expanded: false })
-      }, 180)
+        setBallTransition(undefined)
+        client.setLayout({ expanded: false, ball: nextBall })
+      }, 160)
     }
 
-    // Capsule: a pointer gesture that moves less than the threshold is a click.
-    const onCapsulePointerDown = (event: ReactPointerEvent<HTMLButtonElement>): void => {
+    /** Open from the ball, keeping its disc underneath while the window fades
+     * in; the star is a separate persistent layer and never blinks. */
+    const openFromBall = (point: Point): void => {
+      if (transitionTimer.current !== undefined) clearTimeout(transitionTimer.current)
+      setBallTransition({ point, mode: 'opening' })
+      client.setLayout({ expanded: true })
+      transitionTimer.current = setTimeout(() => {
+        setBallTransition(undefined)
+        transitionTimer.current = undefined
+      }, 200)
+    }
+
+    // The ball is both the open button and its own draggable handle.
+    const onBallPointerDown = (event: ReactPointerEvent<HTMLDivElement>): void => {
       if (event.button !== 0) return
+      event.preventDefault()
+      try {
+        event.currentTarget.setPointerCapture(event.pointerId)
+      } catch {
+        // Synthetic pointers cannot be captured; document listeners still work.
+      }
+      const startX = event.clientX
       const startY = event.clientY
-      const startFraction = snap.layout.capsuleY
+      const start = ballPoint
       let moved = false
-      const target = event.currentTarget
-      target.setPointerCapture(event.pointerId)
-      const move = (e: PointerEvent): void => {
-        if (!moved && Math.abs(e.clientY - startY) < DRAG_THRESHOLD) return
+      let final = start
+      const move = (pointer: PointerEvent): void => {
+        if (!moved && Math.hypot(pointer.clientX - startX, pointer.clientY - startY) < DRAG_THRESHOLD) return
         moved = true
-        setDragY(Math.min(MAX_CAPSULE_Y, Math.max(MIN_CAPSULE_Y, startFraction + (e.clientY - startY) / window.innerHeight)))
+        final = clampBall({ x: start.x + pointer.clientX - startX, y: start.y + pointer.clientY - startY }, viewport.width, viewport.height)
+        setBallDrag(final)
       }
-      const up = (e: PointerEvent): void => {
-        target.removeEventListener('pointermove', move)
-        target.removeEventListener('pointerup', up)
-        target.removeEventListener('pointercancel', up)
-        if (moved) {
-          const y = Math.min(MAX_CAPSULE_Y, Math.max(MIN_CAPSULE_Y, startFraction + (e.clientY - startY) / window.innerHeight))
-          setDragY(undefined)
-          client.setLayout({ capsuleY: y })
-        } else if (e.type === 'pointerup') {
-          client.setLayout({ expanded: true })
+      const up = (): void => {
+        cleanup()
+        if (!moved) {
+          setBallDrag(undefined)
+          openFromBall(start)
+          return
         }
+        const snapped = snapBall(final, viewport.width, viewport.height)
+        setBallDrag(undefined)
+        // A moved ball is the new anchor for the window; drop any old window
+        // position so the next open puts the collapse button under the ball.
+        client.setLayout({ ball: snapped, dock: null })
       }
-      target.addEventListener('pointermove', move)
-      target.addEventListener('pointerup', up)
-      target.addEventListener('pointercancel', up)
+      const cancel = (): void => {
+        cleanup()
+        setBallDrag(undefined)
+      }
+      const cleanup = (): void => {
+        document.removeEventListener('pointermove', move)
+        document.removeEventListener('pointerup', up)
+        document.removeEventListener('pointercancel', cancel)
+      }
+      document.addEventListener('pointermove', move)
+      document.addEventListener('pointerup', up)
+      document.addEventListener('pointercancel', cancel)
     }
 
-    const onCapsuleKey = (event: ReactKeyboardEvent<HTMLButtonElement>): void => {
+    const onBallKey = (event: ReactKeyboardEvent<HTMLDivElement>): void => {
       if (event.key === 'Enter' || event.key === ' ') {
         event.preventDefault()
-        client.setLayout({ expanded: true })
+        openFromBall(ballPoint)
       }
     }
 
-    // Header drag: move the whole dock up and down. The saved capsuleY is the
-    // single anchor, so the capsule reappears at the height the dock was left.
+    // Move the whole window from a pointer that started at (startX, startY).
+    // Shared by the header and the long-press gesture on the star button.
+    const startDockMove = (startX: number, startY: number, onFirstMove?: () => void): void => {
+      const start = dockPoint
+      const width = dockWidth
+      const boxHeight = asideRef.current?.getBoundingClientRect().height ?? MIN_DOCK_HEIGHT
+      const height = clamp(Math.round(boxHeight), MIN_DOCK_HEIGHT, Math.max(MIN_DOCK_HEIGHT, viewport.height - EDGE_GAP * 2))
+      const maxX = Math.max(EDGE_GAP, viewport.width - width - EDGE_GAP)
+      const maxY = Math.max(EDGE_GAP, viewport.height - height - EDGE_GAP)
+      let moved = false
+      let final = start
+      const move = (pointer: PointerEvent): void => {
+        if (!moved && Math.hypot(pointer.clientX - startX, pointer.clientY - startY) < DRAG_THRESHOLD) return
+        if (!moved) {
+          moved = true
+          onFirstMove?.()
+          setDragHeight(height)
+        }
+        final = {
+          x: Math.round(clamp(start.x + pointer.clientX - startX, EDGE_GAP, maxX)),
+          y: Math.round(clamp(start.y + pointer.clientY - startY, EDGE_GAP, maxY)),
+        }
+        setDockDrag(final)
+      }
+      const up = (): void => {
+        cleanup()
+        if (!moved) return
+        setDockDrag(undefined)
+        setDragHeight(undefined)
+        client.setLayout({ dock: final, dockHeight: height })
+      }
+      const cleanup = (): void => {
+        document.removeEventListener('pointermove', move)
+        document.removeEventListener('pointerup', up)
+        document.removeEventListener('pointercancel', up)
+      }
+      document.addEventListener('pointermove', move)
+      document.addEventListener('pointerup', up)
+      document.addEventListener('pointercancel', up)
+    }
+
+    // Header drag: move the window anywhere in the viewport, and freeze its
+    // current height so moving it down does not squeeze it against the floor.
     const onHeadPointerDown = (event: ReactPointerEvent<HTMLElement>): void => {
       if (event.button !== 0) return
       if ((event.target as HTMLElement).closest('button') !== null) return
+      event.preventDefault()
+      try {
+        event.currentTarget.setPointerCapture(event.pointerId)
+      } catch {
+        // Synthetic pointers cannot be captured; document listeners still work.
+      }
+      startDockMove(event.clientX, event.clientY)
+    }
+
+    // A short press on the star collapses; holding it and moving drags the
+    // window. Both gestures share the same 28px control.
+    const onCollapsePointerDown = (event: ReactPointerEvent<HTMLButtonElement>): void => {
+      if (event.button !== 0) return
+      event.stopPropagation()
+      suppressCollapseClick.current = false
+      const token = collapsePressToken.current + 1
+      collapsePressToken.current = token
+      if (holdTimer.current !== undefined) {
+        clearTimeout(holdTimer.current)
+        holdTimer.current = undefined
+      }
+      try {
+        event.currentTarget.setPointerCapture(event.pointerId)
+      } catch {
+        // Synthetic pointers cannot be captured; document listeners still work.
+      }
+      const startX = event.clientX
       const startY = event.clientY
-      const startTop = dragTop ?? dockTop
-      const target = event.currentTarget
-      const { min } = dockLimits(viewportH)
-      // The dock's current height is locked by `dockCap`; keep its bottom in
-      // view instead of letting the height collapse against the window floor.
-      const boxHeight = asideRef.current?.getBoundingClientRect().height ?? viewportH - startTop - EDGE_GAP
-      const maxTop = Math.max(min, viewportH - boxHeight - EDGE_GAP)
       let moved = false
-      const topAt = (y: number): number => Math.max(min, Math.min(startTop + (y - startY), maxTop))
-      target.setPointerCapture(event.pointerId)
-      const move = (e: PointerEvent): void => {
-        if (!moved && Math.abs(e.clientY - startY) < DRAG_THRESHOLD) return
-        moved = true
-        setDragTop(topAt(e.clientY))
+      let dragged = false
+      let dragStarted = false
+      const clearTimer = (): void => {
+        if (holdTimer.current !== undefined) {
+          clearTimeout(holdTimer.current)
+          holdTimer.current = undefined
+        }
       }
-      const up = (e: PointerEvent): void => {
-        target.removeEventListener('pointermove', move)
-        target.removeEventListener('pointerup', up)
-        target.removeEventListener('pointercancel', up)
-        if (!moved) return
-        const nextTop = topAt(e.clientY)
-        setDragTop(undefined)
-        client.setLayout({ capsuleY: Math.min(MAX_CAPSULE_Y, Math.max(MIN_CAPSULE_Y, (nextTop + HEADER_HALF) / viewportH)) })
+      const beginDrag = (): void => {
+        if (dragStarted || token !== collapsePressToken.current) return
+        dragStarted = true
+        clearTimer()
+        startDockMove(startX, startY, () => { dragged = true })
       }
-      target.addEventListener('pointermove', move)
-      target.addEventListener('pointerup', up)
-      target.addEventListener('pointercancel', up)
+      const onMove = (pointer: PointerEvent): void => {
+        if (Math.hypot(pointer.clientX - startX, pointer.clientY - startY) > 8) {
+          moved = true
+          beginDrag()
+        }
+      }
+      const onUp = (): void => {
+        clearTimer()
+        document.removeEventListener('pointermove', onMove)
+        document.removeEventListener('pointerup', onUp)
+        document.removeEventListener('pointercancel', onUp)
+        if (!dragStarted && !moved) return
+        // A long hold that never actually moved is still a click: let the
+        // button's own onClick collapse instead of swallowing it.
+        if (!dragged && !moved) return
+        // The browser may still emit a click after a hold/drag; swallow it.
+        suppressCollapseClick.current = true
+        setTimeout(() => { suppressCollapseClick.current = false }, 500)
+      }
+      holdTimer.current = setTimeout(beginDrag, 260)
+      document.addEventListener('pointermove', onMove)
+      document.addEventListener('pointerup', onUp)
+      document.addEventListener('pointercancel', onUp)
+    }
+    const onCollapseClick = (): void => {
+      if (suppressCollapseClick.current) {
+        suppressCollapseClick.current = false
+        return
+      }
+      collapse()
     }
 
-    // Top edge: change the height from above, keeping the bottom edge in place.
-    const onTopEdgePointerDown = (event: ReactPointerEvent<HTMLDivElement>): void => {
-      if (event.button !== 0) return
-      event.preventDefault()
-      const startY = event.clientY
-      const startTop = dragTop ?? dockTop
-      const startHeight = dockHeight ?? asideRef.current?.getBoundingClientRect().height ?? Math.max(MIN_DOCK_HEIGHT, viewportH - startTop - EDGE_GAP)
-      const bottom = Math.min(startTop + startHeight, viewportH - EDGE_GAP)
-      const { min } = dockLimits(viewportH)
-      const topAt = (y: number): number => Math.max(min, Math.min(startTop + (y - startY), bottom - MIN_DOCK_HEIGHT))
-      const target = event.currentTarget
-      target.setPointerCapture(event.pointerId)
-      const move = (e: PointerEvent): void => {
-        const nextTop = topAt(e.clientY)
-        setDragTop(nextTop)
-        setDockHeight(bottom - nextTop)
-      }
-      const up = (e: PointerEvent): void => {
-        target.removeEventListener('pointermove', move)
-        target.removeEventListener('pointerup', up)
-        target.removeEventListener('pointercancel', up)
-        const nextTop = topAt(e.clientY)
-        const nextHeight = bottom - nextTop
-        setDragTop(undefined)
-        setDockHeight(nextHeight)
-        client.setDockHeight(nextHeight)
-        client.setLayout({ capsuleY: Math.min(MAX_CAPSULE_Y, Math.max(MIN_CAPSULE_Y, (nextTop + HEADER_HALF) / viewportH)) })
-      }
-      target.addEventListener('pointermove', move)
-      target.addEventListener('pointerup', up)
-      target.addEventListener('pointercancel', up)
-    }
-
-    // Bottom edge: grow or shrink the dock downwards from a fixed top.
-    const onBottomEdgePointerDown = (event: ReactPointerEvent<HTMLDivElement>): void => {
-      if (event.button !== 0) return
-      event.preventDefault()
-      const startY = event.clientY
-      const top = dragTop ?? dockTop
-      const startHeight = dockHeight ?? asideRef.current?.getBoundingClientRect().height ?? Math.max(MIN_DOCK_HEIGHT, viewportH - top - EDGE_GAP)
-      const maxHeight = Math.max(MIN_DOCK_HEIGHT, viewportH - top - EDGE_GAP)
-      const heightAt = (y: number): number => Math.max(MIN_DOCK_HEIGHT, Math.min(startHeight + (y - startY), maxHeight))
-      const target = event.currentTarget
-      target.setPointerCapture(event.pointerId)
-      setDockHeight(startHeight)
-      const move = (e: PointerEvent): void => setDockHeight(heightAt(e.clientY))
-      const up = (e: PointerEvent): void => {
-        target.removeEventListener('pointermove', move)
-        target.removeEventListener('pointerup', up)
-        target.removeEventListener('pointercancel', up)
-        const nextHeight = heightAt(e.clientY)
-        setDockHeight(nextHeight)
-        client.setDockHeight(nextHeight)
-      }
-      target.addEventListener('pointermove', move)
-      target.addEventListener('pointerup', up)
-      target.addEventListener('pointercancel', up)
-    }
-
+    // Left edge: width, with the right edge staying put.
     const onResizePointerDown = (event: ReactPointerEvent<HTMLDivElement>): void => {
       if (event.button !== 0) return
       event.preventDefault()
-      const startX = event.clientX
-      const startWidth = snap.layout.width
-      const target = event.currentTarget
-      target.setPointerCapture(event.pointerId)
-      const widthAt = (x: number): number => Math.min(MAX_WIDTH, Math.max(MIN_WIDTH, startWidth + (startX - x)))
-      const move = (e: PointerEvent): void => setDragWidth(widthAt(e.clientX))
-      const up = (e: PointerEvent): void => {
-        target.removeEventListener('pointermove', move)
-        target.removeEventListener('pointerup', up)
-        target.removeEventListener('pointercancel', up)
-        setDragWidth(undefined)
-        client.setLayout({ width: widthAt(e.clientX) })
+      event.stopPropagation()
+      try {
+        event.currentTarget.setPointerCapture(event.pointerId)
+      } catch {
+        // Synthetic pointers cannot be captured; document listeners still work.
       }
-      target.addEventListener('pointermove', move)
-      target.addEventListener('pointerup', up)
-      target.addEventListener('pointercancel', up)
+      const startX = event.clientX
+      const startWidth = dockWidth
+      const right = dockPoint.x + startWidth
+      const minWidth = Math.min(MIN_WIDTH, Math.max(140, viewport.width - EDGE_GAP * 2))
+      const maxWidth = Math.max(minWidth, Math.min(MAX_WIDTH, right - EDGE_GAP))
+      let finalWidth = startWidth
+      let finalPoint = dockPoint
+      const move = (pointer: PointerEvent): void => {
+        finalWidth = Math.round(clamp(startWidth + (startX - pointer.clientX), minWidth, maxWidth))
+        finalPoint = { x: Math.round(right - finalWidth), y: dockPoint.y }
+        setDragWidth(finalWidth)
+        setDockDrag(finalPoint)
+      }
+      const up = (): void => {
+        cleanup()
+        setDragWidth(undefined)
+        setDockDrag(undefined)
+        client.setLayout({ width: finalWidth, dock: finalPoint })
+      }
+      const cleanup = (): void => {
+        document.removeEventListener('pointermove', move)
+        document.removeEventListener('pointerup', up)
+        document.removeEventListener('pointercancel', up)
+      }
+      document.addEventListener('pointermove', move)
+      document.addEventListener('pointerup', up)
+      document.addEventListener('pointercancel', up)
+    }
+
+    // Top edge: change height from above while the bottom edge stays put.
+    const onTopEdgePointerDown = (event: ReactPointerEvent<HTMLDivElement>): void => {
+      if (event.button !== 0) return
+      event.preventDefault()
+      try {
+        event.currentTarget.setPointerCapture(event.pointerId)
+      } catch {
+        // Synthetic pointers cannot be captured; document listeners still work.
+      }
+      const startY = event.clientY
+      const boxHeight = asideRef.current?.getBoundingClientRect().height ?? savedHeight ?? MIN_DOCK_HEIGHT
+      const bottom = Math.min(dockPoint.y + boxHeight, viewport.height - EDGE_GAP)
+      const startTop = dockPoint.y
+      const maxTop = Math.max(EDGE_GAP, bottom - MIN_DOCK_HEIGHT)
+      let finalHeight = bottom - startTop
+      let finalPoint = dockPoint
+      const move = (pointer: PointerEvent): void => {
+        const nextTop = Math.round(clamp(startTop + pointer.clientY - startY, EDGE_GAP, maxTop))
+        finalHeight = Math.round(bottom - nextTop)
+        finalPoint = { x: dockPoint.x, y: nextTop }
+        setDragHeight(finalHeight)
+        setDockDrag(finalPoint)
+      }
+      const up = (): void => {
+        cleanup()
+        setDragHeight(undefined)
+        setDockDrag(undefined)
+        client.setLayout({ dockHeight: finalHeight, dock: finalPoint })
+      }
+      const cleanup = (): void => {
+        document.removeEventListener('pointermove', move)
+        document.removeEventListener('pointerup', up)
+        document.removeEventListener('pointercancel', up)
+      }
+      document.addEventListener('pointermove', move)
+      document.addEventListener('pointerup', up)
+      document.addEventListener('pointercancel', up)
+    }
+
+    // Bottom edge: grow or shrink the window downwards from a fixed top.
+    const onBottomEdgePointerDown = (event: ReactPointerEvent<HTMLDivElement>): void => {
+      if (event.button !== 0) return
+      event.preventDefault()
+      try {
+        event.currentTarget.setPointerCapture(event.pointerId)
+      } catch {
+        // Synthetic pointers cannot be captured; document listeners still work.
+      }
+      const startY = event.clientY
+      const startHeight = asideRef.current?.getBoundingClientRect().height ?? savedHeight ?? MIN_DOCK_HEIGHT
+      const maxHeight = Math.max(MIN_DOCK_HEIGHT, viewport.height - dockPoint.y - EDGE_GAP)
+      let finalHeight = startHeight
+      const move = (pointer: PointerEvent): void => {
+        finalHeight = Math.round(clamp(startHeight + pointer.clientY - startY, MIN_DOCK_HEIGHT, maxHeight))
+        setDragHeight(finalHeight)
+      }
+      const up = (): void => {
+        cleanup()
+        setDragHeight(undefined)
+        client.setLayout({ dockHeight: finalHeight, dock: dockPoint })
+      }
+      const cleanup = (): void => {
+        document.removeEventListener('pointermove', move)
+        document.removeEventListener('pointerup', up)
+        document.removeEventListener('pointercancel', up)
+      }
+      document.addEventListener('pointermove', move)
+      document.addEventListener('pointerup', up)
+      document.addEventListener('pointercancel', up)
+    }
+
+    const renderNode = (node: LayoutNode, path: readonly number[]): ReactNode => {
+      if (node.kind === 'leaf') {
+        const view = snap.panels.find(panel => panel.id === node.id)
+        if (view === undefined) return null
+        return (
+          <PanelCard
+            key={node.id}
+            view={view}
+            client={client}
+            theme={theme}
+            lang={lang}
+            t={t}
+            now={now}
+            fresh={snap.fresh === view.id}
+            dragging={drag?.id === view.id}
+            dropTarget={drag?.target === view.id}
+            dropZone={drag?.target === view.id ? drag.zone : undefined}
+            onAsk={(text, submit) => { ask(text, submit) }}
+            onExpand={() => setFocusedId(view.id)}
+            onDragStart={event => startCardDrag(view.id, event)}
+          />
+        )
+      }
+      const pathKey = path.join('.') || 'root'
+      if (node.dir === 'col') {
+        return (
+          <div className="dshpad-split is-col" key={pathKey}>
+            {node.children.map((child, index) => (
+              <div className="dshpad-pane" key={`${pathKey}.${index}`}>
+                {renderNode(child, [...path, index])}
+              </div>
+            ))}
+          </div>
+        )
+      }
+      return (
+        <div className="dshpad-split is-row" key={pathKey} style={{ gridTemplateColumns: rowTemplate(node) }}>
+          {node.children.map((child, index) => (
+            <Fragment key={`${pathKey}.${index}`}>
+              {index > 0
+                ? (
+                  <div className="dshpad-splitter" role="separator" aria-orientation="vertical" title={t('dock.split')}
+                    onPointerDown={event => startSplit(path, index - 1, event)} />
+                  )
+                : null}
+              <div className="dshpad-pane">{renderNode(child, [...path, index])}</div>
+            </Fragment>
+          ))}
+        </div>
+      )
     }
 
     if (!snap.layout.expanded) {
-      const y = dragY ?? snap.layout.capsuleY
       return (
         <div className="dshpad-root" ref={rootRef}>
-          <button
-            type="button"
-            className={`dshpad-toggle${dragY !== undefined ? ' is-dragging' : ''}`}
-            style={{ top: `${(y * 100).toFixed(2)}%` }}
-            title={attention ? t('capsule.attention') : t('dock.open')}
+          <div
+            id="dshpad-ball"
+            className={`dshpad-ball${ballDrag !== undefined ? ' is-dragging' : ''}`}
+            style={{ left: ballPoint.x, top: ballPoint.y }}
+            role="button"
+            tabIndex={0}
+            title={attention ? t('capsule.attention') : `${t('dock.open')} · ${t('dock.ballHint')}`}
             aria-label={t('dock.open')}
-            onPointerDown={onCapsulePointerDown}
-            onKeyDown={onCapsuleKey}
+            onPointerDown={onBallPointerDown}
+            onKeyDown={onBallKey}
           >
-            {Icon.expand}
-            {attention ? <i className="dshpad-dot" aria-hidden="true" /> : null}
-          </button>
+            <BallDisc />
+          </div>
+          {starAnchor}
+          {ballDrag !== undefined ? <div className="dshpad-drag-shield" aria-hidden="true" /> : null}
         </div>
       )
     }
 
     const examples: PadKey[] = ['empty.example1', 'empty.example2', 'empty.example3']
     const dragView = drag === undefined ? undefined : snap.panels.find(panel => panel.id === drag.id)
-    // Open where the toggle sits: its centre becomes the header's grab area.
-    const toggleCenter = Math.round(snap.layout.capsuleY * viewportH)
-    const limits = dockLimits(viewportH)
-    const dockTop = Math.min(limits.max, Math.max(limits.min, toggleCenter - HEADER_HALF))
-    const top = dragTop ?? dockTop
-    const available = Math.max(MIN_DOCK_HEIGHT, viewportH - top - EDGE_GAP)
-    const renderedHeight = dockHeight === undefined ? undefined : Math.min(dockHeight, available)
-    const dockMaxHeight = dockCap ?? Math.max(200, available)
+    const dropHint = drag === undefined
+      ? undefined
+      : drag.target !== undefined && drag.zone !== undefined
+        ? t(DROP_LABEL[drag.zone])
+        : drag.blank
+          ? t(DROP_LABEL.root)
+          : t(DROP_LABEL.hint)
     return (
       <div className="dshpad-root" ref={rootRef}>
-        <aside ref={asideRef} className={`dshpad-dock${dragTop !== undefined ? ' is-moving' : ''}${closing ? ' is-closing' : ''}`} style={{ width: dragWidth ?? snap.layout.width, top, height: renderedHeight, maxHeight: renderedHeight ?? dockMaxHeight }} aria-label={t('dock.title')}>
+        <aside ref={asideRef} className={`dshpad-dock${dockDrag !== undefined ? ' is-moving' : ''}${closing ? ' is-closing' : ''}`}
+          style={dockStyle} aria-label={t('dock.title')}>
           <div className="dshpad-dock-edge is-top" role="separator" aria-orientation="horizontal" title={t('dock.resizeHeight')} onPointerDown={onTopEdgePointerDown}
-            onDoubleClick={() => { setDockHeight(undefined); client.setDockHeight(undefined) }} />
+            onDoubleClick={() => { setDragHeight(undefined); client.setDockHeight(undefined) }} />
           <div className="dshpad-resize" title={t('dock.resize')} onPointerDown={onResizePointerDown} />
           <header className="dshpad-dock-head" title={t('dock.move')} onPointerDown={onHeadPointerDown}>
             <span className="dshpad-grip" aria-hidden="true" />
@@ -612,8 +959,14 @@ export function createDock(client: PadClient) {
                 </button>
                 )
               : null}
-            <button type="button" className="dshpad-collapse" title={t('dock.collapse')} aria-label={t('dock.collapse')}
-              onClick={collapse}>{Icon.collapse}</button>
+            <button type="button" className="dshpad-collapse" title={`${t('dock.collapse')} · ${t('dock.holdDrag')}`} aria-label={t('dock.collapse')}
+              onClick={onCollapseClick}
+              onPointerDown={onCollapsePointerDown}
+              onContextMenu={event => event.preventDefault()}>
+              <svg className="dshpad-collapse-star" viewBox="0 0 28 28" width="28" height="28" aria-hidden="true" focusable="false">
+                <path d={STAR_PATH} />
+              </svg>
+            </button>
           </header>
 
           {updateOpen
@@ -679,49 +1032,39 @@ export function createDock(client: PadClient) {
                 )
               : (
                 <div className="dshpad-rows">
-                  {rows.map((row, rowIndex) => (
-                    <div className="dshpad-row" key={row.ids.join('|')} style={{ gridTemplateColumns: rowTemplate(row) }}>
-                      {row.ids.map((id, index) => {
-                        const view = snap.panels.find(panel => panel.id === id)
-                        if (view === undefined) return null
-                        return (
-                          <Fragment key={id}>
-                            {index > 0
-                              ? <div className="dshpad-splitter" role="separator" aria-orientation="vertical" title={t('dock.split')}
-                                  onPointerDown={event => startSplit(rowIndex, index - 1, event)} />
-                              : null}
-                            <PanelCard
-                              view={view}
-                              client={client}
-                              theme={theme}
-                              lang={lang}
-                              t={t}
-                              now={now}
-                              fresh={snap.fresh === view.id}
-                              dragging={drag?.id === id}
-                              dropTarget={drag?.target === id}
-                              onAsk={(text, submit) => { ask(text, submit) }}
-                              onExpand={() => setFocusedId(view.id)}
-                              onDragStart={event => startCardDrag(id, event)}
-                            />
-                          </Fragment>
-                        )
-                      })}
-                    </div>
-                  ))}
+                  {tree === null ? null : renderNode(tree, [])}
+                  {drag?.blank ? <div className="dshpad-root-drop">{t(DROP_LABEL.root)}</div> : null}
                 </div>
                 )}
           </div>
 
           <div className="dshpad-dock-foot" role="separator" aria-orientation="horizontal" title={t('dock.resizeHeight')} onPointerDown={onBottomEdgePointerDown}
-            onDoubleClick={() => { setDockHeight(undefined); client.setDockHeight(undefined) }} />
+            onDoubleClick={() => { setDragHeight(undefined); client.setDockHeight(undefined) }} />
         </aside>
+
+        {ballTransition === undefined
+          ? null
+          : (
+            <div
+              className={`dshpad-ball-transition is-${ballTransition.mode}`}
+              style={{ left: ballTransition.point.x, top: ballTransition.point.y }}
+              aria-hidden="true"
+            >
+              <BallDisc />
+            </div>
+            )}
+        {starAnchor}
+        {dockDrag !== undefined ? <div className="dshpad-drag-shield" aria-hidden="true" /> : null}
+        {dragHeight !== undefined && dockDrag === undefined ? <div className="dshpad-drag-shield" aria-hidden="true" /> : null}
+
+        {drag !== undefined ? <div className="dshpad-drag-shield" ref={shieldRef} aria-hidden="true" /> : null}
 
         {drag !== undefined && dragView !== undefined
           ? (
             <div className="dshpad-drag-ghost" style={{ left: drag.x + 12, top: drag.y + 12 }}>
               {dragView.definition.icon ? <span>{dragView.definition.icon}</span> : null}
-              <span>{dragView.definition.title}</span>
+              <span className="dshpad-drag-name">{dragView.definition.title}</span>
+              {dropHint === undefined ? null : <span className="dshpad-drag-hint">{dropHint}</span>}
             </div>
             )
           : null}
@@ -736,7 +1079,7 @@ export function createDock(client: PadClient) {
                   <span className="dshpad-focus-title">{focusedView.definition.title}</span>
                   <button type="button" className="dshpad-icon-btn" aria-label={t('card.close')} title={t('card.close')}
                     onClick={() => setFocusedId(undefined)}>
-                    <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M4 4l8 8M12 4l-8 8" /></svg>
+                    {Icon.close}
                   </button>
                 </header>
                 <PanelFrame

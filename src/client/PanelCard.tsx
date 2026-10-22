@@ -2,6 +2,7 @@
 import { type PointerEvent as ReactPointerEvent, useEffect, useRef, useState } from 'react'
 import type { PanelModelCatalog, PanelModelOption, PanelModelSelection, PanelView, SourceReading } from '../shared/types.ts'
 import type { PadKey } from './locales.ts'
+import type { DropZone } from './layout.ts'
 import type { HistoryPoint, PadClient } from './pad-client.ts'
 import { PanelFrame } from './PanelFrame.tsx'
 import type { ThemeSnapshot } from './theme.ts'
@@ -74,12 +75,14 @@ export interface PanelCardProps {
   readonly fresh: boolean
   readonly dragging: boolean
   readonly dropTarget: boolean
+  /** Which part of this card a dragged card would split or swap into. */
+  readonly dropZone?: DropZone
   readonly onAsk: (text: string, submit: boolean) => void
   readonly onExpand: () => void
   readonly onDragStart: (event: ReactPointerEvent<HTMLElement>) => void
 }
 
-export function PanelCard({ view, client, theme, lang, t, now, fresh, dragging, dropTarget, onAsk, onExpand, onDragStart }: PanelCardProps) {
+export function PanelCard({ view, client, theme, lang, t, now, fresh, dragging, dropTarget, dropZone, onAsk, onExpand, onDragStart }: PanelCardProps) {
   const [menuOpen, setMenuOpen] = useState(false)
   const [confirmDelete, setConfirmDelete] = useState(false)
   const [modelOpen, setModelOpen] = useState(false)
@@ -186,13 +189,16 @@ export function PanelCard({ view, client, theme, lang, t, now, fresh, dragging, 
   const startHeaderDrag = (event: ReactPointerEvent<HTMLElement>): void => {
     const target = event.target
     if (!(target instanceof Element)) return
+    // The title, menu and expand controls are buttons; pressing them must not
+    // turn a slightly shaky click into a card drag.
+    if (target.closest('button') !== null) return
     if (target.closest('.dshpad-card-actions') !== null) return
     if (target.closest('.dshpad-expand') !== null) return
     onDragStart(event)
   }
 
   return (
-    <article className={`dshpad-card${fresh ? ' is-fresh' : ''}${folded ? ' is-folded' : ''}${dragging ? ' is-dragging' : ''}${dropTarget ? ' is-drop-target' : ''}`}
+    <article className={`dshpad-card${fresh ? ' is-fresh' : ''}${folded ? ' is-folded' : ''}${dragging ? ' is-dragging' : ''}${dropTarget ? ' is-drop-target' : ''}${dropZone === undefined ? '' : ` is-drop-${dropZone}`}`}
       aria-label={definition.title} data-panel-id={view.id}>
       <header className="dshpad-card-head" onPointerDown={startHeaderDrag}>
         <span className="dshpad-card-grip" title={t('card.drag')} aria-label={t('card.drag')} role="button" tabIndex={-1}>

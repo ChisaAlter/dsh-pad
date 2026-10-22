@@ -4,7 +4,7 @@
  *
  * Direct sources only poll while at least one open stream watches the panel
  * (the dock is expanded and the card is not folded), so a closed browser or a
- * capsule-sized dock costs nothing on the Host.
+ * collapsed dock costs nothing on the Host.
  */
 import type { PanelData, PanelRecord, PanelView, SourceReading, StreamEvent } from '../shared/types.ts'
 import { type SecretResolver, runSource } from './sources.ts'

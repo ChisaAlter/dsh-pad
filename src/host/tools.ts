@@ -156,7 +156,7 @@ export function registerTools(deps: ToolDeps): void {
 
   ctx.effect(() => ctx.tools.register(defineTool({
     name: 'pad_list',
-    description: '列出右侧面板坞里的所有面板（id、标题、数据源、最近的错误、AI 刷新状态）。改面板、修面板前先调用。',
+    description: '列出悬浮面板坞里的所有面板（id、标题、数据源、最近的错误、AI 刷新状态）。改面板、修面板前先调用。',
     parameters: {},
     output: textOutput,
     isConcurrencySafe: () => true,
@@ -214,7 +214,7 @@ export function registerTools(deps: ToolDeps): void {
 
   ctx.effect(() => ctx.tools.register(defineTool({
     name: 'pad_create',
-    description: `在右侧悬浮面板坞里新建一张面板。\n\n${PANEL_GUIDE}`,
+    description: `在悬浮面板坞里新建一张面板。\n\n${PANEL_GUIDE}`,
     parameters: {
       title: { type: 'string', required: true, description: '简短标题（≤40 字）' },
       icon: { type: 'string', description: '一个 emoji' },
@@ -237,7 +237,7 @@ export function registerTools(deps: ToolDeps): void {
         await store.approve(panel.id, sourcesFingerprint(definition.sources))
         panel = store.get(panel.id)
       }
-      const lines = [`已创建面板 ${panel.id}「${definition.title}」，已经出现在右侧面板坞。`]
+      const lines = [`已创建面板 ${panel.id}「${definition.title}」，已经出现在悬浮面板坞。`]
       if (duplicate) lines.push(`注意：已有同名面板 ${duplicate.id}，如果是重复创建请用 pad_delete 删掉一张。`)
       lines.push(...await firstReadings(panel))
       if (definition.agent && args.data === undefined) lines.push('提醒：AI 刷新面板没有交第一版 data，面板在第一次后台刷新前是空的。最好现在取一次真实数据，用 pad_update 的 data 补上。')

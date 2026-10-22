@@ -1,9 +1,11 @@
 /**
  * Browser-side panel state: one event stream to the Host, the panel list,
- * per-source reading history, and the dock's own view state (expanded,
- * width, capsule position) persisted per device.
+ * per-source reading history, and the dock's own view state (expanded, width,
+ * floating-ball and window positions, nested card layout) persisted per device.
  */
-import { type Json, type PanelAction, type PanelData, type PanelModelCatalog, type PanelRunResult, type PanelView, type PadUpdateInfo, ROUTES, type StreamEvent } from '../shared/types.ts'
+import type { Json, PanelAction, PanelData, PanelModelCatalog, PanelRunResult, PanelView, PadUpdateInfo, StreamEvent } from '../shared/types.ts'
+import { ROUTES } from '../shared/types.ts'
+import { type LayoutNode, legacyRowsToTree, parseTree } from './layout.ts'
 
 export const HISTORY_LIMIT = 120
 
@@ -12,19 +14,27 @@ export interface HistoryPoint {
   readonly at: string
 }
 
-/** One row of tiled cards; weights are relative widths inside the row. */
+/** One row of the pre-nesting tiled layout; read only to migrate stored state. */
 export interface PanelRowLayout {
   readonly ids: readonly string[]
   readonly weights: readonly number[]
 }
 
+/** A viewport position in CSS pixels. */
+export interface Point {
+  readonly x: number
+  readonly y: number
+}
+
 export interface DockLayout {
   readonly expanded: boolean
   readonly width: number
-  /** Tiled rows; every panel appears in exactly one row. */
-  readonly rows: readonly PanelRowLayout[]
-  /** Capsule vertical position as a fraction of the viewport height. */
-  readonly capsuleY: number
+  /** Nested card layout; null when there are no panels yet. */
+  readonly tree: LayoutNode | null
+  /** Floating ball's top-left corner. */
+  readonly ball: Point
+  /** Where the user last put the expanded window; null opens next to the ball. */
+  readonly dock: Point | null
   /** Per-panel iframe height in px, set by dragging a panel's bottom edge. */
   readonly heights: Readonly<Record<string, number>>
   /** Dock height in px, set by dragging the dock's top or bottom edge. */
@@ -42,17 +52,44 @@ export interface PadSnapshot {
 }
 
 const LAYOUT_KEY = 'dsh-pad:layout'
-const DEFAULT_LAYOUT: DockLayout = { expanded: false, width: 352, rows: [], capsuleY: 0.42, heights: {} }
+const DEFAULT_WIDTH = 352
 export const MIN_WIDTH = 288
 export const MAX_WIDTH = 980
-/** Safe band for the floating capsule: it must stay clear of the window chrome. */
-export const MIN_CAPSULE_Y = 0.1
-export const MAX_CAPSULE_Y = 0.9
 export const MIN_PANEL_HEIGHT = 120
 export const MAX_PANEL_HEIGHT = 900
 /** Bounds for a dock height chosen with its top/bottom edge handles. */
 export const MIN_DOCK_HEIGHT = 180
 export const MAX_DOCK_HEIGHT = 2000
+/** The floating open button: a round ball, not a strip on the edge. */
+export const BALL_SIZE = 28
+/** Keep at least this much of the ball on screen while dragging / restoring. */
+export const BALL_MARGIN = 1
+/** Snap inset that puts the ball centre under the header's collapse button
+ * (8px window gap + 9px right inset + half the 28px button). */
+export const BALL_SNAP_INSET = 31 - BALL_SIZE / 2
+
+function viewportSize(): { width: number, height: number } {
+  if (typeof window === 'undefined') return { width: 1440, height: 900 }
+  return { width: window.innerWidth, height: window.innerHeight }
+}
+
+/** Default floating-ball spot: just inside the right edge, a little above centre. */
+function defaultBall(): Point {
+  const { width, height } = viewportSize()
+  return {
+    x: Math.max(BALL_MARGIN, Math.round(width - BALL_SIZE - BALL_SNAP_INSET)),
+    y: Math.max(BALL_MARGIN, Math.round(height * 0.42 - BALL_SIZE / 2)),
+  }
+}
+
+const DEFAULT_LAYOUT: DockLayout = {
+  expanded: false,
+  width: DEFAULT_WIDTH,
+  tree: null,
+  ball: defaultBall(),
+  dock: null,
+  heights: {},
+}
 
 /** Document-relative form of an absolute `/api/…` route, as dsh's own transport uses. */
 function routeUrl(route: string): string {
@@ -72,13 +109,36 @@ export function clampPanelHeight(height: number): number {
   return Math.round(Math.min(MAX_PANEL_HEIGHT, Math.max(MIN_PANEL_HEIGHT, height)))
 }
 
-/** Keeps the floating capsule in a band where it can always be clicked again. */
-function readCapsuleY(value: unknown): number {
-  if (typeof value !== 'number' || !Number.isFinite(value)) return DEFAULT_LAYOUT.capsuleY
-  // A capsule parked against the top edge hides under the window chrome and can
-  // never be clicked again, so a stuck value falls back to the default position.
-  if (value < 0.08 || value > 0.95) return DEFAULT_LAYOUT.capsuleY
-  return Math.min(MAX_CAPSULE_Y, Math.max(MIN_CAPSULE_Y, value))
+function readPoint(raw: unknown): Point | null {
+  if (typeof raw !== 'object' || raw === null) return null
+  const record = raw as Record<string, unknown>
+  const x = record['x']
+  const y = record['y']
+  if (typeof x !== 'number' || !Number.isFinite(x)) return null
+  if (typeof y !== 'number' || !Number.isFinite(y)) return null
+  return { x, y }
+}
+
+/**
+ * Read the ball position, migrating the old `capsuleY` fraction. The ball is
+ * kept fully inside the current viewport so it can always be clicked again.
+ */
+function readBall(raw: unknown, legacy: Record<string, unknown>): Point {
+  const point = readPoint(raw)
+  if (point !== null) {
+    const { width, height } = viewportSize()
+    return {
+      x: Math.round(Math.min(Math.max(BALL_MARGIN, point.x), Math.max(BALL_MARGIN, width - BALL_SIZE - BALL_MARGIN))),
+      y: Math.round(Math.min(Math.max(BALL_MARGIN, point.y), Math.max(BALL_MARGIN, height - BALL_SIZE - BALL_MARGIN))),
+    }
+  }
+  const fraction = legacy['capsuleY']
+  if (typeof fraction === 'number' && Number.isFinite(fraction)) {
+    const { width, height } = viewportSize()
+    const y = Math.min(0.94, Math.max(0.06, fraction))
+    return { x: width - BALL_SIZE - BALL_SNAP_INSET, y: Math.round(height * y - BALL_SIZE / 2) }
+  }
+  return defaultBall()
 }
 
 function normalizeDockHeight(value: unknown): number | undefined {
@@ -86,6 +146,7 @@ function normalizeDockHeight(value: unknown): number | undefined {
   return Math.round(Math.min(MAX_DOCK_HEIGHT, Math.max(MIN_DOCK_HEIGHT, value)))
 }
 
+/** Read the old row layout, used only to migrate a stored client state. */
 function readRows(raw: unknown): PanelRowLayout[] {
   if (!Array.isArray(raw)) return []
   const rows: PanelRowLayout[] = []
@@ -106,25 +167,37 @@ function readRows(raw: unknown): PanelRowLayout[] {
   return rows
 }
 
-function normalizeLayout(raw: Partial<DockLayout> | null): DockLayout {
-  if (raw === null) return DEFAULT_LAYOUT
+/**
+ * Validate one persisted layout, migrating the old row list and `capsuleY`.
+ * Exported for tests; the client always calls it through `readLayout`.
+ */
+export function normalizeDockLayout(raw: unknown): DockLayout {
+  if (typeof raw !== 'object' || raw === null) {
+    return { ...DEFAULT_LAYOUT, ball: defaultBall() }
+  }
+  const record = raw as Record<string, unknown>
+  const rows = readRows(record['rows'])
+  const tree = parseTree(record['tree']) ?? (rows.length > 0 ? legacyRowsToTree(rows) : null)
+  const width = typeof record['width'] === 'number' && Number.isFinite(record['width'])
+    ? Math.min(MAX_WIDTH, Math.max(MIN_WIDTH, record['width']))
+    : DEFAULT_LAYOUT.width
+  const dockHeight = normalizeDockHeight(record['dockHeight'])
   return {
-    expanded: raw.expanded === true,
-    width: typeof raw.width === 'number' && Number.isFinite(raw.width)
-      ? Math.min(MAX_WIDTH, Math.max(MIN_WIDTH, raw.width))
-      : DEFAULT_LAYOUT.width,
-    rows: readRows(raw.rows),
-    capsuleY: readCapsuleY(raw.capsuleY),
-    heights: readHeights(raw.heights),
-    dockHeight: normalizeDockHeight(raw.dockHeight),
+    expanded: record['expanded'] === true,
+    width,
+    tree,
+    ball: readBall(record['ball'], record),
+    dock: readPoint(record['dock']),
+    heights: readHeights(record['heights']),
+    ...(dockHeight === undefined ? {} : { dockHeight }),
   }
 }
 
 function readLayout(): DockLayout {
   try {
-    return normalizeLayout(JSON.parse(localStorage.getItem(LAYOUT_KEY) ?? 'null') as Partial<DockLayout> | null)
+    return normalizeDockLayout(JSON.parse(localStorage.getItem(LAYOUT_KEY) ?? 'null') as unknown)
   } catch {
-    return DEFAULT_LAYOUT
+    return { ...DEFAULT_LAYOUT, ball: defaultBall() }
   }
 }
 
@@ -175,10 +248,9 @@ export class PadClient {
     this.reconnect()
   }
 
-  /** Pin one card at a freeform position, or return it to the auto flow. */
-  /** Store the tiled rows (order, grouping and split weights). */
-  setRows(rows: readonly PanelRowLayout[]): void {
-    this.setLayout({ rows })
+  /** Store the nested card tree (order, splits and widths). */
+  setTree(tree: LayoutNode | null): void {
+    this.setLayout({ tree })
   }
 
   /** Remember one panel's iframe height, or clear it with `undefined` (auto). */
@@ -200,7 +272,7 @@ export class PadClient {
   }
 
   private persistLayout(patch: Partial<DockLayout>): void {
-    const layout = normalizeLayout({ ...this.snapshot.layout, ...patch })
+    const layout = normalizeDockLayout({ ...this.snapshot.layout, ...patch })
     try {
       localStorage.setItem(LAYOUT_KEY, JSON.stringify(layout))
     } catch {

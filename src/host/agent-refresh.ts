@@ -42,8 +42,13 @@ const MAX_DATA_BYTES = 256 * 1024
 
 export class AgentRefresher {
   private readonly queue: string[] = []
-  private readonly running = new Set<string>()
+  /** Panel id → generation of the run that owns it. */
+  private readonly running = new Map<string, number>()
+  /** In-flight agent handles, so stop() can cancel real work. */
+  private readonly active = new Map<string, { readonly generation: number, readonly cancel: () => void }>()
   private timer: ReturnType<typeof setInterval> | undefined
+  private generation = 0
+  private stopped = true
 
   constructor(
     private readonly ctx: Context,
@@ -53,10 +58,13 @@ export class AgentRefresher {
   ) {}
 
   start(): void {
+    if (this.timer !== undefined) return
+    this.stopped = false
+    this.generation += 1
     // A refresh that was running when the Host stopped never finished.
     for (const panel of this.store.list()) {
       if (panel.agentRun?.status === 'running') {
-        void this.store.setAgentRun(panel.id, { ...panel.agentRun, status: 'failed', error: '上次刷新被中断' })
+        void this.store.setAgentRun(panel.id, { ...panel.agentRun, status: 'failed', error: '上次刷新被中断' }).catch(() => {})
       }
     }
     this.timer = setInterval(() => this.scan(), CHECK_EVERY_MS)
@@ -64,12 +72,28 @@ export class AgentRefresher {
   }
 
   stop(): void {
-    clearInterval(this.timer)
+    this.stopped = true
+    this.generation += 1
+    if (this.timer !== undefined) {
+      clearInterval(this.timer)
+      this.timer = undefined
+    }
     this.queue.length = 0
+    const active = [...this.active.values()]
+    this.active.clear()
+    this.running.clear()
+    for (const entry of active) {
+      try {
+        entry.cancel()
+      } catch {
+        // A handle that has already gone away is fine.
+      }
+    }
   }
 
   /** Ask for a refresh now (user pressed refresh, or the model called pad_refresh). */
   request(panelId: string): void {
+    if (this.stopped) return
     if (this.running.has(panelId) || this.queue.includes(panelId)) return
     this.queue.push(panelId)
     this.pump()
@@ -80,6 +104,7 @@ export class AgentRefresher {
   }
 
   private scan(): void {
+    if (this.stopped) return
     const now = Date.now()
     for (const panel of this.store.list()) {
       const next = panel.agentRun?.nextRunAt
@@ -88,26 +113,40 @@ export class AgentRefresher {
   }
 
   private pump(): void {
+    if (this.stopped) return
+    const generation = this.generation
     while (this.running.size < this.options.concurrency && this.queue.length > 0) {
       const panelId = this.queue.shift()!
+      if (this.running.has(panelId)) continue
       const panel = this.store.find(panelId)
       if (panel?.definition.agent == null) continue
-      this.running.add(panelId)
-      void this.run(panel).finally(() => {
-        this.running.delete(panelId)
-        this.pump()
+      this.running.set(panelId, generation)
+      void this.run(panel, generation).catch(() => {
+        // run() reports failures as data; this is only a last-resort guard so
+        // a rejected store write cannot become an unhandled rejection.
+      }).finally(() => {
+        if (this.running.get(panelId) === generation) this.running.delete(panelId)
+        if (!this.stopped && this.generation === generation) this.pump()
       })
     }
   }
 
-  private async run(panel: PanelRecord): Promise<void> {
-    const agentDef = panel.definition.agent!
+  private async run(panel: PanelRecord, generation: number): Promise<void> {
+    if (this.stopped || generation !== this.generation) return
+    const agentDef = panel.definition.agent
+    if (agentDef === undefined) return
     const startedAt = new Date().toISOString()
-    await this.store.setAgentRun(panel.id, { ...panel.agentRun, status: 'running', lastRunAt: startedAt })
+    try {
+      await this.store.setAgentRun(panel.id, { ...panel.agentRun, status: 'running', lastRunAt: startedAt })
+    } catch {
+      return
+    }
+    if (this.stopped || generation !== this.generation) return
 
     let outcome: { ok: true } | { ok: false, reason: string } | undefined
     const panelId = panel.id
     const store = this.store
+    const currentRun = (): boolean => !this.stopped && generation === this.generation
     const submit = defineTool({
       name: 'pad_submit_data',
       description: '提交这次刷新取到的面板数据（完整 JSON，结构与上一次一致）。每次刷新只调用一次。',
@@ -116,6 +155,7 @@ export class AgentRefresher {
       },
       output: { schema: { type: 'string' }, render: (_args, value) => [{ type: 'text', text: value }] },
       async execute(args) {
+        if (!currentRun()) throw new Error('刷新已停止')
         const data = args.data as Json
         if (JSON.stringify(data).length > MAX_DATA_BYTES) throw new Error(`数据超过 ${MAX_DATA_BYTES / 1024}KB，只保留面板要显示的字段`)
         await store.setAgentData(panelId, data)
@@ -129,6 +169,7 @@ export class AgentRefresher {
       parameters: { reason: { type: 'string', required: true, description: '原因，一句大白话' } },
       output: { schema: { type: 'string' }, render: (_args, value) => [{ type: 'text', text: value }] },
       async execute(args) {
+        if (!currentRun()) throw new Error('刷新已停止')
         outcome = { ok: false, reason: args.reason.slice(0, 300) }
         return '已记录。'
       },
@@ -166,6 +207,17 @@ export class AgentRefresher {
           agentCtx.tools.register(fail)
         },
       })
+      if (this.stopped || generation !== this.generation) return
+      this.active.set(panel.id, {
+        generation,
+        cancel: () => {
+          try {
+            handle?.agent.cancel({ kind: 'hook', reason: 'dsh-pad refresh stopped' })
+          } catch {
+            // The turn may already be gone.
+          }
+        },
+      })
       const agent = handle.agent
       agent.followup(createUserMessage({
         content: [{ type: 'text', text: refreshPrompt(panel) }],
@@ -184,24 +236,35 @@ export class AgentRefresher {
     } catch (error) {
       outcome ??= { ok: false, reason: `刷新出错：${error instanceof Error ? error.message : String(error)}` }
     } finally {
+      if (this.active.get(panel.id)?.generation === generation) this.active.delete(panel.id)
       await handle?.dispose().catch(() => {})
     }
 
+    if (this.stopped || generation !== this.generation) return
     const finished = Date.now()
     const current = this.store.find(panel.id)
-    if (current === undefined) return
-    const every = (current.definition.agent?.everyMinutes ?? agentDef.everyMinutes) * 60_000
-    if (outcome?.ok) {
-      await this.store.setAgentRun(panel.id, { status: 'idle', lastRunAt: startedAt, nextRunAt: new Date(finished + every).toISOString() })
-      this.dataChanged(panel.id)
-    } else {
-      const retry = Math.min(every, this.options.retryMinutes * 60_000)
-      await this.store.setAgentRun(panel.id, {
-        status: 'failed',
-        lastRunAt: startedAt,
-        nextRunAt: new Date(finished + retry).toISOString(),
-        error: outcome?.reason ?? '这一轮没有提交数据',
-      })
+    const currentAgent = current?.definition.agent
+    if (current === undefined || currentAgent == null) return
+    const every = currentAgent.everyMinutes * 60_000
+    try {
+      if (outcome?.ok) {
+        await this.store.setAgentRun(panel.id, { status: 'idle', lastRunAt: startedAt, nextRunAt: new Date(finished + every).toISOString() })
+        try {
+          this.dataChanged(panel.id)
+        } catch {
+          // A failing observer must not turn a finished refresh into a failure.
+        }
+      } else {
+        const retry = Math.min(every, this.options.retryMinutes * 60_000)
+        await this.store.setAgentRun(panel.id, {
+          status: 'failed',
+          lastRunAt: startedAt,
+          nextRunAt: new Date(finished + retry).toISOString(),
+          error: outcome?.reason ?? '这一轮没有提交数据',
+        })
+      }
+    } catch {
+      // The run itself finished; a failed state write is retried by scan/start.
     }
   }
 }
@@ -209,7 +272,7 @@ export class AgentRefresher {
 function refreshPrompt(panel: PanelRecord): string {
   const previous = panel.agentData === undefined ? '（还没有数据）' : JSON.stringify(panel.agentData.value, null, 2).slice(0, 8000)
   return [
-    `你正在后台刷新右侧面板「${panel.definition.title}」的数据。这不是和用户对话，没有人会看到你的回复。`,
+    `你正在后台刷新悬浮面板「${panel.definition.title}」的数据。这不是和用户对话，没有人会看到你的回复。`,
     '',
     '刷新说明：',
     panel.definition.agent!.instruction,

@@ -1,7 +1,7 @@
 {
   "name": "dsh-pad",
-  "version": "0.2.2",
-  "description": "DeepSeek Harness 插件：右侧悬浮面板坞，面板由 AI 在对话里生成并自由平铺；支持本机/HTTP 数据源、AI 刷新、面板内 dsh.run 模型调用",
+  "version": "0.3.0",
+  "description": "DeepSeek Harness 插件：悬浮面板坞，面板由 AI 在对话里生成并自由分区；支持本机/HTTP 数据源、AI 刷新、面板内 dsh.run 模型调用",
   "license": "MIT",
   "author": "ChisaAlter",
   "homepage": "https://github.com/ChisaAlter/dsh-pad#readme",

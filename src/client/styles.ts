@@ -14,32 +14,46 @@ export const DOCK_CSS = `
   --dshpad-accent:var(--dsw-alias-brand-primary,#4d6bfe);
   --dshpad-danger:var(--dsw-alias-state-error-primary,#e5484d);
   --dshpad-warn:var(--dsw-alias-state-warn-primary,#d97706);
+  --dshpad-ball-hi:color-mix(in srgb,var(--dshpad-surface) 90%,var(--dshpad-fg) 10%);
   --dshpad-ease:cubic-bezier(.22,.8,.24,1);
   color:var(--dshpad-fg)}
 .dshpad-root svg{width:14px;height:14px;fill:none;stroke:currentColor;stroke-width:1.5;stroke-linecap:round;stroke-linejoin:round}
 .dshpad-root circle{fill:currentColor;stroke:none}
 .dshpad-root button{font:inherit;color:inherit}
 
-.dshpad-toggle,.dshpad-collapse{display:grid;place-items:center;padding:0;border:0;border-radius:9px;cursor:pointer;touch-action:none;user-select:none;
-  background:transparent;color:var(--dshpad-fg-2)!important;
-  transition:background-color .18s,box-shadow .2s,color .15s}
-.dshpad-toggle{position:fixed;right:5px;transform:translateY(-50%);width:28px;height:28px;
-  background:color-mix(in srgb, var(--dsw-alias-button-floating-fill,var(--dshpad-surface)) 78%, transparent);
-  -webkit-backdrop-filter:blur(18px) saturate(1.4);backdrop-filter:blur(18px) saturate(1.4);
-  box-shadow:inset 0 0 0 .5px var(--dsw-alias-border-l1,var(--dshpad-border)),var(--dsw-elevation-panel,0 6px 20px rgba(0,0,0,.12));
-  animation:dshpad-pop .2s var(--dshpad-ease)}
-.dshpad-toggle:hover{background:color-mix(in srgb, var(--dsw-alias-button-floating-hover,var(--dshpad-surface)) 84%, transparent);color:var(--dshpad-fg)!important}
-.dshpad-collapse{position:absolute;top:2px;right:9px;width:28px;height:28px}
-.dshpad-collapse:hover{background:var(--dshpad-hover);color:var(--dshpad-fg)!important}
-.dshpad-toggle.is-dragging{cursor:grabbing;box-shadow:inset 0 0 0 .5px var(--dsw-alias-border-l1,var(--dshpad-border)),var(--dsw-elevation-prominent,0 10px 30px rgba(0,0,0,.18))}
-.dshpad-toggle svg,.dshpad-collapse svg{width:16px;height:16px}
-.dshpad-dot{position:absolute;top:3px;right:4px;width:7px;height:7px;border-radius:50%;corner-shape:round;background:var(--dshpad-warn)}
+.dshpad-root #dshpad-ball{position:fixed!important;display:grid;place-items:center;width:28px!important;height:28px!important;padding:0!important;border:0!important;border-radius:0!important;background:none!important;box-shadow:none!important;clip-path:none!important;cursor:grab;touch-action:none;user-select:none;-webkit-user-select:none;overflow:visible!important;
+  opacity:1!important;pointer-events:auto!important}
+.dshpad-root .dshpad-ball-disc{display:block;width:28px!important;height:28px!important;overflow:visible;filter:drop-shadow(0 5px 14px rgba(0,0,0,.24))}
+.dshpad-root .dshpad-ball-disc .dshpad-ball-fill{fill:url(#dshpad-ball-surface)!important;fill-opacity:1;stroke:var(--dsw-alias-border-l1,var(--dshpad-border))!important;stroke-width:1!important;transition:stroke .15s}
+.dshpad-root .dshpad-ball-disc .dshpad-ball-stop-a{stop-color:var(--dshpad-ball-hi)!important}
+.dshpad-root .dshpad-ball-disc .dshpad-ball-stop-b{stop-color:var(--dshpad-surface)!important}
+.dshpad-root #dshpad-ball:active,.dshpad-root #dshpad-ball.is-dragging{cursor:grabbing}
+.dshpad-root #dshpad-ball:focus-visible{outline:none}
+.dshpad-root #dshpad-ball:focus-visible .dshpad-ball-fill{stroke:var(--dshpad-fg)!important;stroke-width:2!important}
 
-.dshpad-dock{position:fixed;top:52px;right:5px;max-height:calc(100vh - 64px);max-width:calc(100vw - 12px);pointer-events:auto;display:flex;flex-direction:column;
+/* One visible star for both states: it stays exactly where the ball / the
+   header button is, while the surface around it cross-fades. */
+.dshpad-root .dshpad-star-anchor{position:fixed;display:grid;place-items:center;width:28px;height:28px;pointer-events:none!important;z-index:3;color:var(--dshpad-fg-2)}
+.dshpad-root .dshpad-star-anchor *{pointer-events:none!important}
+.dshpad-root .dshpad-star-anchor svg{display:block;width:28px!important;height:28px!important;overflow:visible}
+.dshpad-root .dshpad-star-anchor path{fill:currentColor!important;stroke:none!important}
+.dshpad-root:has(#dshpad-ball:hover) .dshpad-star-anchor,
+.dshpad-root:has(.dshpad-collapse:hover) .dshpad-star-anchor{color:var(--dshpad-fg)}
+.dshpad-root .dshpad-ball-transition{position:fixed;display:grid;place-items:center;width:28px;height:28px;pointer-events:none;z-index:2}
+.dshpad-root .dshpad-ball-transition.is-opening{animation:dshpad-ball-out .2s var(--dshpad-ease) forwards}
+
+.dshpad-collapse{position:absolute!important;top:2px!important;right:9px!important;display:grid;place-items:center;width:28px!important;height:28px!important;min-width:0!important;min-height:0!important;padding:0!important;border:0!important;border-radius:9px!important;box-sizing:border-box!important;cursor:pointer;touch-action:none;user-select:none;pointer-events:auto!important;
+  background:transparent!important;color:var(--dshpad-fg-2)!important;transition:background-color .18s}
+.dshpad-collapse:hover{background:var(--dshpad-hover)!important}
+.dshpad-collapse svg{display:block;width:28px!important;height:28px!important}
+.dshpad-collapse-star{visibility:hidden}
+
+.dshpad-dock{position:fixed;left:8px;top:52px;max-height:calc(100vh - 16px);max-width:calc(100vw - 16px);pointer-events:auto;display:flex;flex-direction:column;
   background:color-mix(in srgb, var(--dshpad-surface) 70%, transparent);border:0;border-radius:var(--dsw-radius-xl,16px);box-shadow:var(--dsw-elevation-panel,0 8px 28px rgba(0,0,0,.14));
   -webkit-backdrop-filter:blur(26px) saturate(1.45);backdrop-filter:blur(26px) saturate(1.45);
-  font-size:13px;line-height:18px;transform-origin:100% 0;animation:dshpad-slide .22s var(--dshpad-ease)}
-.dshpad-dock.is-closing{animation:dshpad-close .18s var(--dshpad-ease) forwards;pointer-events:none}
+  font-size:13px;line-height:18px;animation:dshpad-dock-in .18s var(--dshpad-ease)}
+.dshpad-dock.is-closing{animation:dshpad-dock-out .16s var(--dshpad-ease) forwards;pointer-events:none}
+.dshpad-dock.is-closing .dshpad-collapse{pointer-events:none!important}
 .dshpad-resize{position:absolute;left:-3px;top:16px;bottom:16px;width:7px;cursor:ew-resize;touch-action:none;z-index:2}
 .dshpad-resize::after{content:"";position:absolute;left:3px;top:50%;width:2px;height:36px;margin-top:-18px;border-radius:1px;background:var(--dshpad-border);opacity:0;transition:opacity .15s}
 .dshpad-resize:hover::after,.dshpad-resize:active::after{opacity:1}
@@ -81,15 +95,26 @@ export const DOCK_CSS = `
 .dshpad-banner{margin:0 6px 4px;padding:4px 5px;border-radius:8px;background:var(--dsw-alias-state-warn-tertiary,rgba(217,119,6,.1));color:var(--dsw-alias-state-warn-label,var(--dshpad-fg));font-size:12px;flex:none}
 
 .dshpad-list{flex:1;min-height:0;overflow-y:auto;overscroll-behavior:contain;scrollbar-gutter:stable;padding:1px 5px 6px;position:relative}
-.dshpad-rows{display:flex;flex-direction:column;gap:4px}
-.dshpad-row{display:grid;align-items:stretch;min-height:0}
-.dshpad-splitter{position:relative;min-height:0;cursor:col-resize;touch-action:none;z-index:1;border-radius:3px;background:transparent}
-.dshpad-splitter::before{content:"";position:absolute;top:0;bottom:0;left:2px;right:2px;border-radius:2px;background:var(--dshpad-border);opacity:.55;transition:background-color .15s,opacity .15s}
-.dshpad-splitter:hover::before,.dshpad-splitter:active::before{background:var(--dshpad-accent);opacity:1}
+.dshpad-rows{display:flex;flex-direction:column;gap:4px;min-width:0}
+.dshpad-split{min-width:0;min-height:0}
+.dshpad-split.is-row{display:grid;align-items:stretch}
+.dshpad-split.is-col{display:flex;flex-direction:column;gap:4px}
+.dshpad-pane{display:flex;flex-direction:column;min-width:0;min-height:0}
+.dshpad-pane>.dshpad-card{width:100%}
+.dshpad-root-drop{display:grid;place-items:center;min-height:58px;margin-top:2px;border:1.5px dashed color-mix(in srgb,var(--dshpad-accent) 55%, transparent);border-radius:12px;background:color-mix(in srgb,var(--dshpad-accent) 8%, transparent);color:var(--dshpad-accent);font-size:12px;pointer-events:none}
+.dshpad-splitter{position:relative;min-height:24px;cursor:col-resize;touch-action:none;z-index:1;border-radius:3px;background:transparent}
+.dshpad-splitter::before{content:"";position:absolute;top:0;bottom:0;left:50%;width:1px;transform:translateX(-50%);border-radius:1px;background:var(--dshpad-fg-3);opacity:.42;transition:background-color .15s,opacity .15s}
+.dshpad-splitter:hover::before,.dshpad-splitter:active::before{background:var(--dshpad-fg-3);opacity:.68}
 
 .dshpad-card{position:relative;min-width:0;border-radius:12px;background:color-mix(in srgb, var(--dsw-alias-settings-card-fill, transparent) 55%, transparent);box-shadow:inset 0 0 0 .5px var(--dsw-alias-settings-card-stroke,var(--dshpad-border));animation:dshpad-fade .24s ease-out}
 .dshpad-card.is-dragging{opacity:.45}
 .dshpad-card.is-drop-target{box-shadow:inset 0 0 0 2px var(--dshpad-accent),0 8px 24px rgba(0,0,0,.12)}
+.dshpad-card.is-drop-left::after,.dshpad-card.is-drop-right::after,.dshpad-card.is-drop-top::after,.dshpad-card.is-drop-bottom::after,.dshpad-card.is-drop-center::after{content:"";position:absolute;z-index:3;pointer-events:none;border-radius:12px;background:color-mix(in srgb,var(--dshpad-accent) 14%, transparent)}
+.dshpad-card.is-drop-left::after{inset:0 52% 0 0;border-right:2px solid var(--dshpad-accent);border-radius:12px 0 0 12px}
+.dshpad-card.is-drop-right::after{inset:0 0 0 52%;border-left:2px solid var(--dshpad-accent);border-radius:0 12px 12px 0}
+.dshpad-card.is-drop-top::after{inset:0 0 52% 0;border-bottom:2px solid var(--dshpad-accent);border-radius:12px 12px 0 0}
+.dshpad-card.is-drop-bottom::after{inset:52% 0 0 0;border-top:2px solid var(--dshpad-accent);border-radius:0 0 12px 12px}
+.dshpad-card.is-drop-center::after{inset:0;background:color-mix(in srgb,var(--dshpad-accent) 9%, transparent);box-shadow:inset 0 0 0 2px var(--dshpad-accent)}
 .dshpad-card.is-fresh{animation:dshpad-flash 2.4s ease-out}
 .dshpad-card-head{display:flex;align-items:center;gap:2px;height:38px;padding:0 3px;cursor:grab;touch-action:none}
 .dshpad-card-head button{cursor:pointer}
@@ -111,12 +136,13 @@ export const DOCK_CSS = `
 .dshpad-more:hover{background:transparent;color:var(--dshpad-fg)!important}
 .dshpad-more svg{width:14px;height:14px}
 .dshpad-card-body{padding:0 6px 5px}
-.dshpad-drag-ghost{position:fixed;z-index:99999;display:flex;align-items:center;gap:6px;max-width:220px;padding:6px 9px;border-radius:9px;
-  background:color-mix(in srgb, var(--dsw-alias-button-floating-fill,var(--dshpad-surface)) 88%, transparent);
+.dshpad-drag-shield{position:fixed;inset:0;z-index:99990;cursor:grabbing;background:transparent;touch-action:none;user-select:none}
+.dshpad-drag-ghost{position:fixed;z-index:99999;display:flex;align-items:center;gap:6px;max-width:280px;padding:6px 9px;border-radius:9px;  background:color-mix(in srgb, var(--dsw-alias-button-floating-fill,var(--dshpad-surface)) 88%, transparent);
   -webkit-backdrop-filter:blur(18px) saturate(1.4);backdrop-filter:blur(18px) saturate(1.4);
   box-shadow:var(--dsw-elevation-panel,0 6px 20px rgba(0,0,0,.16));color:var(--dshpad-fg);
   font-size:12px;line-height:1.3;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;pointer-events:none}
-.dshpad-drag-ghost span:last-child{overflow:hidden;text-overflow:ellipsis}
+.dshpad-drag-name{overflow:hidden;text-overflow:ellipsis}
+.dshpad-drag-hint{flex:none;padding-left:6px;border-left:.5px solid var(--dshpad-border);color:var(--dshpad-fg-3);font-size:11px}
 .dshpad-card-note{margin:3px 0 0;color:var(--dshpad-fg-3);font-size:11px;line-height:16px;overflow-wrap:anywhere}
 .dshpad-card-note.is-alert{color:var(--dshpad-danger)}
 
@@ -203,15 +229,13 @@ export const DOCK_CSS = `
 }
 [data-titlebar-density]{transition:padding-right .26s cubic-bezier(.22,.8,.24,1)}
 
-@keyframes dshpad-slide{from{opacity:0;transform:translateX(12px) scale(.94)}to{opacity:1;transform:none}}
-@keyframes dshpad-close{to{opacity:0;transform:translateX(10px) scale(.94)}}
+@keyframes dshpad-dock-in{from{opacity:0}to{opacity:1}}
+@keyframes dshpad-dock-out{to{opacity:0}}
+@keyframes dshpad-ball-out{to{opacity:0}}
 @keyframes dshpad-pop{from{opacity:0;scale:.96}to{opacity:1;scale:1}}
 @keyframes dshpad-fade{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:none}}
 @keyframes dshpad-flash{0%,30%{box-shadow:inset 0 0 0 1.5px var(--dshpad-accent)}100%{box-shadow:inset 0 0 0 .5px var(--dsw-alias-settings-card-stroke,var(--dshpad-border))}}
 @media (prefers-reduced-motion:reduce){
   .dshpad-root *{animation-duration:1ms!important;transition-duration:1ms!important}
-}
-@media (max-width:640px){
-  .dshpad-dock{top:8px;right:8px;max-height:calc(100vh - 16px);width:calc(100vw - 16px)!important}
 }
 `

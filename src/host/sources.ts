@@ -3,7 +3,7 @@
  * Secrets are written as `{{env:NAME}}` in a source and resolved here, per
  * run; their values never reach the browser and are redacted from errors.
  */
-import { spawn } from 'node:child_process'
+import { spawn, type ChildProcess } from 'node:child_process'
 import type { HttpSource, Json, PanelSource, SourceParse, SourceReading } from '../shared/types.ts'
 
 /** Resolves a secret reference name to its value, or undefined when unset. */
@@ -57,11 +57,48 @@ function redact(message: string, secrets: ReadonlySet<string>): string {
   return out
 }
 
+function killCommandTree(child: ChildProcess): void {
+  if (child.pid === undefined) return
+  if (process.platform === 'win32') {
+    // child.kill() only stops the shell (`cmd.exe`); taskkill /T stops the
+    // command it started as well.
+    try {
+      const killer = spawn('taskkill', ['/pid', String(child.pid), '/T', '/F'], { windowsHide: true, stdio: 'ignore' })
+      killer.on('error', () => {
+        try {
+          child.kill()
+        } catch {
+          // Already gone.
+        }
+      })
+    } catch {
+      try {
+        child.kill()
+      } catch {
+        // Already gone.
+      }
+    }
+    return
+  }
+  // On POSIX the shell is the leader of its own process group (see detached
+  // below), so a negative pid reaches the whole pipeline.
+  try {
+    process.kill(-child.pid, 'SIGKILL')
+  } catch {
+    try {
+      child.kill('SIGKILL')
+    } catch {
+      // Already gone.
+    }
+  }
+}
+
 function runCommand(command: string, timeoutMs: number, signal?: AbortSignal): Promise<string> {
   return new Promise((resolve, reject) => {
     const child = spawn(command, {
       shell: true,
       windowsHide: true,
+      detached: process.platform !== 'win32',
       stdio: ['ignore', 'pipe', 'pipe'],
     })
     const stdout: Buffer[] = []
@@ -77,7 +114,7 @@ function runCommand(command: string, timeoutMs: number, signal?: AbortSignal): P
       else resolve(value!)
     }
     const kill = (): void => {
-      if (child.exitCode === null) child.kill('SIGKILL')
+      if (child.exitCode === null) killCommandTree(child)
     }
     const timer = setTimeout(() => {
       kill()

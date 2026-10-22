@@ -78,6 +78,26 @@ describe('PanelStore', () => {
     await expect(store.undo(panel.id)).rejects.toThrow(/没有可以撤销/)
   })
 
+  it('reconciles agent scheduling when undo crosses the agent boundary', async () => {
+    const store = new PanelStore(await tempFile(), false)
+    const agent = { instruction: 'x', everyMinutes: 60 }
+    const plain = await store.create(definition())
+    const withAgent = await store.update(plain.id, { ...plain.definition, agent })
+    expect(withAgent.agentRun?.status).toBe('idle')
+    const undonePlain = await store.undo(plain.id)
+    expect(undonePlain.definition.agent).toBeUndefined()
+    expect(undonePlain.agentRun).toBeUndefined()
+
+    const agentPanel = await store.create({ ...definition(), agent })
+    expect(agentPanel.agentRun?.status).toBe('idle')
+    await store.update(agentPanel.id, { ...agentPanel.definition, agent: undefined })
+    expect(store.get(agentPanel.id).agentRun).toBeUndefined()
+    const restored = await store.undo(agentPanel.id)
+    expect(restored.definition.agent).toEqual(agent)
+    expect(restored.agentRun?.status).toBe('idle')
+    expect(Date.parse(restored.agentRun!.nextRunAt!)).toBeGreaterThan(Date.now() + 59 * 60_000)
+  })
+
   it('schedules the first agent refresh one interval out and keeps a corrupt file aside', async () => {
     const file = await tempFile()
     const store = new PanelStore(file, false)
