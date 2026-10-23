@@ -112,6 +112,7 @@ type FrameMessage =
   | { kind: 'ask', text: string }
   | { kind: 'run', id: string, prompt: string, system?: string }
   | { kind: 'state', key: string, value: unknown }
+  | { kind: 'ok' }
   | { kind: 'error', message: string }
 
 export function PanelFrame({ view, histories, theme, lang, onRefresh, onAsk, onRun, onScriptError, height, onHeightChange, resizeLabel, resizable = true }: PanelFrameProps) {
@@ -185,6 +186,11 @@ export function PanelFrame({ view, histories, theme, lang, onRefresh, onAsk, onR
           break
         case 'state':
           if (typeof message.key === 'string') writeState(view.id, message.key, message.value)
+          break
+        case 'ok':
+          // The panel just rendered a fresh data set without throwing; a stale
+          // error from an earlier render must not stay on the card.
+          latest.current.onScriptError(undefined)
           break
         case 'error':
           if (typeof message.message === 'string') latest.current.onScriptError(message.message)

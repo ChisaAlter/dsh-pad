@@ -114,6 +114,12 @@ export interface PanelData {
   readonly agent: { readonly value: Json, readonly at: string } | null
 }
 
+/** One point of a source's recent history, oldest first. */
+export interface ReadingPoint {
+  readonly value: Json
+  readonly at: string
+}
+
 /** A panel as the browser half renders it. */
 export interface PanelView {
   readonly id: string
@@ -130,6 +136,11 @@ export interface PanelView {
   readonly fingerprint: string
   readonly agentRun: AgentRunState | null
   readonly data: PanelData
+  /**
+   * Points of the last session kept on disk, per source id; a fresh page starts
+   * with these so `dsh.history()` has a trend before the first poll comes back.
+   */
+  readonly history: Readonly<Record<string, readonly ReadingPoint[]>>
 }
 
 /** One model advertised for the per-panel AI refresh picker. */

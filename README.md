@@ -135,6 +135,7 @@ dsh plugin --profile web add github:ChisaAlter/dsh-pad#v0.3.0
 ```
 
 - **直接数据源**只在面板坞展开、卡片没折叠时才轮询；关掉浏览器或收起成悬浮球后宿主上就不再跑。命令输出上限 512KB，默认超时 10 秒。
+- **重启后先显示上次的数值**：每个数据源最近一次成功读数、以及最近 20 个点写在 `$DSH_HOME/dsh-pad/readings.json`（10 秒合并写一次，单条 JSON 超过 16KB 不缓存，单个数据源的历史最多留 128KB，数据源改过之后旧读数自动作废）。面板坞一展开就先拿它渲染，趋势图也直接有历史，第一次轮询回来再接着往后画；这个文件只是缓存，删掉只会让面板重新等第一次读数。
 - **密钥**：`{{env:NAME}}` 先从 dsh 凭据服务里解析，没有再读宿主进程的环境变量。错误信息里出现的密钥值会被替换成 `***`。
 - **AI 刷新**：后台 agent 默认使用 dsh 的默认模型和默认 agent 预设（有 web_fetch / web_search 等工具），另外只多两个工具：`pad_submit_data` 和 `pad_report_failure`。面板可以带顶层 `model`（`{ provider, model, reasoningEffort? }`）单独指定模型；不写就跟随全局默认。这个模型同时用于面板里的 `dsh.run`。卡片 ⋯ 菜单里的「面板模型」可以直接切换。它只看得到 `instruction` 和上一次提交的数据。单轮最长 5 分钟（可配置），失败后过一段时间重试，原因会显示在卡片上。
 - **面板脚本**在 `sandbox="allow-scripts"` 的 iframe 里运行：不和 dsh 同源，CSP 是 `default-src 'none'`，没有网络，拿不到 cookie 和存储，也访问不到父页面。唯一的出口是 `window.dsh`：
@@ -142,7 +143,7 @@ dsh plugin --profile web add github:ChisaAlter/dsh-pad#v0.3.0
 | API | 说明 |
 |---|---|
 | `dsh.onData(fn)` | 有数据时立即调用，之后每次更新再调用。`data = { sources: { [id]: { ok, value, error, at } }, agent: { value, at } \| null }` |
-| `dsh.history(id)` | 该数据源最近 120 次成功读数（页面打开期间累积），画趋势用 |
+| `dsh.history(id)` | 该数据源最近 120 次成功读数（页面打开期间累积；重启后先带上上次缓存的最近 20 个点），画趋势用 |
 | `dsh.refresh()` / `dsh.openUrl(url)` / `dsh.ask(text)` | 立即刷新 / 新标签打开链接 / 把一句话填进对话输入框 |
 | `dsh.run(prompt, { system? })` | 用这张面板的模型跑一次，返回 `{ ok, text?, error? }`；纯文本生成，没有工具和网络，适合按钮处理当前数据 |
 | `dsh.state.get(k)` / `dsh.state.set(k, v)` | 按面板保存的小量 UI 状态 |
@@ -198,7 +199,7 @@ dsh plugin --profile web add github:ChisaAlter/dsh-pad#v0.3.0
 
 ## 数据与已知限制
 
-- 面板存在 `$DSH_HOME/dsh-pad/panels.json`；悬浮球位置、窗口位置 / 宽度 / 高度、嵌套分区和分隔比例按浏览器存在 localStorage。
+- 面板存在 `$DSH_HOME/dsh-pad/panels.json`；每个数据源最近一次成功读数和最近 20 个点存在同目录的 `readings.json`（只为重启后立刻有画面和趋势，可随时删除）；悬浮球位置、窗口位置 / 宽度 / 高度、嵌套分区和分隔比例按浏览器存在 localStorage。
 - 每次 AI 刷新都是一个独立的 dsh 会话，工作目录是 `$DSH_HOME/dsh-pad/refresh`。dsh 目前不提供删除会话的接口，所以这些会话日志会留在 `$DSH_HOME/sessions/` 下对应这个目录的子目录里（每轮大约十几 KB）。它们不会出现在侧栏，需要清理时手动删除即可。
 - 后台刷新的 agent 没有人在线审批，所以需要审批的工具调用（比如 workspace-write 模式下的 shell 命令）会被拒绝。AI 刷新适合用 web_fetch / web_search 取数；本机命令请用直接数据源。
 - 在 dsh 0.2.1-rc.2 的 Web 界面（`dsh web`）与鲸屿桌面端上验证过：安装后宿主半激活、8 个 `pad_*` 工具注册、六个 `/api/dsh-pad.*` 路由可用，客户端面板坞在无头 Chrome 中渲染无异常。dsh 的插件 API 还在快速变化。悬浮坞挂在 dsh 的 `shell.overlay` 槽位；宽屏让位是给外框（`data-titlebar-density`）加 `padding-right`，右侧面板因此一起左移、不会被坞盖住；回合导航条则在 `@container` 里按对话宽度（≥ 800px）重新显示。dsh 以后改掉这些属性或类名，最坏也只是退化成纯悬浮、导航条按 dsh 自己的规则隐藏，不会坏。

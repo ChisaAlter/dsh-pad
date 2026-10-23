@@ -1,8 +1,9 @@
 import { mkdtemp, readFile, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { describe, expect, it } from 'vitest'
 import { DataHub, type Subscriber } from '../src/host/hub.ts'
+import { ReadingCache } from '../src/host/readings.ts'
 import { PanelStore, sourcesFingerprint } from '../src/host/store.ts'
 import type { PanelDefinition, StreamEvent } from '../src/shared/types.ts'
 
@@ -147,5 +148,39 @@ describe('DataHub', () => {
     expect(readings).toEqual([expect.objectContaining({ id: 'a', ok: true, value: 'hi' })])
     expect(hub.views()[0]?.data.sources['a']?.value).toBe('hi')
     hub.dispose()
+  })
+
+  it('serves the cached trend and readings to a fresh page', async () => {
+    const panelsFile = join(await mkdtemp(join(tmpdir(), 'dsh-pad-')), 'panels.json')
+    const cacheFile = join(dirname(panelsFile), 'readings.json')
+    const store = new PanelStore(panelsFile, true)
+    const cache = new ReadingCache(cacheFile, 5)
+    const hub = new DataHub(store, async () => undefined, () => {}, { cache })
+    const panel = await store.create(definition('echo hi', 60))
+    await hub.runAll(panel.id)
+    await sleep(20)
+    await hub.runAll(panel.id)
+    expect(hub.views(true)[0]?.history['a']?.length).toBe(2)
+    expect(hub.views()[0]?.history).toEqual({})
+    await cache.flush()
+    hub.dispose()
+    cache.dispose()
+
+    // A restarted Host: no polling yet, but the page already has the trend.
+    const nextStore = new PanelStore(panelsFile, true)
+    await nextStore.load()
+    const nextCache = new ReadingCache(cacheFile)
+    const restored = await nextCache.load(nextStore.list())
+    const nextHub = new DataHub(nextStore, async () => undefined, () => {}, { restored, cache: nextCache })
+    const events: StreamEvent[] = []
+    const subscriber: Subscriber = { watch: new Set([panel.id]), send: event => events.push(event) }
+    const unsubscribe = nextHub.subscribe(subscriber)
+    const first = events.find(event => event.type === 'panels')
+    const view = first?.type === 'panels' ? first.panels[0] : undefined
+    expect(view?.data.sources['a']?.value).toBe('hi')
+    expect(view?.history['a']?.map(point => point.value)).toEqual(['hi', 'hi'])
+    unsubscribe()
+    nextHub.dispose()
+    nextCache.dispose()
   })
 })

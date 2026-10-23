@@ -135,6 +135,7 @@ A panel definition:
 ```
 
 - **Direct data sources** poll only while the dock is expanded and the card is not folded; once the browser is closed or the dock is collapsed to the floating ball, nothing runs on the host anymore. Command output is capped at 512KB, with a default timeout of 10 seconds.
+- **The last value survives a restart**: the newest successful reading of every source, plus its last 20 points, are written to `$DSH_HOME/dsh-pad/readings.json` (coalesced into one write every 10 seconds; a JSON value over 16KB is not cached; one source's ring is capped at 128KB; a reading is dropped as soon as its source changes). The dock paints from it right away — trend charts start with that history — and the first poll continues from there; the file is only a cache, deleting it just makes panels wait for their first reading again.
 - **Secrets**: `{{env:NAME}}` is resolved from dsh’s credential service first, then from the host process environment variables. Secret values appearing in error messages are replaced with `***`.
 - **AI refresh**: the background agent uses dsh’s default model and default agent preset by default (with tools such as web_fetch / web_search), plus exactly two more: `pad_submit_data` and `pad_report_failure`. A panel may carry a top-level `model` (`{ provider, model, reasoningEffort? }`) to pick its own model; without it the global default applies. That model is used for `dsh.run` inside the panel too. “Panel model” in the card’s ⋯ menu switches it directly. It only ever sees the `instruction` and the data submitted last time. A single turn runs for at most 5 minutes (configurable); after a failure it retries after a while, and the reason is shown on the card.
 - **Panel scripts** run in an iframe with `sandbox="allow-scripts"`: not same-origin with dsh, CSP `default-src 'none'`, no network, no access to cookies or storage, and no access to the parent page. The only way out is `window.dsh`:
@@ -142,7 +143,7 @@ A panel definition:
 | API | Description |
 |---|---|
 | `dsh.onData(fn)` | Called immediately when data is available, then again on every update. `data = { sources: { [id]: { ok, value, error, at } }, agent: { value, at } \| null }` |
-| `dsh.history(id)` | The last 120 successful readings of that data source (accumulated while the page is open), for trend charts |
+| `dsh.history(id)` | The last 120 successful readings of that data source (accumulated while the page is open; after a restart it starts with the last 20 cached points), for trend charts |
 | `dsh.refresh()` / `dsh.openUrl(url)` / `dsh.ask(text)` | Refresh now / open a link in a new tab / put a sentence into the conversation composer |
 | `dsh.run(prompt, { system? })` | Run one pass with this panel’s model, returning `{ ok, text?, error? }`; plain text generation with no tools or network, handy for a button that processes the current data |
 | `dsh.state.get(k)` / `dsh.state.set(k, v)` | Store a small amount of UI state per panel |
@@ -198,7 +199,7 @@ Override in `$DSH_HOME/profiles/web/cordis.patch.yml` (a patch replaces the whol
 
 ## Data and known limits
 
-- Panels are stored in `$DSH_HOME/dsh-pad/panels.json`; the ball’s position, the window’s position / width / height, the nested regions and the split ratios are stored per browser in localStorage.
+- Panels are stored in `$DSH_HOME/dsh-pad/panels.json`; the newest successful reading of every source sits next to it in `readings.json` (only so a restart paints immediately, safe to delete); the ball’s position, the window’s position / width / height, the nested regions and the split ratios are stored per browser in localStorage.
 - Every AI refresh is a separate dsh session whose working directory is `$DSH_HOME/dsh-pad/refresh`. dsh currently offers no API to delete sessions, so those session logs stay under `$DSH_HOME/sessions/`, in the subdirectory that corresponds to this directory (roughly a dozen KB per turn). They never show up in the sidebar, and you can delete them by hand when you want to clean up.
 - The background refresh agent has no human online to approve anything, so any tool call that needs approval (a shell command under workspace-write mode, say) is rejected. AI refresh suits fetching data with web_fetch / web_search; use a direct data source for commands on this machine.
 - Verified on dsh 0.2.1-rc.2’s Web UI (`dsh web`) and the Whale Isle desktop app: after install the host half is active, the 8 `pad_*` tools are registered, the six `/api/dsh-pad.*` routes work, and the client dock renders without errors in headless Chrome. dsh’s plugin API is still changing quickly. The floating dock hangs on dsh’s `shell.overlay` slot; making room on wide screens is a `padding-right` on the outer frame (`data-titlebar-density`), so the right-side panel shifts left with it and is not covered by the dock; the turn-navigation rail is shown again inside a `@container` query based on conversation width (≥ 800px). If dsh later changes these attributes or class names, the worst case is that it degrades to a plain floating dock and the rail hides by dsh’s own rules — nothing breaks.

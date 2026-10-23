@@ -28,7 +28,18 @@ export const FRAME_RUNTIME = String.raw`
     post({ kind: 'error', message: text.slice(0, 2000) });
   }
   function emit() {
-    listeners.slice().forEach(function (fn) { try { fn(current); } catch (e) { report(e); } });
+    var list = listeners.slice();
+    // With no listener there is nothing to render: stay quiet rather than
+    // reporting success for a script that never got as far as subscribing.
+    if (list.length === 0) return;
+    var failed = null;
+    list.forEach(function (fn) {
+      try { fn(current); } catch (e) { if (failed === null) failed = e; }
+    });
+    // Report the outcome of this render, not just failures: an error raised for
+    // an earlier data set must not outlive the render that replaced it.
+    if (failed === null) post({ kind: 'ok' });
+    else report(failed);
   }
 
   window.addEventListener('error', function (e) { report(e.error || e.message); });

@@ -6,7 +6,8 @@
  * (the dock is expanded and the card is not folded), so a closed browser or a
  * collapsed dock costs nothing on the Host.
  */
-import type { PanelData, PanelRecord, PanelView, SourceReading, StreamEvent } from '../shared/types.ts'
+import type { PanelData, PanelRecord, PanelView, ReadingPoint, SourceReading, StreamEvent } from '../shared/types.ts'
+import type { ReadingCache } from './readings.ts'
 import { type SecretResolver, runSource } from './sources.ts'
 import { type PanelStore, sourcesFingerprint } from './store.ts'
 
@@ -15,6 +16,13 @@ export interface Subscriber {
   /** Watched panel ids; polling runs for the union of all subscribers. */
   watch: ReadonlySet<string>
   send(event: StreamEvent): void
+}
+
+export interface DataHubOptions {
+  /** Readings cached by the previous run, per panel id and source id. */
+  readonly restored?: ReadonlyMap<string, ReadonlyMap<string, SourceReading>> | undefined
+  /** Cache that keeps the newest reading of every source on disk. */
+  readonly cache?: ReadingCache | undefined
 }
 
 interface SourceTimer {
@@ -28,25 +36,38 @@ export class DataHub {
   private readonly readings = new Map<string, Map<string, SourceReading>>()
   private readonly timers = new Map<string, Map<string, SourceTimer>>()
   private readonly subscribers = new Set<Subscriber>()
+  private readonly cache: ReadingCache | undefined
   private disposed = false
 
   constructor(
     private readonly store: PanelStore,
     private readonly resolveSecret: SecretResolver,
     private readonly onAgentRefresh: (panelId: string) => void,
-  ) {}
+    options: DataHubOptions = {},
+  ) {
+    this.cache = options.cache
+    // Panels paint from the last session's readings until the first poll lands.
+    for (const [panelId, sources] of options.restored ?? []) this.readings.set(panelId, new Map(sources))
+  }
 
   /** Re-sync after a store change: push the panel list, restart changed timers. */
   storeChanged(): void {
     const ids = new Set(this.store.list().map(p => p.id))
-    for (const id of [...this.readings.keys()]) if (!ids.has(id)) this.readings.delete(id)
+    for (const id of [...this.readings.keys()]) {
+      if (ids.has(id)) continue
+      this.readings.delete(id)
+      this.cache?.forgetPanel(id)
+    }
+    this.cache?.prune(this.store.list())
     this.broadcast({ type: 'panels', panels: this.views() })
     this.reconcile()
   }
 
   subscribe(subscriber: Subscriber): () => void {
     this.subscribers.add(subscriber)
-    subscriber.send({ type: 'panels', panels: this.views() })
+    // The first frame of a page also carries the cached trend; later broadcasts
+    // skip it, since live readings keep the page's history up to date.
+    subscriber.send({ type: 'panels', panels: this.views(true) })
     this.reconcile()
     return () => {
       this.subscribers.delete(subscriber)
@@ -77,8 +98,12 @@ export class DataHub {
     if (panel !== undefined) this.broadcastData(panel)
   }
 
-  views(): PanelView[] {
-    return this.store.list().map(panel => this.view(panel))
+  /**
+   * One view per panel.
+   * @param withHistory - include the cached trend; only a page's first list needs it.
+   */
+  views(withHistory = false): PanelView[] {
+    return this.store.list().map(panel => this.view(panel, withHistory))
   }
 
   dispose(): void {
@@ -88,7 +113,7 @@ export class DataHub {
     this.subscribers.clear()
   }
 
-  private view(panel: PanelRecord): PanelView {
+  private view(panel: PanelRecord, withHistory: boolean): PanelView {
     return {
       id: panel.id,
       version: panel.version,
@@ -102,7 +127,19 @@ export class DataHub {
       fingerprint: sourcesFingerprint(panel.definition.sources),
       agentRun: panel.agentRun ?? null,
       data: this.data(panel),
+      history: withHistory ? this.history(panel) : {},
     }
+  }
+
+  /** Cached points of the panel's declared sources, so a fresh page starts with a trend. */
+  private history(panel: PanelRecord): Record<string, readonly ReadingPoint[]> {
+    const cached = this.cache?.history(panel.id) ?? {}
+    const history: Record<string, readonly ReadingPoint[]> = {}
+    for (const source of panel.definition.sources) {
+      const points = cached[source.id]
+      if (points !== undefined && points.length > 0) history[source.id] = points
+    }
+    return history
   }
 
   private data(panel: PanelRecord): PanelData {
@@ -194,16 +231,21 @@ export class DataHub {
     if (entry) entry.running = true
     try {
       const reading = await runSource(source, this.resolveSecret)
+      const key = sourcesFingerprint([source])
       const current = this.store.find(panel.id)
       // Drop readings of a source that changed while it ran.
       const still = current?.definition.sources.find(s => s.id === sourceId)
-      if (current === undefined || still === undefined || sourcesFingerprint([still]) !== sourcesFingerprint([source])) return reading
+      if (current === undefined || still === undefined || sourcesFingerprint([still]) !== key) {
+        this.cache?.forgetSource(panel.id, sourceId)
+        return reading
+      }
       let readings = this.readings.get(panel.id)
       if (readings === undefined) {
         readings = new Map()
         this.readings.set(panel.id, readings)
       }
       readings.set(sourceId, reading)
+      this.cache?.remember(panel.id, sourceId, key, reading)
       this.broadcastData(current)
       return reading
     } finally {

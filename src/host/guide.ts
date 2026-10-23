@@ -25,7 +25,8 @@ export const PANEL_GUIDE = `## 悬浮面板（dsh-pad）
 - 可用 CSS 变量（自动跟随亮 / 暗主题）：--pad-fg, --pad-fg-2, --pad-fg-3, --pad-bg, --pad-bg-2, --pad-border, --pad-accent, --pad-ok, --pad-warn, --pad-danger, --pad-font, --pad-mono, --pad-radius。不要写死颜色。
 - 全局对象 \`dsh\`：
   - \`dsh.onData(fn)\`：fn(data) 在有数据时立即调用，之后每次更新再调用。data = \`{ sources: { [id]: { ok, value, error, at } }, agent: { value, at } | null }\`。
-  - \`dsh.history(sourceId)\`：该数据源最近 120 次成功读数 \`[{ value, at }]\`（面板打开期间累积），画趋势用。
+    脚本第一次运行前，声明的每个数据源都已有一次读数（dsh 重启后也一样），但读数可能是失败：\`sources[id].ok === false\` 时要显示 \`error\`，不要假设 \`value\` 一定存在。
+  - \`dsh.history(sourceId)\`：该数据源最近 120 次成功读数 \`[{ value, at }]\`（面板打开期间累积；dsh 重启后先带上上次缓存的最近 20 个点），画趋势用。
   - \`dsh.refresh()\`：立即刷新。\`dsh.openUrl(url)\`：在新标签打开链接（iframe 里普通链接打不开）。
   - \`dsh.state.get(key)\` / \`dsh.state.set(key, value)\`：按面板保存的小量 UI 状态（例如选中的标签页）。
   - \`dsh.ask(text)\`：把一句话填进对话输入框（例如「帮我分析一下这台机器为什么负载高」）。

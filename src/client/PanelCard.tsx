@@ -3,7 +3,7 @@ import { type PointerEvent as ReactPointerEvent, useEffect, useRef, useState } f
 import type { PanelModelCatalog, PanelModelOption, PanelModelSelection, PanelView, SourceReading } from '../shared/types.ts'
 import type { PadKey } from './locales.ts'
 import type { DropZone } from './layout.ts'
-import type { HistoryPoint, PadClient } from './pad-client.ts'
+import { awaitingFirstData, type HistoryPoint, type PadClient } from './pad-client.ts'
 import { PanelFrame } from './PanelFrame.tsx'
 import type { ThemeSnapshot } from './theme.ts'
 
@@ -134,6 +134,9 @@ export function PanelCard({ view, client, theme, lang, t, now, fresh, dragging, 
     .map(source => [source.id, view.data.sources[source.id]] as const)
     .filter(([, reading]) => reading !== undefined && !reading.ok)
     .map(([id, reading]) => t('card.sourceError', { id, error: reading!.error ?? '' }))
+  // A panel's script must not run before its sources have been read once: after
+  // a restart the Hub starts empty and that first render would throw.
+  const awaiting = awaitingFirstData(definition, view.data)
   const updated = lastUpdate(view)
   const agent = definition.agent
   const run = view.agentRun
@@ -345,19 +348,23 @@ export function PanelCard({ view, client, theme, lang, t, now, fresh, dragging, 
                 </div>
                 )
               : null}
-            <PanelFrame
-              view={view}
-              histories={() => client.historiesOf(view.id) as Record<string, readonly HistoryPoint[]>}
-              theme={theme}
-              lang={lang}
-              onRefresh={() => void client.act({ op: 'refresh', panelId: view.id })}
-              onAsk={text => onAsk(text, false)}
-              onRun={(prompt, system) => client.run(view.id, prompt, system)}
-              onScriptError={setScriptError}
-              height={client.panelHeight(view.id)}
-              onHeightChange={next => client.setPanelHeight(view.id, next)}
-              resizeLabel={t('card.resize')}
-            />
+            {awaiting
+              ? <p className="dshpad-card-note">{t('card.firstData')}</p>
+              : (
+                <PanelFrame
+                  view={view}
+                  histories={() => client.historiesOf(view.id) as Record<string, readonly HistoryPoint[]>}
+                  theme={theme}
+                  lang={lang}
+                  onRefresh={() => void client.act({ op: 'refresh', panelId: view.id })}
+                  onAsk={text => onAsk(text, false)}
+                  onRun={(prompt, system) => client.run(view.id, prompt, system)}
+                  onScriptError={setScriptError}
+                  height={client.panelHeight(view.id)}
+                  onHeightChange={next => client.setPanelHeight(view.id, next)}
+                  resizeLabel={t('card.resize')}
+                />
+                )}
             {agent
               ? (
                 <p className={`dshpad-card-note${run?.status === 'failed' ? ' is-alert' : ''}`}>

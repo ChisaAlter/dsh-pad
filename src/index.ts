@@ -15,6 +15,7 @@ import type {} from '@deepseek-ai/dsh-tools'
 import Schema from '@deepseek-ai/schemastery'
 import { AgentRefresher } from './host/agent-refresh.ts'
 import { DataHub } from './host/hub.ts'
+import { ReadingCache } from './host/readings.ts'
 import { registerRoutes } from './host/routes.ts'
 import { PanelStore } from './host/store.ts'
 import { registerTools } from './host/tools.ts'
@@ -103,6 +104,13 @@ async function start(ctx: Context, config: Config): Promise<void> {
   const store = new PanelStore(dataFile, config.autoApprove)
   await store.load()
 
+  // The newest reading of every source is kept next to the panels, so a
+  // restarted dsh paints the last values instead of waiting for the first poll.
+  // Entries of edited or deleted sources are dropped on load and on every store
+  // change, and oversized values are never cached.
+  const cache = new ReadingCache(join(dirname(dataFile), 'readings.json'))
+  const restored = await cache.load(store.list())
+
   const resolveSecret = async (name: string): Promise<string | undefined> => {
     const credentials = ctx.get('credentials')
     if (credentials !== undefined) {
@@ -117,7 +125,7 @@ async function start(ctx: Context, config: Config): Promise<void> {
   }
 
   let refresher: AgentRefresher | undefined
-  const hub = new DataHub(store, resolveSecret, panelId => refresher?.request(panelId))
+  const hub = new DataHub(store, resolveSecret, panelId => refresher?.request(panelId), { restored, cache })
   if (config.agentRefresh) {
     refresher = new AgentRefresher(ctx, store, {
       timeoutMs: config.agentTimeoutSec * 1000,
@@ -133,6 +141,7 @@ async function start(ctx: Context, config: Config): Promise<void> {
     return () => {
       refresher?.stop()
       hub.dispose()
+      cache.dispose()
     }
   }, 'dsh-pad: schedulers')
 

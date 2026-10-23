@@ -25,6 +25,7 @@ import {
   MAX_WIDTH,
   MIN_DOCK_HEIGHT,
   MIN_WIDTH,
+  awaitingFirstData,
   type PadClient,
   type Point,
 } from './pad-client.ts'
@@ -1082,18 +1083,22 @@ export function createDock(client: PadClient) {
                     {Icon.close}
                   </button>
                 </header>
-                <PanelFrame
-                  view={focusedView}
-                  histories={() => client.historiesOf(focusedView.id) as Record<string, readonly HistoryPoint[]>}
-                  theme={theme}
-                  lang={lang}
-                  onRefresh={() => void client.act({ op: 'refresh', panelId: focusedView.id })}
-                  onAsk={text => { ask(text, false) }}
-                  onRun={(prompt, system) => client.run(focusedView.id, prompt, system)}
-                  onScriptError={() => {}}
-                  resizeLabel={t('card.resize')}
-                  resizable={false}
-                />
+                {awaitingFirstData(focusedView.definition, focusedView.data)
+                  ? <p className="dshpad-card-note">{t('card.firstData')}</p>
+                  : (
+                    <PanelFrame
+                      view={focusedView}
+                      histories={() => client.historiesOf(focusedView.id) as Record<string, readonly HistoryPoint[]>}
+                      theme={theme}
+                      lang={lang}
+                      onRefresh={() => void client.act({ op: 'refresh', panelId: focusedView.id })}
+                      onAsk={text => { ask(text, false) }}
+                      onRun={(prompt, system) => client.run(focusedView.id, prompt, system)}
+                      onScriptError={() => {}}
+                      resizeLabel={t('card.resize')}
+                      resizable={false}
+                    />
+                    )}
               </div>
             </div>
             )

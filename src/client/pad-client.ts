@@ -3,16 +3,14 @@
  * per-source reading history, and the dock's own view state (expanded, width,
  * floating-ball and window positions, nested card layout) persisted per device.
  */
-import type { Json, PanelAction, PanelData, PanelModelCatalog, PanelRunResult, PanelView, PadUpdateInfo, StreamEvent } from '../shared/types.ts'
+import type { PanelAction, PanelData, PanelDefinition, PanelModelCatalog, PanelRunResult, PanelView, PadUpdateInfo, ReadingPoint, StreamEvent } from '../shared/types.ts'
 import { ROUTES } from '../shared/types.ts'
 import { type LayoutNode, legacyRowsToTree, parseTree } from './layout.ts'
 
 export const HISTORY_LIMIT = 120
 
-export interface HistoryPoint {
-  readonly value: Json
-  readonly at: string
-}
+/** One point of a source's history, as the panel frame receives it. */
+export type HistoryPoint = ReadingPoint
 
 /** One row of the pre-nesting tiled layout; read only to migrate stored state. */
 export interface PanelRowLayout {
@@ -107,6 +105,54 @@ function readHeights(raw: unknown): Record<string, number> {
 
 export function clampPanelHeight(height: number): number {
   return Math.round(Math.min(MAX_PANEL_HEIGHT, Math.max(MIN_PANEL_HEIGHT, height)))
+}
+
+/**
+ * Whether a panel's script must wait for its first readings before it runs.
+ *
+ * After a dsh restart the Hub has no readings yet, and a script written as
+ * `dsh.onData(data => data.sources.metric.value…)` throws on that empty first
+ * render: the card then shows a script error, and a top-level throw can even
+ * stop the script before it registers its listener, leaving the panel dead.
+ * The frame is therefore not created until every declared source has a reading
+ * (a failed source still counts — the panel shows the error itself).
+ *
+ * Panels without direct sources render immediately: a static panel has nothing
+ * to wait for, and an agent-refreshed panel keeps its data with the panel.
+ * @param definition - the panel's definition.
+ * @param data - the data the client has for it right now.
+ * @returns true while a declared source has not been read yet.
+ */
+export function awaitingFirstData(definition: PanelDefinition, data: PanelData): boolean {
+  return definition.sources.some(source => data.sources[source.id] === undefined)
+}
+
+/**
+ * Seed a panel's in-memory history with the points the Host cached on disk.
+ *
+ * Called when the panel list arrives: a fresh page starts with an empty history,
+ * so a panel drawing `dsh.history()` would begin with a blank chart. The first
+ * list wins — once live points exist they are never replaced by the older
+ * cached ones, and duplicate readings are dropped by `record`.
+ * @param store - the client's per-panel, per-source history.
+ * @param panel - the panel view, carrying the cached points.
+ */
+export function seedPanelHistory(store: Map<string, Map<string, HistoryPoint[]>>, panel: PanelView): void {
+  if (panel.history === undefined || panel.history === null) return
+  for (const [sourceId, points] of Object.entries(panel.history)) {
+    if (!Array.isArray(points) || points.length === 0) continue
+    let panelHistory = store.get(panel.id)
+    if (panelHistory === undefined) {
+      panelHistory = new Map()
+      store.set(panel.id, panelHistory)
+    }
+    // Live points are newer than anything on disk; keep them.
+    if (panelHistory.has(sourceId)) continue
+    const clean = points
+      .filter(point => typeof point?.at === 'string' && Number.isFinite(Date.parse(point.at)))
+      .map(point => ({ value: point.value, at: point.at }))
+    if (clean.length > 0) panelHistory.set(sourceId, clean.slice(-HISTORY_LIMIT))
+  }
 }
 
 function readPoint(raw: unknown): Point | null {
@@ -388,7 +434,10 @@ export class PadClient {
 
   private receive(event: StreamEvent): void {
     if (event.type === 'panels') {
-      for (const panel of event.panels) this.record(panel.id, panel.data)
+      for (const panel of event.panels) {
+        seedPanelHistory(this.history, panel)
+        this.record(panel.id, panel.data)
+      }
       const ids = new Set(event.panels.map(p => p.id))
       for (const id of [...this.history.keys()]) if (!ids.has(id)) this.history.delete(id)
       const created = this.known === undefined ? undefined : event.panels.find(p => !this.known!.has(p.id))
