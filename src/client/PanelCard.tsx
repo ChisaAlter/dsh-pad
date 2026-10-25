@@ -1,11 +1,12 @@
 /** One panel in the dock: header with status and actions, approval prompt, the frame. */
-import { type PointerEvent as ReactPointerEvent, useEffect, useRef, useState } from 'react'
-import type { PanelModelCatalog, PanelModelOption, PanelModelSelection, PanelView, SourceReading } from '../shared/types.ts'
+import { type PointerEvent as ReactPointerEvent, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react'
+import type { PanelModelCatalog, PanelModelOption, PanelModelSelection, PanelView } from '../shared/types.ts'
 import type { PadKey } from './locales.ts'
 import type { DropZone } from './layout.ts'
 import { awaitingFirstData, type HistoryPoint, type PadClient } from './pad-client.ts'
 import { PanelFrame } from './PanelFrame.tsx'
 import type { ThemeSnapshot } from './theme.ts'
+import { statusTime, subscribeNoStatusTime, subscribeStatusTime } from './status-clock.ts'
 
 export type Translate = (key: PadKey, params?: Record<string, string | number>) => string
 
@@ -33,9 +34,11 @@ function clock(iso: string | undefined): string {
 
 /** Latest reading time across the panel's data. */
 function lastUpdate(view: PanelView): string | undefined {
-  const times = Object.values(view.data.sources).map((r: SourceReading) => r.at)
-  if (view.data.agent !== null) times.push(view.data.agent.at)
-  return times.sort().at(-1)
+  let latest = view.data.agent?.at
+  for (const reading of Object.values(view.data.sources)) {
+    if (latest === undefined || reading.at > latest) latest = reading.at
+  }
+  return latest
 }
 
 /** Whether the card has something the user should look at. */
@@ -71,7 +74,7 @@ export interface PanelCardProps {
   readonly theme: ThemeSnapshot
   readonly lang: string
   readonly t: Translate
-  readonly now: number
+  readonly clockActive: boolean
   readonly fresh: boolean
   readonly dragging: boolean
   readonly dropTarget: boolean
@@ -82,7 +85,16 @@ export interface PanelCardProps {
   readonly onDragStart: (event: ReactPointerEvent<HTMLElement>) => void
 }
 
-export function PanelCard({ view, client, theme, lang, t, now, fresh, dragging, dropTarget, dropZone, onAsk, onExpand, onDragStart }: PanelCardProps) {
+function CardStatus({ t, updated, refreshing, attention, active }: {
+  t: Translate, updated: string | undefined, refreshing: boolean, attention: boolean, active: boolean
+}) {
+  const now = useSyncExternalStore(active && updated !== undefined && !refreshing ? subscribeStatusTime : subscribeNoStatusTime, statusTime)
+  const meta = refreshing ? t('card.agentRunning')
+    : updated === undefined ? t('card.waiting') : t('card.updated', { ago: relativeTime(t, updated, active ? now : Date.now()) })
+  return <span className={`dshpad-card-meta${attention ? ' is-alert' : ''}`}>{meta}</span>
+}
+
+export function PanelCard({ view, client, theme, lang, t, clockActive, fresh, dragging, dropTarget, dropZone, onAsk, onExpand, onDragStart }: PanelCardProps) {
   const [menuOpen, setMenuOpen] = useState(false)
   const [confirmDelete, setConfirmDelete] = useState(false)
   const [modelOpen, setModelOpen] = useState(false)
@@ -137,7 +149,7 @@ export function PanelCard({ view, client, theme, lang, t, now, fresh, dragging, 
   // A panel's script must not run before its sources have been read once: after
   // a restart the Hub starts empty and that first render would throw.
   const awaiting = awaitingFirstData(definition, view.data)
-  const updated = lastUpdate(view)
+  const updated = useMemo(() => lastUpdate(view), [view.data])
   const agent = definition.agent
   const run = view.agentRun
   const refreshing = run?.status === 'running'
@@ -183,11 +195,6 @@ export function PanelCard({ view, client, theme, lang, t, now, fresh, dragging, 
       }
     })
   }
-
-  let meta: string
-  if (refreshing) meta = t('card.agentRunning')
-  else if (updated !== undefined) meta = t('card.updated', { ago: relativeTime(t, updated, now) })
-  else meta = t('card.waiting')
 
   const startHeaderDrag = (event: ReactPointerEvent<HTMLElement>): void => {
     const target = event.target
@@ -254,7 +261,7 @@ export function PanelCard({ view, client, theme, lang, t, now, fresh, dragging, 
           {definition.icon ? <span className="dshpad-card-icon">{definition.icon}</span> : null}
           <span className="dshpad-card-name">{definition.title}</span>
         </button>
-        <span className={`dshpad-card-meta${needsAttention(view) ? ' is-alert' : ''}`}>{meta}</span>
+        <CardStatus t={t} updated={updated} refreshing={refreshing} attention={needsAttention(view)} active={clockActive} />
         <button type="button" className="dshpad-icon-btn dshpad-expand" title={t('card.expand')} aria-label={t('card.expand')}
           onClick={onExpand}>
           {Icon.expand}

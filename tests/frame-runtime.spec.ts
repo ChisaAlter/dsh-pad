@@ -11,17 +11,25 @@ interface Posted {
  * Run the frame runtime against a stubbed document/window and give back the
  * messages it posts to the dock plus its `dsh` object.
  */
-function bootFrame(data: unknown): { posted: Posted[], dsh: any, sendData(next: unknown): void } {
+function bootFrame(data: unknown, heightMode = 'auto') {
   const posted: Posted[] = []
+  const attributes = new Map([['data-token', 'test-token'], ['data-height', heightMode]])
+  let sizeReads = 0
+  let resizeCallback = (): void => {}
+  class Observer {
+    constructor(callback: () => void) { resizeCallback = callback }
+    observe(): void {}
+    disconnect(): void {}
+  }
   const handlers = new Map<string, (event: any) => void>()
   const parent = { postMessage: (message: Posted): void => { posted.push(message) } }
   const documentStub = {
-    documentElement: { getAttribute: (): string => 'test-token', setAttribute: (): void => {} },
+    documentElement: { getAttribute: (name: string): string | undefined => attributes.get(name), setAttribute: (name: string, value: string): void => { attributes.set(name, value) } },
     getElementById: (id: string): { textContent: string } => ({
       textContent: id === 'pad-init' ? JSON.stringify({ data, histories: {}, state: {}, lang: 'zh' }) : '',
     }),
     addEventListener: (): void => {},
-    body: { scrollHeight: 10 },
+    body: { get scrollHeight() { sizeReads++; return 10 } },
   }
   const windowStub = {
     parent,
@@ -29,15 +37,20 @@ function bootFrame(data: unknown): { posted: Posted[], dsh: any, sendData(next: 
     dsh: undefined as unknown,
   }
 
-  new Function('window', 'document', 'ResizeObserver', FRAME_RUNTIME)(windowStub, documentStub, undefined)
+  new Function('window', 'document', 'ResizeObserver', FRAME_RUNTIME)(windowStub, documentStub, Observer)
 
   return {
     posted,
+    sizeReads: () => sizeReads,
+    resize: () => resizeCallback(),
     dsh: (windowStub as { dsh: any }).dsh,
     sendData(next: unknown) {
+      this.send({ kind: 'data', data: next })
+    },
+    send(message: Record<string, unknown>) {
       const handler = handlers.get('message')
       if (handler === undefined) throw new Error('the frame did not listen for messages')
-      handler({ source: parent, data: { kind: 'data', data: next, histories: {}, token: 'test-token' } })
+      handler({ source: parent, data: structuredClone({ ...message, token: 'test-token' }) })
     },
   }
 }
@@ -67,6 +80,31 @@ describe('frame runtime', () => {
     expect(kinds).toContain('error')
     expect(kinds).not.toContain('ok')
     expect(frame.posted.find(message => message.kind === 'error')?.message).toContain('boom')
+  })
+
+  it('merges incremental histories before rendering and keeps the last 120 points', () => {
+    const frame = bootFrame(data)
+    const points = Array.from({ length: 120 }, (_, i) => ({ at: String(i), value: i }))
+    frame.send({ kind: 'data', data, histories: { metric: points } })
+    let rendered: unknown
+    frame.dsh.onData(() => { rendered = frame.dsh.history('metric') })
+    frame.send({ kind: 'data', data, historyDelta: { metric: [{ at: '120', value: 120 }] } })
+    expect(rendered).toEqual([...points.slice(1), { at: '120', value: 120 }])
+    frame.send({ kind: 'data', data, historyDelta: { metric: [{ at: '120', value: 121 }] } })
+    expect(frame.dsh.history('metric')).toHaveLength(120)
+    expect(frame.dsh.history('metric').at(-1).value).toBe(121)
+  })
+
+  it('skips fixed-height layout measurements and resumes when reset to auto', () => {
+    const frame = bootFrame(data, 'fixed')
+    frame.resize()
+    expect(frame.sizeReads()).toBe(0)
+    frame.send({ kind: 'height', auto: true })
+    expect(frame.sizeReads()).toBe(1)
+    expect(frame.posted.some(message => message.kind === 'resize')).toBe(true)
+    frame.send({ kind: 'height', auto: false })
+    frame.resize()
+    expect(frame.sizeReads()).toBe(1)
   })
 
   it('stays quiet for a script that never subscribed to data', () => {

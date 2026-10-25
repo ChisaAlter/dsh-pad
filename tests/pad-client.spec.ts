@@ -125,6 +125,74 @@ describe('history cached on the Host', () => {
   })
 })
 
+describe('stream setup recovery', () => {
+  it('shows the setup error and clears it when a retry opens', async () => {
+    vi.useFakeTimers()
+    let attempts = 0
+    let stream: { onopen: (() => void) | null } | undefined
+    vi.stubGlobal('EventSource', class {
+      onopen: (() => void) | null = null
+      constructor() { attempts++; if (attempts === 1) throw new Error('temporarily blocked'); stream = this }
+      close(): void {}
+    })
+    const client = new PadClient()
+    try {
+      expect(() => client.start()).not.toThrow()
+      expect(client.getSnapshot().connectionError).toBe('temporarily blocked')
+      await vi.advanceTimersByTimeAsync(3000)
+      expect(attempts).toBe(2)
+      stream?.onopen?.()
+      expect(client.getSnapshot().connectionError).toBeUndefined()
+      expect(client.getSnapshot().connected).toBe(true)
+    } finally { client.stop(); vi.unstubAllGlobals(); vi.useRealTimers() }
+  })
+
+  it('cancels a pending retry when the plugin stops', async () => {
+    vi.useFakeTimers()
+    const construct = vi.fn(() => { throw new Error('blocked') })
+    vi.stubGlobal('EventSource', class { constructor() { construct() } })
+    const client = new PadClient()
+    try {
+      client.start()
+      client.stop()
+      await vi.advanceTimersByTimeAsync(9000)
+      expect(construct).toHaveBeenCalledOnce()
+    } finally { client.stop(); vi.unstubAllGlobals(); vi.useRealTimers() }
+  })
+})
+
+describe('visibility-aware source subscriptions', () => {
+  it('pauses watched sources while hidden and resumes without losing panels', () => {
+    const target = new EventTarget()
+    const documentStub = { visibilityState: 'visible', addEventListener: target.addEventListener.bind(target), removeEventListener: target.removeEventListener.bind(target) }
+    vi.stubGlobal('document', documentStub)
+    const streams: { url: string, close: ReturnType<typeof vi.fn>, onmessage?: (event: { data: string }) => void }[] = []
+    vi.stubGlobal('EventSource', class {
+      close = vi.fn()
+      constructor(readonly url: string) { streams.push(this) }
+    })
+    const client = new PadClient()
+    try {
+      client.setLayout({ expanded: true })
+      client.start()
+      streams.at(-1)!.onmessage?.({ data: JSON.stringify({ type: 'panels', panels: [view({})] }) })
+      expect(streams.at(-1)!.url).toContain('watch=p_1')
+      documentStub.visibilityState = 'hidden'
+      target.dispatchEvent(new Event('visibilitychange'))
+      expect(streams.at(-1)!.url).toContain('watch=')
+      expect(streams.at(-1)!.url).not.toContain('p_1')
+      expect(client.getSnapshot().panels).toHaveLength(1)
+      documentStub.visibilityState = 'visible'
+      target.dispatchEvent(new Event('visibilitychange'))
+      expect(streams.at(-1)!.url).toContain('watch=p_1')
+      client.stop()
+      const count = streams.length
+      target.dispatchEvent(new Event('visibilitychange'))
+      expect(streams).toHaveLength(count)
+    } finally { client.stop(); vi.unstubAllGlobals() }
+  })
+})
+
 describe('persisted dock layout', () => {
   it('migrates old rows and the capsule position', () => {
     const layout = normalizeDockLayout({
@@ -167,6 +235,29 @@ describe('persisted dock layout', () => {
     expect(layout.tree).toEqual(tree)
     expect(layout.ball).toEqual({ x: 30, y: 40 })
     expect(layout.dock).toEqual({ x: 120, y: 90 })
+  })
+
+  it('persists the attached edge and preserves a deliberately free ball', () => {
+    expect(normalizeDockLayout({ ballEdge: 'right' }).ballEdge).toBe('right')
+    expect(normalizeDockLayout({ ballEdge: null }).ballEdge).toBeNull()
+    expect(normalizeDockLayout({ ballEdge: 'invalid' }).ballEdge).toBeUndefined()
+    expect(normalizeDockLayout({}).ballEdge).toBeUndefined()
+  })
+
+  it('restores an edge control after its window is moved', () => {
+    const dockControl = { edge: 'left', point: { x: 0, y: 80 } }
+    expect(normalizeDockLayout({ dockControl }).dockControl).toEqual(dockControl)
+    expect(normalizeDockLayout({ dockControl: null }).dockControl).toBeUndefined()
+    expect(normalizeDockLayout({ dockControl: { edge: 'invalid', point: { x: 0, y: 80 } } }).dockControl).toBeUndefined()
+    expect(normalizeDockLayout({ dockControl: { edge: 'left', point: { x: NaN, y: 80 } } }).dockControl).toBeUndefined()
+  })
+
+  it('retains the constrained width of a moved edge dock across persistence', () => {
+    const dockControl = { edge: 'top', point: { x: 251, y: 0 } }
+    const layout = normalizeDockLayout({ width: 279, dock: { x: 1, y: 10 }, dockControl })
+    expect(layout.width).toBe(279)
+    expect(normalizeDockLayout(JSON.parse(JSON.stringify(layout))).width).toBe(279)
+    expect(normalizeDockLayout({ width: 1, dockControl }).width).toBe(BALL_SIZE)
   })
 
   it('clamps sizes and falls back to sane defaults', () => {

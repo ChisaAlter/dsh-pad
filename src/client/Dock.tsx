@@ -8,6 +8,7 @@
  */
 import {
   Fragment,
+  type CSSProperties,
   type KeyboardEvent as ReactKeyboardEvent,
   type PointerEvent as ReactPointerEvent,
   type ReactNode,
@@ -18,10 +19,12 @@ import {
   useSyncExternalStore,
 } from 'react'
 import { composer } from './composer.ts'
+import { clampBall, nearestBallEdge, positionAtBallEdge, type BallEdge } from './ball-position.ts'
+import { attachedDock } from './dock-position.ts'
+import { dockSafeTop, readViewport, watchViewport, type Viewport } from './window-controls.ts'
 import {
-  BALL_MARGIN,
   BALL_SIZE,
-  BALL_SNAP_INSET,
+  BALL_MARGIN,
   MAX_WIDTH,
   MIN_DOCK_HEIGHT,
   MIN_WIDTH,
@@ -49,8 +52,6 @@ import { PanelFrame } from './PanelFrame.tsx'
 import { type ThemeSnapshot, readTheme, watchTheme } from './theme.ts'
 
 const DRAG_THRESHOLD = 4
-/** Distance from a viewport edge at which the ball snaps against it. */
-const SNAP_DISTANCE = 26
 /** Gap kept between the floating layer and the window edges. */
 const EDGE_GAP = 8
 const SPLITTER_W = 6
@@ -70,10 +71,13 @@ const Icon = {
 }
 
 const STAR_PATH = 'M14 6.3C14.8 10.8 17.2 13.2 21.7 14C17.2 14.8 14.8 17.2 14 21.7C13.2 17.2 10.8 14.8 6.3 14C10.8 13.2 13.2 10.8 14 6.3Z'
+const OPPOSITE_EDGE: Record<BallEdge, BallEdge> = { left: 'right', right: 'left', top: 'bottom', bottom: 'top' }
 
-/** The ball's circular surface, without the star (the star is a persistent
- * overlay so it can stay put while the ball and the dock cross-fade). */
-function BallDisc() {
+/** A round free ball or a tab flush against its attached edge. The symbol
+ * stays in a separate overlay while the ball and dock cross-fade. */
+function BallDisc({ edge }: { readonly edge?: BallEdge | null }) {
+  const tab = edge === 'left' || edge === 'right' ? 'M0 0H14A14 14 0 0 1 14 28H0Z' : 'M0 0H28V14A14 14 0 0 1 0 14Z'
+  const transform = edge === 'right' || edge === 'bottom' ? 'rotate(180 14 14)' : undefined
   return (
     <svg className="dshpad-ball-disc" viewBox="0 0 28 28" width="28" height="28" aria-hidden="true" focusable="false">
       <defs>
@@ -82,62 +86,40 @@ function BallDisc() {
           <stop offset="1" className="dshpad-ball-stop-b" />
         </linearGradient>
       </defs>
-      <circle className="dshpad-ball-fill" cx="14" cy="14" r="13.5" />
+      {edge == null
+        ? <circle className="dshpad-ball-fill" cx="14" cy="14" r="13.5" />
+        : <path className="dshpad-ball-fill" d={tab} transform={transform} />}
     </svg>
   )
 }
 
-function useNow(intervalMs: number): number {
-  const [now, setNow] = useState(() => Date.now())
+function usePageVisible(): boolean {
+  const [visible, setVisible] = useState(() => document.visibilityState !== 'hidden')
   useEffect(() => {
-    const timer = setInterval(() => setNow(Date.now()), intervalMs)
-    return () => clearInterval(timer)
-  }, [intervalMs])
-  return now
+    const update = (): void => setVisible(document.visibilityState !== 'hidden')
+    document.addEventListener('visibilitychange', update)
+    return () => document.removeEventListener('visibilitychange', update)
+  }, [])
+  return visible
 }
 
 function clamp(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, value))
 }
 
-/** Keep a box of `size` px fully inside the viewport, with a margin. */
-function clampBall(point: Point, width: number, height: number): Point {
-  return {
-    x: Math.round(clamp(point.x, BALL_MARGIN, Math.max(BALL_MARGIN, width - BALL_SIZE - BALL_MARGIN))),
-    y: Math.round(clamp(point.y, BALL_MARGIN, Math.max(BALL_MARGIN, height - BALL_SIZE - BALL_MARGIN))),
-  }
-}
-
-/** Snap a ball dropped near one of the four edges against that edge. */
-function snapBall(point: Point, width: number, height: number): Point {
-  const right = Math.max(BALL_SNAP_INSET, width - BALL_SIZE - BALL_SNAP_INSET)
-  const bottom = Math.max(BALL_SNAP_INSET, height - BALL_SIZE - BALL_SNAP_INSET)
-  let { x, y } = clampBall(point, width, height)
-  if (x - BALL_SNAP_INSET < SNAP_DISTANCE) x = BALL_SNAP_INSET
-  else if (right - x < SNAP_DISTANCE) x = right
-  if (y - BALL_SNAP_INSET < SNAP_DISTANCE) y = BALL_SNAP_INSET
-  else if (bottom - y < SNAP_DISTANCE) y = bottom
-  return { x, y }
-}
-
 /** Where the window opens when it has not been dragged yet: its collapse
  * button centred on the ball, so the ball and the button are the same spot. */
 function defaultDockPoint(ball: Point, width: number, viewport: Viewport, heightHint: number): Point {
-  const height = clamp(heightHint, MIN_DOCK_HEIGHT, Math.max(MIN_DOCK_HEIGHT, viewport.height - EDGE_GAP * 2))
   const x = ball.x + BALL_SIZE / 2 - (width - COLLAPSE_CENTER_FROM_RIGHT)
   const y = ball.y + BALL_SIZE / 2 - COLLAPSE_CENTER_Y
-  return {
-    x: Math.round(clamp(x, EDGE_GAP, Math.max(EDGE_GAP, viewport.width - width - EDGE_GAP))),
-    y: Math.round(clamp(y, EDGE_GAP, Math.max(EDGE_GAP, viewport.height - height - EDGE_GAP))),
-  }
+  return clampDock({ x, y }, width, viewport, heightHint)
 }
 
-function clampDock(point: Point, width: number, viewport: Viewport, heightHint: number): Point {
-  const height = clamp(heightHint, MIN_DOCK_HEIGHT, Math.max(MIN_DOCK_HEIGHT, viewport.height - EDGE_GAP * 2))
-  return {
-    x: Math.round(clamp(point.x, EDGE_GAP, Math.max(EDGE_GAP, viewport.width - width - EDGE_GAP))),
-    y: Math.round(clamp(point.y, EDGE_GAP, Math.max(EDGE_GAP, viewport.height - height - EDGE_GAP))),
-  }
+function clampDock(point: Point, width: number, viewport: Viewport, heightHint: number, margin = EDGE_GAP): Point {
+  const x = Math.round(clamp(point.x, margin, Math.max(margin, viewport.width - width - margin)))
+  const top = dockSafeTop(x, width, viewport, margin)
+  const height = Math.min(Math.max(BALL_SIZE, heightHint), Math.max(BALL_SIZE, viewport.height - top - margin))
+  return { x, y: Math.round(clamp(point.y, top, Math.max(top, viewport.height - height - margin))) }
 }
 
 function rowTemplate(split: LayoutSplit): string {
@@ -159,11 +141,6 @@ const DROP_LABEL: Record<DropZone | 'root' | 'hint', PadKey> = {
   hint: 'drop.hint',
 }
 
-interface Viewport {
-  readonly width: number
-  readonly height: number
-}
-
 export interface DockProps {
   readonly t: Translate
 }
@@ -182,7 +159,13 @@ export function createDock(client: PadClient) {
     const shieldRef = useRef<HTMLDivElement>(null)
     const [theme, setTheme] = useState<ThemeSnapshot>({ mode: 'light', css: ':root{}' })
     const [notice, setNotice] = useState<string>()
-    const [viewport, setViewport] = useState<Viewport>(() => ({ width: window.innerWidth, height: window.innerHeight }))
+    const [viewport, setViewport] = useState<Viewport>(readViewport)
+    const initialBallEdge = useRef(snap.layout.ballEdge === undefined
+      ? nearestBallEdge(snap.layout.ball, viewport.width, viewport.height, viewport.controls)
+      : snap.layout.ballEdge)
+    useEffect(() => {
+      if (snap.layout.ballEdge === undefined) client.setLayout({ ballEdge: initialBallEdge.current })
+    }, [snap.layout.ballEdge])
     const [ballDrag, setBallDrag] = useState<Point>()
     const [dockDrag, setDockDrag] = useState<Point>()
     const [dragHeight, setDragHeight] = useState<number>()
@@ -200,17 +183,18 @@ export function createDock(client: PadClient) {
     const holdTimer = useRef<ReturnType<typeof setTimeout>>()
     const suppressCollapseClick = useRef(false)
     const collapsePressToken = useRef(0)
-    const focusedView = focusedId === undefined ? undefined : snap.panels.find(panel => panel.id === focusedId)
-    const now = useNow(10_000)
+    const panelsById = useMemo(() => new Map(snap.panels.map(panel => [panel.id, panel])), [snap.panels])
+    const focusedView = focusedId === undefined ? undefined : panelsById.get(focusedId)
+    const pageVisible = usePageVisible()
     const lang = t('dock.title') === '面板' ? 'zh-CN' : 'en'
 
-    const panelIdsKey = snap.panels.map(panel => panel.id).join('\u0000')
+    const panelIdsKey = useMemo(() => snap.panels.map(panel => panel.id).join('\u0000'), [snap.panels])
     const snapshotTree = useMemo(
       () => normalizeTree(snap.layout.tree, snap.panels.map(panel => panel.id)),
       // eslint-disable-next-line react-hooks/exhaustive-deps
       [snap.layout.tree, panelIdsKey],
     )
-    const treeSignature = JSON.stringify(snapshotTree)
+    const treeSignature = useMemo(() => JSON.stringify(snapshotTree), [snapshotTree])
     const [tree, setTree] = useState<LayoutNode | null>(snapshotTree)
 
     useEffect(() => {
@@ -220,11 +204,13 @@ export function createDock(client: PadClient) {
       // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [treeSignature])
 
-    useEffect(() => {
-      const onResize = (): void => setViewport({ width: window.innerWidth, height: window.innerHeight })
-      window.addEventListener('resize', onResize)
-      return () => window.removeEventListener('resize', onResize)
-    }, [])
+    useEffect(() => watchViewport(() => {
+      const next = readViewport()
+      setViewport(previous => previous.width === next.width && previous.height === next.height
+        && previous.controls?.left === next.controls?.left && previous.controls?.right === next.controls?.right
+        && previous.controls?.top === next.controls?.top && previous.controls?.bottom === next.controls?.bottom
+        ? previous : next)
+    }), [])
 
     useEffect(() => () => {
       if (closeTimer.current !== undefined) clearTimeout(closeTimer.current)
@@ -267,7 +253,7 @@ export function createDock(client: PadClient) {
       }
       updateTheme()
       return watchTheme(updateTheme)
-    }, [snap.layout.expanded])
+    }, [])
 
     useEffect(() => {
       if (notice === undefined) return
@@ -326,9 +312,12 @@ export function createDock(client: PadClient) {
     }
 
     const attention = snap.panels.some(needsAttention)
-    const ballPoint = clampBall(ballDrag ?? snap.layout.ball, viewport.width, viewport.height)
+    const ballEdge = ballDrag === undefined
+      ? snap.layout.ballEdge === undefined ? initialBallEdge.current : snap.layout.ballEdge
+      : nearestBallEdge(ballDrag, viewport.width, viewport.height, viewport.controls)
+    const ballPoint = positionAtBallEdge(ballDrag ?? snap.layout.ball, ballEdge, viewport.width, viewport.height, viewport.controls)
     const widthLimit = Math.max(120, viewport.width - EDGE_GAP * 2)
-    const dockWidth = Math.min(dragWidth ?? snap.layout.width, widthLimit)
+    const requestedDockWidth = Math.min(dragWidth ?? snap.layout.width, widthLimit)
     const openHeight = snap.layout.dockHeight ?? Math.min(560, Math.max(MIN_DOCK_HEIGHT, viewport.height - EDGE_GAP * 2))
     const ballAnchorTop = ballPoint.y + BALL_SIZE / 2 - COLLAPSE_CENTER_Y
     const belowBall = viewport.height - EDGE_GAP - ballAnchorTop
@@ -338,42 +327,74 @@ export function createDock(client: PadClient) {
     const defaultOpenHeight = belowBall >= MIN_DOCK_HEIGHT
       ? Math.max(MIN_DOCK_HEIGHT, Math.min(openHeight, belowBall))
       : openHeight
-    const baseDock = snap.layout.dock ?? defaultDockPoint(ballPoint, dockWidth, viewport, defaultOpenHeight)
     const savedHeight = dragHeight ?? snap.layout.dockHeight
-    const dockPoint = dockDrag ?? clampDock(
-      baseDock,
+    const edgeAnchor = ballEdge !== null && snap.layout.dock === null && dockDrag === undefined
+    const attached = edgeAnchor ? attachedDock(ballPoint, ballEdge, viewport, requestedDockWidth, savedHeight ?? openHeight) : undefined
+    const dockWidth = attached?.width ?? requestedDockWidth
+    const retainedControl = snap.layout.dockControl
+    const dockMargin = attached !== undefined || retainedControl != null ? BALL_MARGIN : EDGE_GAP
+    const controlEdge = attached === undefined ? retainedControl?.edge : ballEdge
+    const baseDock = snap.layout.dock ?? defaultDockPoint(ballPoint, dockWidth, viewport, defaultOpenHeight)
+    const dockPoint = attached?.point ?? clampDock(
+      dockDrag ?? baseDock,
       dockWidth,
       viewport,
-      snap.layout.dock === null ? defaultOpenHeight : savedHeight ?? MIN_DOCK_HEIGHT,
+      dockDrag === undefined && snap.layout.dock === null ? defaultOpenHeight : savedHeight ?? MIN_DOCK_HEIGHT,
+      dockMargin,
     )
-    const starPoint = snap.layout.expanded
-      ? {
+    const availableHeight = Math.max(BALL_SIZE, viewport.height - dockPoint.y - dockMargin)
+    const renderedHeight = attached?.height ?? (savedHeight === undefined ? undefined : Math.min(savedHeight, availableHeight))
+    const maxHeight = renderedHeight ?? availableHeight
+    const control = attached?.control ?? (retainedControl == null ? undefined : {
+      x: clamp(retainedControl.point.x, 0, dockWidth - BALL_SIZE),
+      y: clamp(retainedControl.point.y, 0, maxHeight - BALL_SIZE),
+    })
+    // Rewrite inaccessible persisted positions after load/resize, without
+    // interfering with a pointer gesture that is still choosing its position.
+    useEffect(() => {
+      if (ballDrag !== undefined || dockDrag !== undefined || closing) return
+      const patch: { ball?: Point, dock?: Point } = {}
+      if (snap.layout.ball.x !== ballPoint.x || snap.layout.ball.y !== ballPoint.y) patch.ball = ballPoint
+      if (snap.layout.expanded && snap.layout.dock !== null
+        && (snap.layout.dock.x !== dockPoint.x || snap.layout.dock.y !== dockPoint.y)) patch.dock = dockPoint
+      if (Object.keys(patch).length > 0) client.setLayout(patch)
+    }, [ballDrag, dockDrag, closing, snap.layout.ball, snap.layout.dock, snap.layout.expanded, ballPoint.x, ballPoint.y, dockPoint.x, dockPoint.y])
+    const starPoint = !snap.layout.expanded ? ballPoint
+      : control === undefined ? {
           x: dockPoint.x + dockWidth - COLLAPSE_RIGHT - COLLAPSE_SIZE,
           y: dockPoint.y + COLLAPSE_TOP,
-        }
-      : ballPoint
+        } : { x: dockPoint.x + control.x, y: dockPoint.y + control.y }
+    const arrowEdge = snap.layout.expanded
+      ? controlEdge == null ? null : OPPOSITE_EDGE[controlEdge]
+      : ballEdge
+    const arrowRotation = arrowEdge === 'right' ? 180 : arrowEdge === 'top' ? 90 : arrowEdge === 'bottom' ? -90 : 0
     const starAnchor = (
-      <div className="dshpad-star-anchor" style={{ left: starPoint.x, top: starPoint.y }} aria-hidden="true">
+      <div className={`dshpad-star-anchor${arrowEdge === null ? '' : ' is-arrow'}`} style={{ left: starPoint.x, top: starPoint.y }} aria-hidden="true">
         <svg viewBox="0 0 28 28" width="28" height="28" focusable="false">
-          <path d={STAR_PATH} />
+          {arrowEdge === null
+            ? <path d={STAR_PATH} />
+            : <path d="M10.5 8.5L16 14L10.5 19.5" transform={`rotate(${arrowRotation} 14 14)`} />}
         </svg>
       </div>
     )
-    const availableHeight = Math.max(MIN_DOCK_HEIGHT, viewport.height - dockPoint.y - EDGE_GAP)
-    const renderedHeight = savedHeight === undefined ? undefined : Math.min(savedHeight, availableHeight)
-    const maxHeight = renderedHeight ?? availableHeight
     const dockStyle = {
       left: dockPoint.x,
       top: dockPoint.y,
       width: dockWidth,
       height: renderedHeight,
       maxHeight,
-    }
+      ...(attached === undefined ? {} : { maxHeight: attached.height }),
+      ...(control === undefined ? {} : {
+        '--dshpad-control-x': `${control.x}px`,
+        '--dshpad-control-y': `${control.y}px`,
+        '--dshpad-head-left': control.y < 32 && control.x < 32 ? '36px' : '4px',
+        '--dshpad-head-right': control.y < 32 && control.x + BALL_SIZE > dockWidth - 100 ? '36px' : '6px',
+      }),
+    } as CSSProperties
     const reserve = snap.layout.expanded
       && dockPoint.x + dockWidth >= viewport.width - EDGE_GAP - 2
       ? Math.round(dockWidth) + 12
       : 0
-
     useEffect(() => {
       const root = document.documentElement
       root.classList.toggle('dshpad-reserve', reserve > 0)
@@ -529,20 +550,21 @@ export function createDock(client: PadClient) {
       document.addEventListener('pointercancel', up)
     }
 
-    // Let the window play its exit before the ball takes its place. The ball
-    // lands exactly on the header's collapse button, so the control does not
-    // jump when the window folds away.
+    // Replace the collapse control in place with the ball or edge tab.
     const collapse = (): void => {
       if (closing) return
-      const buttonRect = asideRef.current?.querySelector<HTMLElement>('.dshpad-collapse')?.getBoundingClientRect()
+      const buttonRect = rootRef.current?.querySelector<HTMLElement>('.dshpad-collapse')?.getBoundingClientRect()
       const center = buttonRect === undefined
         ? { x: dockPoint.x + dockWidth - COLLAPSE_CENTER_FROM_RIGHT, y: dockPoint.y + COLLAPSE_CENTER_Y }
         : { x: buttonRect.left + buttonRect.width / 2, y: buttonRect.top + buttonRect.height / 2 }
-      const nextBall = clampBall(
-        { x: center.x - BALL_SIZE / 2, y: center.y - BALL_SIZE / 2 },
-        viewport.width,
-        viewport.height,
-      )
+      const collapsePoint = edgeAnchor ? ballPoint : { x: center.x - BALL_SIZE / 2, y: center.y - BALL_SIZE / 2 }
+      // Do not move a header control a second time on collapse. If it is merely
+      // near an edge, keep its actual position until the next explicit drag.
+      const nearbyEdge = nearestBallEdge(collapsePoint, viewport.width, viewport.height, viewport.controls)
+      const attachedPoint = positionAtBallEdge(collapsePoint, nearbyEdge, viewport.width, viewport.height, viewport.controls)
+      const nextEdge = edgeAnchor ? ballEdge
+        : attachedPoint.x === collapsePoint.x && attachedPoint.y === collapsePoint.y ? nearbyEdge : null
+      const nextBall = clampBall(collapsePoint, viewport.width, viewport.height, viewport.controls)
       if (transitionTimer.current !== undefined) {
         clearTimeout(transitionTimer.current)
         transitionTimer.current = undefined
@@ -552,7 +574,7 @@ export function createDock(client: PadClient) {
       closeTimer.current = setTimeout(() => {
         setClosing(false)
         setBallTransition(undefined)
-        client.setLayout({ expanded: false, ball: nextBall })
+        client.setLayout({ expanded: false, ball: nextBall, ballEdge: nextEdge })
       }, 160)
     }
 
@@ -561,7 +583,7 @@ export function createDock(client: PadClient) {
     const openFromBall = (point: Point): void => {
       if (transitionTimer.current !== undefined) clearTimeout(transitionTimer.current)
       setBallTransition({ point, mode: 'opening' })
-      client.setLayout({ expanded: true })
+      client.setLayout({ expanded: true, ...(ballEdge === null ? {} : { dock: null, dockControl: null }) })
       transitionTimer.current = setTimeout(() => {
         setBallTransition(undefined)
         transitionTimer.current = undefined
@@ -585,7 +607,7 @@ export function createDock(client: PadClient) {
       const move = (pointer: PointerEvent): void => {
         if (!moved && Math.hypot(pointer.clientX - startX, pointer.clientY - startY) < DRAG_THRESHOLD) return
         moved = true
-        final = clampBall({ x: start.x + pointer.clientX - startX, y: start.y + pointer.clientY - startY }, viewport.width, viewport.height)
+        final = clampBall({ x: start.x + pointer.clientX - startX, y: start.y + pointer.clientY - startY }, viewport.width, viewport.height, viewport.controls)
         setBallDrag(final)
       }
       const up = (): void => {
@@ -595,11 +617,12 @@ export function createDock(client: PadClient) {
           openFromBall(start)
           return
         }
-        const snapped = snapBall(final, viewport.width, viewport.height)
+        const edge = nearestBallEdge(final, viewport.width, viewport.height, viewport.controls)
+        const snapped = positionAtBallEdge(final, edge, viewport.width, viewport.height, viewport.controls)
         setBallDrag(undefined)
         // A moved ball is the new anchor for the window; drop any old window
         // position so the next open puts the collapse button under the ball.
-        client.setLayout({ ball: snapped, dock: null })
+        client.setLayout({ ball: snapped, ballEdge: edge, dock: null, dockControl: null })
       }
       const cancel = (): void => {
         cleanup()
@@ -628,9 +651,7 @@ export function createDock(client: PadClient) {
       const start = dockPoint
       const width = dockWidth
       const boxHeight = asideRef.current?.getBoundingClientRect().height ?? MIN_DOCK_HEIGHT
-      const height = clamp(Math.round(boxHeight), MIN_DOCK_HEIGHT, Math.max(MIN_DOCK_HEIGHT, viewport.height - EDGE_GAP * 2))
-      const maxX = Math.max(EDGE_GAP, viewport.width - width - EDGE_GAP)
-      const maxY = Math.max(EDGE_GAP, viewport.height - height - EDGE_GAP)
+      const height = clamp(Math.round(boxHeight), BALL_SIZE, Math.max(BALL_SIZE, viewport.height - dockMargin * 2))
       let moved = false
       let final = start
       const move = (pointer: PointerEvent): void => {
@@ -638,12 +659,13 @@ export function createDock(client: PadClient) {
         if (!moved) {
           moved = true
           onFirstMove?.()
+          if (control !== undefined && controlEdge != null) client.setLayout({ dockControl: { edge: controlEdge, point: control } })
           setDragHeight(height)
+          // Detaching a top-edge dock must keep the width that fitted beside
+          // the window buttons, rather than restoring the wider saved request.
+          setDragWidth(width)
         }
-        final = {
-          x: Math.round(clamp(start.x + pointer.clientX - startX, EDGE_GAP, maxX)),
-          y: Math.round(clamp(start.y + pointer.clientY - startY, EDGE_GAP, maxY)),
-        }
+        final = clampDock({ x: start.x + pointer.clientX - startX, y: start.y + pointer.clientY - startY }, width, viewport, height, dockMargin)
         setDockDrag(final)
       }
       const up = (): void => {
@@ -651,7 +673,8 @@ export function createDock(client: PadClient) {
         if (!moved) return
         setDockDrag(undefined)
         setDragHeight(undefined)
-        client.setLayout({ dock: final, dockHeight: height })
+        setDragWidth(undefined)
+        client.setLayout({ dock: final, dockHeight: height, width })
       }
       const cleanup = (): void => {
         document.removeEventListener('pointermove', move)
@@ -756,13 +779,14 @@ export function createDock(client: PadClient) {
       const startX = event.clientX
       const startWidth = dockWidth
       const right = dockPoint.x + startWidth
-      const minWidth = Math.min(MIN_WIDTH, Math.max(140, viewport.width - EDGE_GAP * 2))
-      const maxWidth = Math.max(minWidth, Math.min(MAX_WIDTH, right - EDGE_GAP))
+      const maxWidth = Math.max(BALL_SIZE, Math.min(MAX_WIDTH, right - dockMargin))
+      const minWidth = Math.min(MIN_WIDTH, maxWidth)
+      if (control !== undefined && controlEdge != null) client.setLayout({ dockControl: { edge: controlEdge, point: control } })
       let finalWidth = startWidth
       let finalPoint = dockPoint
       const move = (pointer: PointerEvent): void => {
         finalWidth = Math.round(clamp(startWidth + (startX - pointer.clientX), minWidth, maxWidth))
-        finalPoint = { x: Math.round(right - finalWidth), y: dockPoint.y }
+        finalPoint = clampDock({ x: Math.round(right - finalWidth), y: dockPoint.y }, finalWidth, viewport, savedHeight ?? maxHeight, dockMargin)
         setDragWidth(finalWidth)
         setDockDrag(finalPoint)
       }
@@ -793,13 +817,16 @@ export function createDock(client: PadClient) {
       }
       const startY = event.clientY
       const boxHeight = asideRef.current?.getBoundingClientRect().height ?? savedHeight ?? MIN_DOCK_HEIGHT
-      const bottom = Math.min(dockPoint.y + boxHeight, viewport.height - EDGE_GAP)
+      const bottom = Math.min(dockPoint.y + boxHeight, viewport.height - dockMargin)
       const startTop = dockPoint.y
-      const maxTop = Math.max(EDGE_GAP, bottom - MIN_DOCK_HEIGHT)
+      const minTop = dockSafeTop(dockPoint.x, dockWidth, viewport, dockMargin)
+      const maxTop = Math.max(minTop, bottom - Math.min(MIN_DOCK_HEIGHT, boxHeight))
+      setDragWidth(dockWidth)
+      if (control !== undefined && controlEdge != null) client.setLayout({ dockControl: { edge: controlEdge, point: control } })
       let finalHeight = bottom - startTop
       let finalPoint = dockPoint
       const move = (pointer: PointerEvent): void => {
-        const nextTop = Math.round(clamp(startTop + pointer.clientY - startY, EDGE_GAP, maxTop))
+        const nextTop = Math.round(clamp(startTop + pointer.clientY - startY, minTop, maxTop))
         finalHeight = Math.round(bottom - nextTop)
         finalPoint = { x: dockPoint.x, y: nextTop }
         setDragHeight(finalHeight)
@@ -808,8 +835,9 @@ export function createDock(client: PadClient) {
       const up = (): void => {
         cleanup()
         setDragHeight(undefined)
+        setDragWidth(undefined)
         setDockDrag(undefined)
-        client.setLayout({ dockHeight: finalHeight, dock: finalPoint })
+        client.setLayout({ dockHeight: finalHeight, dock: finalPoint, width: dockWidth })
       }
       const cleanup = (): void => {
         document.removeEventListener('pointermove', move)
@@ -832,16 +860,23 @@ export function createDock(client: PadClient) {
       }
       const startY = event.clientY
       const startHeight = asideRef.current?.getBoundingClientRect().height ?? savedHeight ?? MIN_DOCK_HEIGHT
-      const maxHeight = Math.max(MIN_DOCK_HEIGHT, viewport.height - dockPoint.y - EDGE_GAP)
+      const maxHeight = Math.max(BALL_SIZE, viewport.height - dockPoint.y - dockMargin)
+      setDragWidth(dockWidth)
+      if (control !== undefined && controlEdge != null) client.setLayout({ dockControl: { edge: controlEdge, point: control } })
       let finalHeight = startHeight
+      let finalPoint = dockPoint
       const move = (pointer: PointerEvent): void => {
-        finalHeight = Math.round(clamp(startHeight + pointer.clientY - startY, MIN_DOCK_HEIGHT, maxHeight))
+        finalHeight = Math.round(clamp(startHeight + pointer.clientY - startY, Math.min(MIN_DOCK_HEIGHT, maxHeight), maxHeight))
+        finalPoint = clampDock(dockPoint, dockWidth, viewport, finalHeight, dockMargin)
         setDragHeight(finalHeight)
+        setDockDrag(finalPoint)
       }
       const up = (): void => {
         cleanup()
         setDragHeight(undefined)
-        client.setLayout({ dockHeight: finalHeight, dock: dockPoint })
+        setDragWidth(undefined)
+        setDockDrag(undefined)
+        client.setLayout({ dockHeight: finalHeight, dock: finalPoint, width: dockWidth })
       }
       const cleanup = (): void => {
         document.removeEventListener('pointermove', move)
@@ -855,7 +890,7 @@ export function createDock(client: PadClient) {
 
     const renderNode = (node: LayoutNode, path: readonly number[]): ReactNode => {
       if (node.kind === 'leaf') {
-        const view = snap.panels.find(panel => panel.id === node.id)
+        const view = panelsById.get(node.id)
         if (view === undefined) return null
         return (
           <PanelCard
@@ -865,7 +900,7 @@ export function createDock(client: PadClient) {
             theme={theme}
             lang={lang}
             t={t}
-            now={now}
+            clockActive={pageVisible}
             fresh={snap.fresh === view.id}
             dragging={drag?.id === view.id}
             dropTarget={drag?.target === view.id}
@@ -910,7 +945,8 @@ export function createDock(client: PadClient) {
         <div className="dshpad-root" ref={rootRef}>
           <div
             id="dshpad-ball"
-            className={`dshpad-ball${ballDrag !== undefined ? ' is-dragging' : ''}`}
+            className={`dshpad-ball${ballDrag !== undefined ? ' is-dragging' : ''}${ballEdge === null ? '' : ` is-edge is-${ballEdge}`}`}
+            data-edge={ballEdge ?? undefined}
             style={{ left: ballPoint.x, top: ballPoint.y }}
             role="button"
             tabIndex={0}
@@ -919,7 +955,7 @@ export function createDock(client: PadClient) {
             onPointerDown={onBallPointerDown}
             onKeyDown={onBallKey}
           >
-            <BallDisc />
+            <BallDisc edge={ballEdge} />
           </div>
           {starAnchor}
           {ballDrag !== undefined ? <div className="dshpad-drag-shield" aria-hidden="true" /> : null}
@@ -927,8 +963,19 @@ export function createDock(client: PadClient) {
       )
     }
 
+    const collapseControl = (
+      <button type="button" className={`dshpad-collapse${control === undefined ? '' : ' is-attached'}`} title={`${t('dock.collapse')} · ${t('dock.holdDrag')}`} aria-label={t('dock.collapse')}
+        disabled={closing}
+        onClick={onCollapseClick}
+        onPointerDown={onCollapsePointerDown}
+        onContextMenu={event => event.preventDefault()}>
+        <svg className="dshpad-collapse-star" viewBox="0 0 28 28" width="28" height="28" aria-hidden="true" focusable="false">
+          <path d={STAR_PATH} />
+        </svg>
+      </button>
+    )
     const examples: PadKey[] = ['empty.example1', 'empty.example2', 'empty.example3']
-    const dragView = drag === undefined ? undefined : snap.panels.find(panel => panel.id === drag.id)
+    const dragView = drag === undefined ? undefined : panelsById.get(drag.id)
     const dropHint = drag === undefined
       ? undefined
       : drag.target !== undefined && drag.zone !== undefined
@@ -938,7 +985,7 @@ export function createDock(client: PadClient) {
           : t(DROP_LABEL.hint)
     return (
       <div className="dshpad-root" ref={rootRef}>
-        <aside ref={asideRef} className={`dshpad-dock${dockDrag !== undefined ? ' is-moving' : ''}${closing ? ' is-closing' : ''}`}
+        <aside ref={asideRef} className={`dshpad-dock${control === undefined ? '' : ` is-attached is-attached-${controlEdge}`}${dockWidth < 160 ? ' is-narrow' : ''}${dockDrag !== undefined ? ' is-moving' : ''}${closing ? ' is-closing' : ''}`}
           style={dockStyle} aria-label={t('dock.title')}>
           <div className="dshpad-dock-edge is-top" role="separator" aria-orientation="horizontal" title={t('dock.resizeHeight')} onPointerDown={onTopEdgePointerDown}
             onDoubleClick={() => { setDragHeight(undefined); client.setDockHeight(undefined) }} />
@@ -960,14 +1007,7 @@ export function createDock(client: PadClient) {
                 </button>
                 )
               : null}
-            <button type="button" className="dshpad-collapse" title={`${t('dock.collapse')} · ${t('dock.holdDrag')}`} aria-label={t('dock.collapse')}
-              onClick={onCollapseClick}
-              onPointerDown={onCollapsePointerDown}
-              onContextMenu={event => event.preventDefault()}>
-              <svg className="dshpad-collapse-star" viewBox="0 0 28 28" width="28" height="28" aria-hidden="true" focusable="false">
-                <path d={STAR_PATH} />
-              </svg>
-            </button>
+            {collapseControl}
           </header>
 
           {updateOpen
@@ -1017,7 +1057,13 @@ export function createDock(client: PadClient) {
               )
             : null}
 
-          {snap.loaded && !snap.connected ? <p className="dshpad-banner">{t('dock.offline')}</p> : null}
+          {!snap.connected
+            ? <p className="dshpad-banner" role="status">
+                {snap.connectionError === undefined
+                  ? t(snap.loaded ? 'dock.offline' : 'dock.connecting')
+                  : t('dock.connectionFailed', { error: snap.connectionError })}
+              </p>
+            : null}
           {notice ? <p className="dshpad-banner">{notice}</p> : null}
 
           <div className="dshpad-list">

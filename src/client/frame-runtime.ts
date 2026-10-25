@@ -48,7 +48,21 @@ export const FRAME_RUNTIME = String.raw`
     if (e.source !== parentWin) return;
     var m = e.data || {};
     if (m.token !== token) return;
-    if (m.kind === 'data') { current = m.data; histories = m.histories || histories; emit(); }
+    if (m.kind === 'data') {
+      current = m.data;
+      if (m.histories) histories = m.histories;
+      if (m.historyDelta) Object.keys(m.historyDelta).forEach(function (id) {
+        var points = histories[id] || [];
+        m.historyDelta[id].forEach(function (point) {
+          var last = points[points.length - 1];
+          if (last && last.at === point.at) points[points.length - 1] = point;
+          else points.push(point);
+        });
+        if (points.length > 120) points.splice(0, points.length - 120);
+        histories[id] = points;
+      });
+      emit();
+    }
     else if (m.kind === 'theme') {
       document.getElementById('pad-theme').textContent = m.css;
       root.setAttribute('data-mode', m.mode);
@@ -56,6 +70,7 @@ export const FRAME_RUNTIME = String.raw`
     else if (m.kind === 'height') {
       // A panel the user sized must scroll its own overflow; auto panels fit it.
       root.setAttribute('data-height', m.auto ? 'auto' : 'fixed');
+      watchSize();
     }
     else if (m.kind === 'run-result') {
       var runCb = pendingRuns[m.id];
@@ -71,18 +86,33 @@ export const FRAME_RUNTIME = String.raw`
   });
 
   var lastHeight = -1;
+  var ro = typeof ResizeObserver === 'function' ? new ResizeObserver(measure) : null;
+  var watchingSize = false;
   function measure() {
+    if (root.getAttribute('data-height') !== 'auto') return;
     // Measure the content, not the viewport: this frame's own height is set by
     // the parent, and root.scrollHeight can never shrink below it again.
     var body = document.body;
     var h = Math.ceil(body ? body.scrollHeight : root.scrollHeight);
     if (h !== lastHeight) { lastHeight = h; post({ kind: 'resize', height: h }); }
   }
-  if (typeof ResizeObserver === 'function') {
-    var ro = new ResizeObserver(measure);
-    ro.observe(root);
-    document.addEventListener('DOMContentLoaded', function () { ro.observe(document.body); measure(); });
+  function watchSize() {
+    var auto = root.getAttribute('data-height') === 'auto';
+    if (ro && auto !== watchingSize) {
+      ro.disconnect();
+      watchingSize = auto;
+      if (auto) {
+        ro.observe(root);
+        if (document.body) ro.observe(document.body);
+      }
+    }
+    if (auto) measure();
   }
+  watchSize();
+  document.addEventListener('DOMContentLoaded', function () {
+    if (ro && watchingSize && document.body) ro.observe(document.body);
+    measure();
+  });
   window.addEventListener('load', measure);
 
   function pad2(n) { return n < 10 ? '0' + n : String(n); }

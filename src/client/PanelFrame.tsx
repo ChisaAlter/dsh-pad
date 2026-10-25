@@ -10,6 +10,7 @@
 import { type PointerEvent as ReactPointerEvent, useEffect, useMemo, useRef, useState } from 'react'
 import type { PanelData, PanelRunResult, PanelView } from '../shared/types.ts'
 import { FRAME_RUNTIME } from './frame-runtime.ts'
+import { HistorySync } from './history-sync.ts'
 import { clampPanelHeight, type HistoryPoint } from './pad-client.ts'
 import type { ThemeSnapshot } from './theme.ts'
 
@@ -58,15 +59,16 @@ interface FrameDocInput {
   readonly data: PanelData
   readonly histories: Record<string, readonly HistoryPoint[]>
   readonly lang: string
+  readonly viewHeight?: number
 }
 
-function frameDocument({ view, token, theme, data, histories, lang }: FrameDocInput): string {
+function frameDocument({ view, token, theme, data, histories, lang, viewHeight }: FrameDocInput): string {
   const { definition } = view
   const init = JSON.stringify({ data, histories, state: readState(view.id), lang }).replace(/</g, '\\u003c')
   const css = definition.css.replace(/<\/style/gi, '<\\/style')
   const script = definition.script.replace(/<\/script/gi, '<\\/script')
   return `<!doctype html>
-<html data-token="${token}" data-mode="${theme.mode}" data-height="${definition.height === 'auto' ? 'auto' : 'fixed'}" lang="${lang}">
+<html data-token="${token}" data-mode="${theme.mode}" data-height="${definition.height === 'auto' && viewHeight === undefined ? 'auto' : 'fixed'}" lang="${lang}">
 <head>
 <meta charset="utf-8">
 <meta http-equiv="Content-Security-Policy" content="${CSP}">
@@ -127,11 +129,14 @@ export function PanelFrame({ view, histories, theme, lang, onRefresh, onAsk, onR
   const resizing = dragHeight !== undefined
 
   // A new document (and token) per definition version; data and theme updates are messages.
-  const { token, doc } = useMemo(() => {
+  const { token, doc, initialData, historySync } = useMemo(() => {
     const token = randomToken()
     readyRef.current = false
     const { data, theme: currentTheme, histories: readHistories } = latest.current
-    return { token, doc: frameDocument({ view, token, theme: currentTheme, data, histories: readHistories(), lang }) }
+    const histories = readHistories()
+    const historySync = new HistorySync()
+    historySync.reset(histories)
+    return { token, initialData: data, historySync, doc: frameDocument({ view, token, theme: currentTheme, data, histories, lang, viewHeight: latest.current.height }) }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [view.id, view.version, lang])
 
@@ -150,7 +155,11 @@ export function PanelFrame({ view, histories, theme, lang, onRefresh, onAsk, onR
         case 'ready':
           readyRef.current = true
           post({ kind: 'theme', css: latest.current.theme.css, mode: latest.current.theme.mode })
-          post({ kind: 'data', data: latest.current.data, histories: latest.current.histories() })
+          // The initial data is embedded in srcDoc. Only send a catch-up when
+          // readings changed while the frame was loading; avoid rendering twice.
+          if (latest.current.data !== initialData) {
+            post({ kind: 'data', data: latest.current.data, historyDelta: historySync.delta(latest.current.histories()) })
+          }
           post({ kind: 'height', auto: latest.current.height === undefined && view.definition.height === 'auto' })
           break
         case 'resize':
@@ -203,7 +212,7 @@ export function PanelFrame({ view, histories, theme, lang, onRefresh, onAsk, onR
   }, [token, view.id])
 
   useEffect(() => {
-    if (readyRef.current) post({ kind: 'data', data: view.data, histories: histories() })
+    if (readyRef.current) post({ kind: 'data', data: view.data, historyDelta: historySync.delta(histories()) })
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [view.data])
 

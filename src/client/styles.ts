@@ -21,7 +21,7 @@ export const DOCK_CSS = `
 .dshpad-root circle{fill:currentColor;stroke:none}
 .dshpad-root button{font:inherit;color:inherit}
 
-.dshpad-root #dshpad-ball{position:fixed!important;display:grid;place-items:center;width:28px!important;height:28px!important;padding:0!important;border:0!important;border-radius:0!important;background:none!important;box-shadow:none!important;clip-path:none!important;cursor:grab;touch-action:none;user-select:none;-webkit-user-select:none;overflow:visible!important;
+.dshpad-root #dshpad-ball{position:fixed!important;display:grid;place-items:center;width:28px!important;height:28px!important;padding:0!important;border:0!important;border-radius:0!important;background:none!important;box-shadow:none!important;clip-path:none!important;cursor:grab;touch-action:none;user-select:none;-webkit-user-select:none;-webkit-app-region:no-drag;overflow:visible!important;
   opacity:1!important;pointer-events:auto!important}
 .dshpad-root .dshpad-ball-disc{display:block;width:28px!important;height:28px!important;overflow:visible;filter:drop-shadow(0 5px 14px rgba(0,0,0,.24))}
 .dshpad-root .dshpad-ball-disc .dshpad-ball-fill{fill:url(#dshpad-ball-surface)!important;fill-opacity:1;stroke:var(--dsw-alias-border-l1,var(--dshpad-border))!important;stroke-width:1!important;transition:stroke .15s}
@@ -37,6 +37,7 @@ export const DOCK_CSS = `
 .dshpad-root .dshpad-star-anchor *{pointer-events:none!important}
 .dshpad-root .dshpad-star-anchor svg{display:block;width:28px!important;height:28px!important;overflow:visible}
 .dshpad-root .dshpad-star-anchor path{fill:currentColor!important;stroke:none!important}
+.dshpad-root .dshpad-star-anchor.is-arrow path{fill:none!important;stroke:currentColor!important;stroke-width:1.8!important}
 .dshpad-root:has(#dshpad-ball:hover) .dshpad-star-anchor,
 .dshpad-root:has(.dshpad-collapse:hover) .dshpad-star-anchor{color:var(--dshpad-fg)}
 .dshpad-root .dshpad-ball-transition{position:fixed;display:grid;place-items:center;width:28px;height:28px;pointer-events:none;z-index:2}
@@ -44,6 +45,8 @@ export const DOCK_CSS = `
 
 .dshpad-collapse{position:absolute!important;top:2px!important;right:9px!important;display:grid;place-items:center;width:28px!important;height:28px!important;min-width:0!important;min-height:0!important;padding:0!important;border:0!important;border-radius:9px!important;box-sizing:border-box!important;cursor:pointer;touch-action:none;user-select:none;pointer-events:auto!important;
   background:transparent!important;color:var(--dshpad-fg-2)!important;transition:background-color .18s}
+.dshpad-collapse.is-attached{left:var(--dshpad-control-x)!important;top:var(--dshpad-control-y)!important;right:auto!important;z-index:4;-webkit-app-region:no-drag}
+.dshpad-collapse.is-attached:disabled{pointer-events:none!important}
 .dshpad-collapse:hover{background:var(--dshpad-hover)!important}
 .dshpad-collapse svg{display:block;width:28px!important;height:28px!important}
 .dshpad-collapse-star{visibility:hidden}
@@ -52,6 +55,21 @@ export const DOCK_CSS = `
   background:color-mix(in srgb, var(--dshpad-surface) 70%, transparent);border:0;border-radius:var(--dsw-radius-xl,16px);box-shadow:var(--dsw-elevation-panel,0 8px 28px rgba(0,0,0,.14));
   -webkit-backdrop-filter:blur(26px) saturate(1.45);backdrop-filter:blur(26px) saturate(1.45);
   font-size:13px;line-height:18px;animation:dshpad-dock-in .18s var(--dshpad-ease)}
+.dshpad-dock.is-attached{border-radius:12px;max-height:calc(100vh - 2px)}
+.dshpad-dock.is-attached .dshpad-dock-head{padding-left:var(--dshpad-head-left);padding-right:var(--dshpad-head-right)}
+.dshpad-dock.is-attached-left .dshpad-list{margin-left:28px}
+.dshpad-dock.is-attached-right .dshpad-list{margin-right:28px}
+.dshpad-dock.is-attached-left>.dshpad-update,.dshpad-dock.is-attached-left>.dshpad-banner{margin-left:34px}
+.dshpad-dock.is-attached-right>.dshpad-update,.dshpad-dock.is-attached-right>.dshpad-banner{margin-right:34px}
+.dshpad-dock.is-attached-top .dshpad-dock-head{flex:none;margin-top:28px}
+.dshpad-dock.is-attached-bottom .dshpad-dock-foot{height:32px}
+.dshpad-dock.is-attached-bottom .dshpad-dock-foot::after{display:none}
+/* Corner-constrained docks can be narrower than a normal panel. Wrap their
+   actions inside the safe area rather than overflowing into window buttons. */
+.dshpad-dock.is-narrow{overflow:clip}
+.dshpad-dock.is-narrow .dshpad-dock-head{height:auto;min-height:32px;flex-wrap:wrap;justify-content:flex-end}
+.dshpad-dock.is-narrow .dshpad-grip,.dshpad-dock.is-narrow .dshpad-spacer{display:none}
+.dshpad-dock.is-narrow.is-attached-top .dshpad-dock-head,.dshpad-dock.is-narrow.is-attached-bottom .dshpad-dock-head{padding:2px}
 .dshpad-dock.is-closing{animation:dshpad-dock-out .16s var(--dshpad-ease) forwards;pointer-events:none}
 .dshpad-dock.is-closing .dshpad-collapse{pointer-events:none!important}
 .dshpad-resize{position:absolute;left:-3px;top:16px;bottom:16px;width:7px;cursor:ew-resize;touch-action:none;z-index:2}

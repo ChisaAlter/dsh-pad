@@ -63,15 +63,17 @@ class DockBoundary extends Component<{ children?: ReactNode }, { error?: Error }
 /**
  * Client plugin body.
  *
- * Like the Host half, a broken dock must not break the shell: the web UI is
- * shared with everything else, so a failure here only disables the dock.
+ * Report a failed activation to Cordis so its diagnostics and retry control
+ * stay accurate. Swallowing it leaves an ACTIVE plugin with no dock entrance.
  * @param ctx - client root context.
  */
 export function apply(ctx: ClientContext): void {
   try {
+    // Cordis releases the registered effects when a failed activation throws.
     start(ctx)
   } catch (error) {
-    console.error('[dsh-pad] 面板坞启动失败，已禁用。在插件目录运行 `node scripts/doctor.mjs` 自检：', error)
+    console.error('[dsh-pad] 面板坞启动失败，可在客户端插件诊断中重试：', error)
+    throw error
   }
 }
 
@@ -91,11 +93,6 @@ function start(ctx: ClientContext): void {
   }, 'dsh-pad: styles')
 
   const client = new PadClient()
-  ctx.effect(() => {
-    client.start()
-    return () => client.stop()
-  }, 'dsh-pad: stream')
-
   const Dock = createDock(client)
   ctx.slots.inject('shell.overlay', () => ctx.slots.register({
     name: 'shell.overlay',
@@ -109,4 +106,10 @@ function start(ctx: ClientContext): void {
     id: 'dsh-pad.composer-bridge',
     order: 1000,
   }, (props: PropsRuntime<'conversation.input.overlay'>) => createElement(ComposerBridge, { inputActions: props.inputActions })))
+
+  // The entrance belongs to the shell, independently of the data transport.
+  ctx.effect(() => {
+    client.start()
+    return () => client.stop()
+  }, 'dsh-pad: stream')
 }

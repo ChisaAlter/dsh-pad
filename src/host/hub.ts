@@ -6,7 +6,7 @@
  * (the dock is expanded and the card is not folded), so a closed browser or a
  * collapsed dock costs nothing on the Host.
  */
-import type { PanelData, PanelRecord, PanelView, ReadingPoint, SourceReading, StreamEvent } from '../shared/types.ts'
+import type { PanelData, PanelRecord, PanelSource, PanelView, ReadingPoint, SourceReading, StreamEvent } from '../shared/types.ts'
 import type { ReadingCache } from './readings.ts'
 import { type SecretResolver, runSource } from './sources.ts'
 import { type PanelStore, sourcesFingerprint } from './store.ts'
@@ -29,12 +29,25 @@ interface SourceTimer {
   /** Fingerprint of the source definition the timer was started for. */
   readonly key: string
   timer: ReturnType<typeof setTimeout> | undefined
-  running: boolean
+}
+
+interface ReadingEntry {
+  readonly key: string
+  readonly reading: SourceReading
+}
+
+interface SourceRun {
+  readonly key: string
+  readonly controller: AbortController
+  readonly promise: Promise<SourceReading>
 }
 
 export class DataHub {
-  private readonly readings = new Map<string, Map<string, SourceReading>>()
+  private readonly readings = new Map<string, Map<string, ReadingEntry>>()
   private readonly timers = new Map<string, Map<string, SourceTimer>>()
+  private readonly sourceKeys = new WeakMap<PanelSource, string>()
+  /** Runs outlive polling timers, including while a panel is folded. */
+  private readonly inFlight = new Map<string, Map<string, SourceRun>>()
   private readonly subscribers = new Set<Subscriber>()
   private readonly cache: ReadingCache | undefined
   private disposed = false
@@ -47,18 +60,46 @@ export class DataHub {
   ) {
     this.cache = options.cache
     // Panels paint from the last session's readings until the first poll lands.
-    for (const [panelId, sources] of options.restored ?? []) this.readings.set(panelId, new Map(sources))
+    for (const [panelId, sources] of options.restored ?? []) {
+      const panel = this.store.find(panelId)
+      if (panel === undefined) continue
+      const readings = new Map<string, ReadingEntry>()
+      for (const source of panel.definition.sources) {
+        const reading = sources.get(source.id)
+        if (reading !== undefined) readings.set(source.id, { key: this.sourceKey(source), reading })
+      }
+      if (readings.size > 0) this.readings.set(panelId, readings)
+    }
   }
 
   /** Re-sync after a store change: push the panel list, restart changed timers. */
   storeChanged(): void {
-    const ids = new Set(this.store.list().map(p => p.id))
-    for (const id of [...this.readings.keys()]) {
-      if (ids.has(id)) continue
-      this.readings.delete(id)
-      this.cache?.forgetPanel(id)
+    if (this.disposed) return
+    const panels = this.store.list()
+    const keys = new Map(panels.map(panel => [
+      panel.id,
+      new Map(panel.definition.sources.map(source => [source.id, this.sourceKey(source)])),
+    ]))
+    for (const [panelId, readings] of this.readings) {
+      const current = keys.get(panelId)
+      if (current === undefined) {
+        this.readings.delete(panelId)
+        this.cache?.forgetPanel(panelId)
+        continue
+      }
+      for (const [sourceId, entry] of readings) if (current.get(sourceId) !== entry.key) readings.delete(sourceId)
+      if (readings.size === 0) this.readings.delete(panelId)
     }
-    this.cache?.prune(this.store.list())
+    for (const [panelId, runs] of this.inFlight) {
+      const current = keys.get(panelId)
+      for (const [sourceId, run] of runs) {
+        if (current?.get(sourceId) === run.key) continue
+        runs.delete(sourceId)
+        run.controller.abort()
+      }
+      if (runs.size === 0) this.inFlight.delete(panelId)
+    }
+    this.cache?.prune(panels)
     this.broadcast({ type: 'panels', panels: this.views() })
     this.reconcile()
   }
@@ -86,6 +127,7 @@ export class DataHub {
    * @param panelId - the panel to refresh.
    */
   refresh(panelId: string): void {
+    if (this.disposed) return
     const panel = this.store.get(panelId)
     if (panel.definition.agent) this.onAgentRefresh(panelId)
     if (!this.store.approved(panel)) return
@@ -110,6 +152,8 @@ export class DataHub {
     this.disposed = true
     for (const sources of this.timers.values()) for (const t of sources.values()) clearTimeout(t.timer)
     this.timers.clear()
+    for (const runs of this.inFlight.values()) for (const run of runs.values()) run.controller.abort()
+    this.inFlight.clear()
     this.subscribers.clear()
   }
 
@@ -146,8 +190,8 @@ export class DataHub {
     const readings = this.readings.get(panel.id)
     const sources: Record<string, SourceReading> = {}
     for (const source of panel.definition.sources) {
-      const reading = readings?.get(source.id)
-      if (reading !== undefined) sources[source.id] = reading
+      const entry = readings?.get(source.id)
+      if (entry?.key === this.sourceKey(source)) sources[source.id] = entry.reading
     }
     return { sources, agent: panel.agentData ?? null }
   }
@@ -173,16 +217,16 @@ export class DataHub {
         this.timers.set(panel.id, timers)
       }
       for (const source of panel.definition.sources) {
-        const key = sourcesFingerprint([source])
+        const key = this.sourceKey(source)
         keep.add(source.id)
         const existing = timers.get(source.id)
         if (existing?.key === key) continue
         if (existing !== undefined) clearTimeout(existing.timer)
-        const entry: SourceTimer = { key, timer: undefined, running: false }
+        const entry: SourceTimer = { key, timer: undefined }
         timers.set(source.id, entry)
         // Start immediately unless a reading of this exact source is still fresh.
         const last = existing === undefined ? this.readings.get(panel.id)?.get(source.id) : undefined
-        const age = last === undefined ? Infinity : Date.now() - Date.parse(last.at)
+        const age = last?.key === key ? Date.now() - Date.parse(last.reading.at) : Infinity
         const wait = Math.max(0, source.intervalSec * 1000 - age)
         entry.timer = setTimeout(() => void this.tick(panel.id, source.id), wait)
       }
@@ -213,7 +257,7 @@ export class DataHub {
   /**
    * Run every source of a panel once, record and broadcast the readings.
    * @param panelId - the panel.
-   * @returns one reading per source (a source already running reports its last reading).
+   * @returns one reading per source, sharing any in-progress run of that definition.
    */
   async runAll(panelId: string): Promise<Array<SourceReading & { readonly id: string }>> {
     const panel = this.store.get(panelId)
@@ -224,33 +268,56 @@ export class DataHub {
   }
 
   private async runNow(panel: PanelRecord, sourceId: string): Promise<SourceReading | undefined> {
+    if (this.disposed) return undefined
     const source = panel.definition.sources.find(s => s.id === sourceId)
     if (source === undefined) return undefined
-    const entry = this.timers.get(panel.id)?.get(sourceId)
-    if (entry?.running) return this.readings.get(panel.id)?.get(sourceId)
-    if (entry) entry.running = true
-    try {
-      const reading = await runSource(source, this.resolveSecret)
-      const key = sourcesFingerprint([source])
+    const key = this.sourceKey(source)
+    let runs = this.inFlight.get(panel.id)
+    if (runs === undefined) {
+      runs = new Map()
+      this.inFlight.set(panel.id, runs)
+    }
+    const existing = runs.get(sourceId)
+    if (existing?.key === key) return await existing.promise
+    existing?.controller.abort()
+    const controller = new AbortController()
+    const promise = (async () => {
+      const reading = await runSource(source, this.resolveSecret, controller.signal)
       const current = this.store.find(panel.id)
-      // Drop readings of a source that changed while it ran.
+      // A superseded run must not replace a new reading or erase its cache.
       const still = current?.definition.sources.find(s => s.id === sourceId)
-      if (current === undefined || still === undefined || sourcesFingerprint([still]) !== key) {
-        this.cache?.forgetSource(panel.id, sourceId)
-        return reading
-      }
+      if (this.disposed || controller.signal.aborted || current === undefined || still === undefined || this.sourceKey(still) !== key) return reading
       let readings = this.readings.get(panel.id)
       if (readings === undefined) {
         readings = new Map()
         this.readings.set(panel.id, readings)
       }
-      readings.set(sourceId, reading)
+      readings.set(sourceId, { key, reading })
       this.cache?.remember(panel.id, sourceId, key, reading)
       this.broadcastData(current)
       return reading
+    })()
+    const run: SourceRun = { key, controller, promise }
+    runs.set(sourceId, run)
+    try {
+      return await promise
     } finally {
-      if (entry) entry.running = false
+      // An older run may settle after a replacement has already started.
+      if (runs.get(sourceId) === run) {
+        runs.delete(sourceId)
+        if (runs.size === 0 && this.inFlight.get(panel.id) === runs) this.inFlight.delete(panel.id)
+      }
     }
+  }
+
+  /** Source definitions are immutable; hash each object once without retaining removed sources. */
+  private sourceKey(source: PanelSource): string {
+    let key = this.sourceKeys.get(source)
+    if (key === undefined) {
+      key = sourcesFingerprint([source])
+      this.sourceKeys.set(source, key)
+    }
+    return key
   }
 
   private broadcastData(panel: PanelRecord): void {

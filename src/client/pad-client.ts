@@ -6,6 +6,7 @@
 import type { PanelAction, PanelData, PanelDefinition, PanelModelCatalog, PanelRunResult, PanelView, PadUpdateInfo, ReadingPoint, StreamEvent } from '../shared/types.ts'
 import { ROUTES } from '../shared/types.ts'
 import { type LayoutNode, legacyRowsToTree, parseTree } from './layout.ts'
+import type { BallEdge } from './ball-position.ts'
 
 export const HISTORY_LIMIT = 120
 
@@ -24,6 +25,11 @@ export interface Point {
   readonly y: number
 }
 
+export interface DockControl {
+  readonly edge: BallEdge
+  readonly point: Point
+}
+
 export interface DockLayout {
   readonly expanded: boolean
   readonly width: number
@@ -31,8 +37,12 @@ export interface DockLayout {
   readonly tree: LayoutNode | null
   /** Floating ball's top-left corner. */
   readonly ball: Point
+  /** Attached edge; null is a free ball, absent migrates a legacy position. */
+  readonly ballEdge?: BallEdge | null
   /** Where the user last put the expanded window; null opens next to the ball. */
   readonly dock: Point | null
+  /** Relative edge control retained while moving an attached window. */
+  readonly dockControl?: DockControl | null
   /** Per-panel iframe height in px, set by dragging a panel's bottom edge. */
   readonly heights: Readonly<Record<string, number>>
   /** Dock height in px, set by dragging the dock's top or bottom edge. */
@@ -44,6 +54,8 @@ export interface PadSnapshot {
   readonly connected: boolean
   /** Whether the first panel list arrived. */
   readonly loaded: boolean
+  /** A synchronous stream setup failure; retained until the connection opens. */
+  readonly connectionError?: string
   readonly layout: DockLayout
   /** Id of a panel created while this page was open, for a short highlight. */
   readonly fresh: string | undefined
@@ -224,16 +236,29 @@ export function normalizeDockLayout(raw: unknown): DockLayout {
   const record = raw as Record<string, unknown>
   const rows = readRows(record['rows'])
   const tree = parseTree(record['tree']) ?? (rows.length > 0 ? legacyRowsToTree(rows) : null)
-  const width = typeof record['width'] === 'number' && Number.isFinite(record['width'])
-    ? Math.min(MAX_WIDTH, Math.max(MIN_WIDTH, record['width']))
-    : DEFAULT_LAYOUT.width
   const dockHeight = normalizeDockHeight(record['dockHeight'])
+  const rawControl = record['dockControl'] as { edge?: unknown, point?: unknown } | null | undefined
+  const controlPoint = readPoint(rawControl?.point)
+  const controlEdge = rawControl?.edge
+  const dockControl: DockControl | undefined = controlPoint !== null && (controlEdge === 'left' || controlEdge === 'right' || controlEdge === 'top' || controlEdge === 'bottom')
+    ? { edge: controlEdge, point: controlPoint } : undefined
+  // Edge-attached windows may be narrower than the normal resize minimum
+  // beside desktop controls. Retain that effective width after detaching.
+  const width = typeof record['width'] === 'number' && Number.isFinite(record['width'])
+    ? Math.min(MAX_WIDTH, Math.max(dockControl === undefined ? MIN_WIDTH : BALL_SIZE, record['width']))
+    : DEFAULT_LAYOUT.width
+  const rawEdge = record['ballEdge']
+  const ballEdge = rawEdge === null || rawEdge === 'left' || rawEdge === 'right' || rawEdge === 'top' || rawEdge === 'bottom'
+    ? rawEdge
+    : undefined
   return {
     expanded: record['expanded'] === true,
     width,
     tree,
     ball: readBall(record['ball'], record),
+    ...(ballEdge === undefined ? {} : { ballEdge }),
     dock: readPoint(record['dock']),
+    ...(dockControl === undefined ? {} : { dockControl }),
     heights: readHeights(record['heights']),
     ...(dockHeight === undefined ? {} : { dockHeight }),
   }
@@ -255,8 +280,11 @@ export class PadClient {
   private watchKey = ''
   private known: Set<string> | undefined
   private freshTimer: ReturnType<typeof setTimeout> | undefined
+  private reconnectTimer: ReturnType<typeof setTimeout> | undefined
   private modelCatalog: PanelModelCatalog | undefined
   private started = false
+
+  private readonly onVisibilityChange = (): void => { this.reconnect() }
 
   readonly subscribe = (listener: () => void): (() => void) => {
     this.listeners.add(listener)
@@ -268,15 +296,19 @@ export class PadClient {
   start(): void {
     if (this.started) return
     this.started = true
+    if (typeof document !== 'undefined') document.addEventListener?.('visibilitychange', this.onVisibilityChange)
     this.reconnect()
   }
 
   stop(): void {
     this.started = false
+    if (typeof document !== 'undefined') document.removeEventListener?.('visibilitychange', this.onVisibilityChange)
     this.source?.close()
     this.source = undefined
     this.watchKey = ''
     clearTimeout(this.freshTimer)
+    clearTimeout(this.reconnectTimer)
+    this.reconnectTimer = undefined
   }
 
   /** Readings of one source collected while this page was open, oldest first. */
@@ -401,7 +433,7 @@ export class PadClient {
 
   /** Panels the Host should poll: everything visible in an expanded dock. */
   private watchIds(): string[] {
-    if (!this.snapshot.layout.expanded) return []
+    if (!this.snapshot.layout.expanded || (typeof document !== 'undefined' && document.visibilityState === 'hidden')) return []
     return this.snapshot.panels.filter(p => !p.collapsed && !p.needsApproval).map(p => p.id)
   }
 
@@ -411,13 +443,28 @@ export class PadClient {
     const ids = this.watchIds()
     const key = ids.join(',')
     if (this.source !== undefined && key === this.watchKey) return
+    clearTimeout(this.reconnectTimer)
+    this.reconnectTimer = undefined
     this.watchKey = key
     this.source?.close()
+    this.source = undefined
     const url = `${routeUrl(ROUTES.stream)}?watch=${encodeURIComponent(key)}`
-    const source = new EventSource(url, { withCredentials: true })
+    let source: EventSource
+    try {
+      source = new EventSource(url, { withCredentials: true })
+    } catch (error) {
+      // A constructor failure used to abort plugin activation before the dock
+      // was registered. Keep the entrance visible and retry while still owned.
+      this.update({ connected: false, connectionError: error instanceof Error ? error.message : String(error) })
+      this.reconnectTimer = setTimeout(() => {
+        this.reconnectTimer = undefined
+        this.reconnect()
+      }, 3000)
+      return
+    }
     this.source = source
     source.onopen = () => {
-      if (this.source === source) this.update({ connected: true })
+      if (this.source === source) this.update({ connected: true, connectionError: undefined })
     }
     source.onerror = () => {
       if (this.source === source) this.update({ connected: false })
@@ -442,7 +489,7 @@ export class PadClient {
       for (const id of [...this.history.keys()]) if (!ids.has(id)) this.history.delete(id)
       const created = this.known === undefined ? undefined : event.panels.find(p => !this.known!.has(p.id))
       this.known = ids
-      this.update({ panels: event.panels, loaded: true, connected: true })
+      this.update({ panels: event.panels, loaded: true, connected: true, connectionError: undefined })
       if (created !== undefined) this.announce(created.id)
       this.reconnect()
       return
