@@ -84,15 +84,36 @@ describe('frame runtime', () => {
 
   it('merges incremental histories before rendering and keeps the last 120 points', () => {
     const frame = bootFrame(data)
-    const points = Array.from({ length: 120 }, (_, i) => ({ at: String(i), value: i }))
+    const stamp = (i: number): string => new Date(Date.UTC(2026, 9, 23, 12, 0, i)).toISOString()
+    const points = Array.from({ length: 120 }, (_, i) => ({ at: stamp(i), value: i }))
     frame.send({ kind: 'data', data, histories: { metric: points } })
     let rendered: unknown
     frame.dsh.onData(() => { rendered = frame.dsh.history('metric') })
-    frame.send({ kind: 'data', data, historyDelta: { metric: [{ at: '120', value: 120 }] } })
-    expect(rendered).toEqual([...points.slice(1), { at: '120', value: 120 }])
-    frame.send({ kind: 'data', data, historyDelta: { metric: [{ at: '120', value: 121 }] } })
+    frame.send({ kind: 'data', data, historyDelta: { metric: [{ at: stamp(120), value: 120 }] } })
+    expect(rendered).toEqual([...points.slice(1), { at: stamp(120), value: 120 }])
+    frame.send({ kind: 'data', data, historyDelta: { metric: [{ at: stamp(120), value: 121 }] } })
     expect(frame.dsh.history('metric')).toHaveLength(120)
     expect(frame.dsh.history('metric').at(-1).value).toBe(121)
+  })
+
+  it('inserts backfilled histories in order and updates an older timestamp', () => {
+    const frame = bootFrame(data)
+    const a = { at: '2026-10-23T12:00:01.000Z', value: 1 }
+    const b = { at: '2026-10-23T12:00:02.000Z', value: 2 }
+    const c = { at: '2026-10-23T12:00:03.000Z', value: 3 }
+    frame.send({ kind: 'data', data, histories: { metric: [a, c] } })
+    frame.send({ kind: 'data', data, historyDelta: { metric: [b] } })
+    expect(frame.dsh.history('metric')).toEqual([a, b, c])
+    frame.send({ kind: 'data', data, historyDelta: { metric: [{ ...a, value: 9 }] } })
+    expect(frame.dsh.history('metric')).toEqual([{ ...a, value: 9 }, b, c])
+  })
+
+  it('supports a source named constructor before and after its first history point', () => {
+    const frame = bootFrame(data)
+    expect(frame.dsh.history('constructor')).toEqual([])
+    const first = { at: '2026-10-23T12:00:01.000Z', value: 1 }
+    frame.send({ kind: 'data', data, historyDelta: { constructor: [first] } })
+    expect(frame.dsh.history('constructor')).toEqual([first])
   })
 
   it('skips fixed-height layout measurements and resumes when reset to auto', () => {

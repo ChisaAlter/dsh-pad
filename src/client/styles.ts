@@ -57,10 +57,10 @@ export const DOCK_CSS = `
   font-size:13px;line-height:18px;animation:dshpad-dock-in .18s var(--dshpad-ease)}
 .dshpad-dock.is-attached{border-radius:12px;max-height:calc(100vh - 2px)}
 .dshpad-dock.is-attached .dshpad-dock-head{padding-left:var(--dshpad-head-left);padding-right:var(--dshpad-head-right)}
-.dshpad-dock.is-attached-left .dshpad-list{margin-left:28px}
-.dshpad-dock.is-attached-right .dshpad-list{margin-right:28px}
-.dshpad-dock.is-attached-left>.dshpad-update,.dshpad-dock.is-attached-left>.dshpad-banner{margin-left:34px}
-.dshpad-dock.is-attached-right>.dshpad-update,.dshpad-dock.is-attached-right>.dshpad-banner{margin-right:34px}
+.dshpad-dock.is-attached-left.has-control-gutter .dshpad-list{margin-left:28px}
+.dshpad-dock.is-attached-right.has-control-gutter .dshpad-list{margin-right:28px}
+.dshpad-dock.is-attached-left.has-control-gutter>.dshpad-update,.dshpad-dock.is-attached-left.has-control-gutter>.dshpad-banner{margin-left:34px}
+.dshpad-dock.is-attached-right.has-control-gutter>.dshpad-update,.dshpad-dock.is-attached-right.has-control-gutter>.dshpad-banner{margin-right:34px}
 .dshpad-dock.is-attached-top .dshpad-dock-head{flex:none;margin-top:28px}
 .dshpad-dock.is-attached-bottom .dshpad-dock-foot{height:32px}
 .dshpad-dock.is-attached-bottom .dshpad-dock-foot::after{display:none}
@@ -155,6 +155,7 @@ export const DOCK_CSS = `
 .dshpad-more svg{width:14px;height:14px}
 .dshpad-card-body{padding:0 6px 5px}
 .dshpad-drag-shield{position:fixed;inset:0;z-index:99990;cursor:grabbing;background:transparent;touch-action:none;user-select:none}
+.dshpad-drag-shield.is-splitting{cursor:col-resize}
 .dshpad-drag-ghost{position:fixed;z-index:99999;display:flex;align-items:center;gap:6px;max-width:280px;padding:6px 9px;border-radius:9px;  background:color-mix(in srgb, var(--dsw-alias-button-floating-fill,var(--dshpad-surface)) 88%, transparent);
   -webkit-backdrop-filter:blur(18px) saturate(1.4);backdrop-filter:blur(18px) saturate(1.4);
   box-shadow:var(--dsw-elevation-panel,0 6px 20px rgba(0,0,0,.16));color:var(--dshpad-fg);

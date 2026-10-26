@@ -3,7 +3,7 @@
  * per-source reading history, and the dock's own view state (expanded, width,
  * floating-ball and window positions, nested card layout) persisted per device.
  */
-import type { PanelAction, PanelData, PanelDefinition, PanelModelCatalog, PanelRunResult, PanelView, PadUpdateInfo, ReadingPoint, StreamEvent } from '../shared/types.ts'
+import type { PanelAction, PanelData, PanelDefinition, PanelModelCatalog, PanelRunResult, PanelSource, PanelView, PadUpdateInfo, ReadingPoint, StreamEvent } from '../shared/types.ts'
 import { ROUTES } from '../shared/types.ts'
 import { type LayoutNode, legacyRowsToTree, parseTree } from './layout.ts'
 import type { BallEdge } from './ball-position.ts'
@@ -41,7 +41,7 @@ export interface DockLayout {
   readonly ballEdge?: BallEdge | null
   /** Where the user last put the expanded window; null opens next to the ball. */
   readonly dock: Point | null
-  /** Relative edge control retained while moving an attached window. */
+  /** Edge and position along it retained when moving or resizing an attached window. */
   readonly dockControl?: DockControl | null
   /** Per-panel iframe height in px, set by dragging a panel's bottom edge. */
   readonly heights: Readonly<Record<string, number>>
@@ -136,34 +136,49 @@ export function clampPanelHeight(height: number): number {
  * @returns true while a declared source has not been read yet.
  */
 export function awaitingFirstData(definition: PanelDefinition, data: PanelData): boolean {
-  return definition.sources.some(source => data.sources[source.id] === undefined)
+  return definition.sources.some(source => !Object.hasOwn(data.sources, source.id) || data.sources[source.id] === undefined)
+}
+
+/** Same canonical fields/defaults as the Host's sourcesFingerprint, without crypto. */
+function sourceKey(source: PanelSource): string {
+  return JSON.stringify(source.kind === 'command'
+    ? ['command', source.id, source.command, source.parse, source.intervalSec, source.timeoutMs ?? null]
+    : ['http', source.id, source.method ?? 'GET', source.url, Object.entries(source.headers ?? {}).sort(),
+        source.body ?? null, source.parse, source.intervalSec, source.timeoutMs ?? null])
+}
+
+/** Keep the latest value at each instant, oldest first, without reviving evicted points. */
+function mergeHistory(points: readonly HistoryPoint[], minimum = -Infinity): HistoryPoint[] {
+  const byTime = new Map<number, HistoryPoint>()
+  for (const point of points) {
+    const time = typeof point?.at === 'string' ? Date.parse(point.at) : NaN
+    if (!Number.isFinite(time) || time < minimum) continue
+    byTime.set(time, { value: point.value, at: point.at })
+  }
+  return [...byTime].sort(([a], [b]) => a - b).slice(-HISTORY_LIMIT).map(([, point]) => point)
 }
 
 /**
- * Seed a panel's in-memory history with the points the Host cached on disk.
- *
- * Called when the panel list arrives: a fresh page starts with an empty history,
- * so a panel drawing `dsh.history()` would begin with a blank chart. The first
- * list wins — once live points exist they are never replaced by the older
- * cached ones, and duplicate readings are dropped by `record`.
+ * Merge the Host's cached history, including readings missed while disconnected.
+ * Local points win timestamp ties; snapshots cannot revive points older than
+ * the local window or replace its newer readings.
  * @param store - the client's per-panel, per-source history.
  * @param panel - the panel view, carrying the cached points.
  */
 export function seedPanelHistory(store: Map<string, Map<string, HistoryPoint[]>>, panel: PanelView): void {
   if (panel.history === undefined || panel.history === null) return
-  for (const [sourceId, points] of Object.entries(panel.history)) {
+  for (const { id: sourceId } of panel.definition.sources) {
+    const points = panel.history[sourceId]
     if (!Array.isArray(points) || points.length === 0) continue
     let panelHistory = store.get(panel.id)
+    const local = panelHistory?.get(sourceId) ?? []
+    const clean = mergeHistory([...points, ...local], local.length > 0 ? Date.parse(local[0]!.at) : -Infinity)
+    if (clean.length === 0) continue
     if (panelHistory === undefined) {
       panelHistory = new Map()
       store.set(panel.id, panelHistory)
     }
-    // Live points are newer than anything on disk; keep them.
-    if (panelHistory.has(sourceId)) continue
-    const clean = points
-      .filter(point => typeof point?.at === 'string' && Number.isFinite(Date.parse(point.at)))
-      .map(point => ({ value: point.value, at: point.at }))
-    if (clean.length > 0) panelHistory.set(sourceId, clean.slice(-HISTORY_LIMIT))
+    panelHistory.set(sourceId, clean)
   }
 }
 
@@ -276,6 +291,7 @@ export class PadClient {
   private snapshot: PadSnapshot = { panels: [], connected: false, loaded: false, layout: readLayout(), fresh: undefined }
   private readonly listeners = new Set<() => void>()
   private readonly history = new Map<string, Map<string, HistoryPoint[]>>()
+  private readonly sourceKeys = new Map<string, Map<string, string>>()
   private source: EventSource | undefined
   private watchKey = ''
   private known: Set<string> | undefined
@@ -303,8 +319,9 @@ export class PadClient {
   stop(): void {
     this.started = false
     if (typeof document !== 'undefined') document.removeEventListener?.('visibilitychange', this.onVisibilityChange)
-    this.source?.close()
+    const source = this.source
     this.source = undefined
+    source?.close()
     this.watchKey = ''
     clearTimeout(this.freshTimer)
     clearTimeout(this.reconnectTimer)
@@ -446,8 +463,9 @@ export class PadClient {
     clearTimeout(this.reconnectTimer)
     this.reconnectTimer = undefined
     this.watchKey = key
-    this.source?.close()
+    const previous = this.source
     this.source = undefined
+    previous?.close()
     const url = `${routeUrl(ROUTES.stream)}?watch=${encodeURIComponent(key)}`
     let source: EventSource
     try {
@@ -456,10 +474,7 @@ export class PadClient {
       // A constructor failure used to abort plugin activation before the dock
       // was registered. Keep the entrance visible and retry while still owned.
       this.update({ connected: false, connectionError: error instanceof Error ? error.message : String(error) })
-      this.reconnectTimer = setTimeout(() => {
-        this.reconnectTimer = undefined
-        this.reconnect()
-      }, 3000)
+      this.scheduleReconnect()
       return
     }
     this.source = source
@@ -467,7 +482,14 @@ export class PadClient {
       if (this.source === source) this.update({ connected: true, connectionError: undefined })
     }
     source.onerror = () => {
-      if (this.source === source) this.update({ connected: false })
+      if (this.source !== source) return
+      // CONNECTING streams retry natively; CLOSED ones (e.g. HTTP 401/404) do not.
+      if (source.readyState === 2) {
+        this.source = undefined
+        source.close()
+        this.scheduleReconnect()
+      }
+      this.update({ connected: false })
     }
     source.onmessage = (message: MessageEvent<string>) => {
       if (this.source !== source) return
@@ -479,14 +501,30 @@ export class PadClient {
     }
   }
 
+  private scheduleReconnect(): void {
+    if (!this.started || this.reconnectTimer !== undefined) return
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = undefined
+      this.reconnect()
+    }, 3000)
+  }
+
   private receive(event: StreamEvent): void {
     if (event.type === 'panels') {
       for (const panel of event.panels) {
+        const keys = new Map(panel.definition.sources.map(source => [source.id, sourceKey(source)]))
+        const previous = this.sourceKeys.get(panel.id)
+        const history = this.history.get(panel.id)
+        if (history !== undefined) {
+          for (const id of history.keys()) if (!keys.has(id) || previous?.get(id) !== keys.get(id)) history.delete(id)
+        }
+        this.sourceKeys.set(panel.id, keys)
         seedPanelHistory(this.history, panel)
         this.record(panel.id, panel.data)
       }
       const ids = new Set(event.panels.map(p => p.id))
-      for (const id of [...this.history.keys()]) if (!ids.has(id)) this.history.delete(id)
+      for (const id of this.history.keys()) if (!ids.has(id)) this.history.delete(id)
+      for (const id of this.sourceKeys.keys()) if (!ids.has(id)) this.sourceKeys.delete(id)
       const created = this.known === undefined ? undefined : event.panels.find(p => !this.known!.has(p.id))
       this.known = ids
       this.update({ panels: event.panels, loaded: true, connected: true, connectionError: undefined })
@@ -509,21 +547,18 @@ export class PadClient {
   }
 
   private record(panelId: string, data: PanelData): void {
+    const keys = this.sourceKeys.get(panelId)
+    if (keys === undefined) return
     let panelHistory = this.history.get(panelId)
     if (panelHistory === undefined) {
       panelHistory = new Map()
       this.history.set(panelId, panelHistory)
     }
     for (const [sourceId, reading] of Object.entries(data.sources)) {
-      if (!reading.ok || reading.value === undefined) continue
-      let points = panelHistory.get(sourceId)
-      if (points === undefined) {
-        points = []
-        panelHistory.set(sourceId, points)
-      }
-      if (points.length > 0 && points[points.length - 1]!.at === reading.at) continue
-      points.push({ value: reading.value, at: reading.at })
-      if (points.length > HISTORY_LIMIT) points.splice(0, points.length - HISTORY_LIMIT)
+      if (!keys.has(sourceId) || !reading.ok || reading.value === undefined) continue
+      const points = panelHistory.get(sourceId) ?? []
+      const clean = mergeHistory([...points, { value: reading.value, at: reading.at }], points.length > 0 ? Date.parse(points[0]!.at) : -Infinity)
+      if (clean.length > 0) panelHistory.set(sourceId, clean)
     }
   }
 

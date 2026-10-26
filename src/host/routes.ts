@@ -87,6 +87,12 @@ export interface RouteDeps {
 export function registerRoutes({ ctx, store, hub, runOptions, update }: RouteDeps): void {
   const connection = ctx.connection
   const runner = new PanelRunner(ctx, runOptions)
+  const streams = new Set<() => void>()
+  ctx.effect(() => () => runner.dispose(), 'dsh-pad: model cleanup')
+  ctx.effect(() => () => {
+    for (const close of [...streams]) close()
+    streams.clear()
+  }, 'dsh-pad: stream cleanup')
 
   ctx.effect(() => connection.fetch.register({
     path: ROUTES.panels,
@@ -107,7 +113,28 @@ export function registerRoutes({ ctx, store, hub, runOptions, update }: RouteDep
       const body = new ReadableStream<Uint8Array>({
         start(controller) {
           let open = true
-          let close = (): void => {}
+          let unsubscribe: (() => void) | undefined
+          let heartbeat: ReturnType<typeof setInterval> | undefined
+          const close = (): void => {
+            if (!open) return
+            open = false
+            clearInterval(heartbeat)
+            unsubscribe?.()
+            streams.delete(close)
+            request.signal.removeEventListener('abort', close)
+            try {
+              controller.close()
+            } catch {
+              // Already closed by the consumer.
+            }
+          }
+          cleanup = close
+          if (request.signal.aborted) {
+            close()
+            return
+          }
+          streams.add(close)
+          request.signal.addEventListener('abort', close, { once: true })
           const write = (text: string): void => {
             if (!open) return
             try {
@@ -121,22 +148,12 @@ export function registerRoutes({ ctx, store, hub, runOptions, update }: RouteDep
             send: (event: StreamEvent) => write(`data: ${JSON.stringify(event)}\n\n`),
           }
           write('retry: 3000\n\n')
-          const unsubscribe = hub.subscribe(subscriber)
-          const heartbeat = setInterval(() => write(': ping\n\n'), HEARTBEAT_MS)
-          close = (): void => {
-            if (!open) return
-            open = false
-            clearInterval(heartbeat)
+          unsubscribe = hub.subscribe(subscriber)
+          if (!open) {
             unsubscribe()
-            request.signal.removeEventListener('abort', close)
-            try {
-              controller.close()
-            } catch {
-              // Already closed by the consumer.
-            }
+            return
           }
-          cleanup = close
-          request.signal.addEventListener('abort', close, { once: true })
+          heartbeat = setInterval(() => write(': ping\n\n'), HEARTBEAT_MS)
         },
         cancel() {
           cleanup?.()
@@ -207,7 +224,7 @@ export function registerRoutes({ ctx, store, hub, runOptions, update }: RouteDep
       }
       const panel = store.find(panelId)
       if (panel === undefined) return json({ ok: false, error: '面板不存在' }, 404)
-      const result = await runner.run(panel, prompt, system)
+      const result = await runner.run(panel, prompt, system, request.signal)
       return json(result, result.ok ? 200 : 400)
     },
   }), 'dsh-pad: run route')

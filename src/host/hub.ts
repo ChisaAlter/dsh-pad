@@ -90,8 +90,9 @@ export class DataHub {
       for (const [sourceId, entry] of readings) if (current.get(sourceId) !== entry.key) readings.delete(sourceId)
       if (readings.size === 0) this.readings.delete(panelId)
     }
+    const approved = new Set(panels.filter(panel => this.store.approved(panel)).map(panel => panel.id))
     for (const [panelId, runs] of this.inFlight) {
-      const current = keys.get(panelId)
+      const current = approved.has(panelId) ? keys.get(panelId) : undefined
       for (const [sourceId, run] of runs) {
         if (current?.get(sourceId) === run.key) continue
         runs.delete(sourceId)
@@ -272,6 +273,14 @@ export class DataHub {
     const source = panel.definition.sources.find(s => s.id === sourceId)
     if (source === undefined) return undefined
     const key = this.sourceKey(source)
+    const latest = this.store.find(panel.id)
+    const latestSource = latest?.definition.sources.find(s => s.id === sourceId)
+    if (latest === undefined || latestSource === undefined || this.sourceKey(latestSource) !== key) {
+      return { ok: false, error: '数据源已经变更', at: new Date().toISOString() }
+    }
+    if (!this.store.approved(latest)) {
+      return { ok: false, error: '数据源还没被允许运行', at: new Date().toISOString() }
+    }
     let runs = this.inFlight.get(panel.id)
     if (runs === undefined) {
       runs = new Map()
@@ -286,7 +295,7 @@ export class DataHub {
       const current = this.store.find(panel.id)
       // A superseded run must not replace a new reading or erase its cache.
       const still = current?.definition.sources.find(s => s.id === sourceId)
-      if (this.disposed || controller.signal.aborted || current === undefined || still === undefined || this.sourceKey(still) !== key) return reading
+      if (this.disposed || controller.signal.aborted || current === undefined || !this.store.approved(current) || still === undefined || this.sourceKey(still) !== key) return reading
       let readings = this.readings.get(panel.id)
       if (readings === undefined) {
         readings = new Map()

@@ -5,7 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { DataHub, type Subscriber } from '../src/host/hub.ts'
 import { ReadingCache } from '../src/host/readings.ts'
 import { runSource } from '../src/host/sources.ts'
-import { PanelStore } from '../src/host/store.ts'
+import { PanelStore, sourcesFingerprint } from '../src/host/store.ts'
 import type { PanelDefinition, PanelSource, SourceReading, StreamEvent } from '../src/shared/types.ts'
 
 vi.mock('../src/host/sources.ts', () => ({ runSource: vi.fn() }))
@@ -64,6 +64,41 @@ async function setup(sources = [source()], withCache = false) {
 }
 
 describe('DataHub source concurrency', () => {
+  it('does not run unapproved sources through runAll', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'dsh-pad-approval-'))
+    const store = new PanelStore(join(directory, 'panels.json'), false)
+    const panel = await store.create(definition(source()))
+    const hub = new DataHub(store, async () => undefined, () => {})
+    hubs.push(hub)
+    const result = hub.runAll(panel.id)
+    const started = pending[0]
+    // Resolve an accidental start so the failing regression cannot hang.
+    started?.resolve(reading('should not run'))
+    const readings = await result
+    expect(runSource).not.toHaveBeenCalled()
+    expect(readings).toEqual([expect.objectContaining({ id: 'a', ok: false, error: expect.stringMatching(/允许/) })])
+  })
+
+  it('cancels an unchanged source when editing another source withdraws panel approval', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'dsh-pad-approval-'))
+    const store = new PanelStore(join(directory, 'panels.json'), false)
+    const panel = await store.create(definition(source('a'), source('b')))
+    await store.approve(panel.id, sourcesFingerprint(panel.definition.sources))
+    const cache = new ReadingCache(join(directory, 'readings.json'))
+    const hub = new DataHub(store, async () => undefined, () => {}, { cache })
+    hubs.push(hub)
+    store.onChange(() => hub.storeChanged())
+    const active = hub.runAll(panel.id)
+    await store.update(panel.id, definition(source('a'), source('b', 'echo changed')))
+    expect(pending[0]!.signal?.aborted).toBe(true)
+    pending[0]!.resolve(reading('unapproved late a'))
+    pending[1]!.resolve(reading('unapproved late b'))
+    await active
+    expect(hub.views()[0]?.data.sources).toEqual({})
+    expect(cache.history(panel.id)).toEqual({})
+    cache.dispose()
+  })
+
   it('shares overlapping hidden refreshes and runAll calls, then allows another run', async () => {
     const { hub, panel, subscriber, dataEvents } = await setup()
     hub.refresh(panel.id)

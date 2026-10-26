@@ -18,6 +18,21 @@ describe('incremental iframe history transfer', () => {
     expect(sync.delta({ a: [point(1), point(3), point(4)], b: [point(2)] })).toEqual({})
   })
 
+  it('sends backfilled points even when the latest timestamp is unchanged', () => {
+    const sync = new HistorySync()
+    sync.reset({ a: [point(1), point(3)] })
+    expect(sync.delta({ a: [point(1), point(2), point(3)] })).toEqual({ a: [point(2)] })
+    expect(sync.delta({ a: [point(1), point(2), point(3)] })).toEqual({})
+  })
+
+  it('sends a replacement value with the same timestamp only once', () => {
+    const sync = new HistorySync()
+    sync.reset({ a: [point(1)] })
+    const changed = { a: [{ ...point(1), value: 9 }] }
+    expect(sync.delta(changed)).toEqual(changed)
+    expect(sync.delta(changed)).toEqual({})
+  })
+
   it('resynchronizes a bounded ring when its previous point has expired', () => {
     const sync = new HistorySync()
     sync.reset({ a: [point(1)] })

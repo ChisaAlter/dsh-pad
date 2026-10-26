@@ -52,12 +52,13 @@ export const FRAME_RUNTIME = String.raw`
       current = m.data;
       if (m.histories) histories = m.histories;
       if (m.historyDelta) Object.keys(m.historyDelta).forEach(function (id) {
-        var points = histories[id] || [];
+        var points = Array.isArray(histories[id]) ? histories[id] : [];
         m.historyDelta[id].forEach(function (point) {
-          var last = points[points.length - 1];
-          if (last && last.at === point.at) points[points.length - 1] = point;
+          var index = points.findIndex(function (old) { return old.at === point.at; });
+          if (index >= 0) points[index] = point;
           else points.push(point);
         });
+        points.sort(function (a, b) { return a.at < b.at ? -1 : a.at > b.at ? 1 : 0; });
         if (points.length > 120) points.splice(0, points.length - 120);
         histories[id] = points;
       });
@@ -215,7 +216,7 @@ export const FRAME_RUNTIME = String.raw`
       if (current) { try { fn(current); } catch (e) { report(e); } }
       return function () { listeners = listeners.filter(function (l) { return l !== fn; }); };
     },
-    history: function (sourceId) { return (histories[sourceId] || []).slice(); },
+    history: function (sourceId) { return Array.isArray(histories[sourceId]) ? histories[sourceId].slice() : []; },
     refresh: function () { post({ kind: 'refresh' }); },
     openUrl: function (url) { post({ kind: 'open', url: String(url) }); },
     ask: function (text) { post({ kind: 'ask', text: String(text) }); },

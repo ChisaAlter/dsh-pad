@@ -89,6 +89,45 @@ describe('UpdateService', () => {
     expect(existsSync(join(root, '.dsh-pad-update-backup'))).toBe(true)
   })
 
+  it('keeps every installed file when creating the backup fails', async () => {
+    const root = await pluginRoot()
+    // A non-directory at the backup path reproduces a failed mkdir before any
+    // installed file has been replaced (also occurs with permissions/disk errors).
+    await writeFile(join(root, '.dsh-pad-update-backup'), 'blocked')
+    const service = new UpdateService({
+      current: '0.1.1', root, enabled: true, checkHours: 6,
+      fetchImpl: releaseFetch({
+        'lib/index.js': 'new host'.padEnd(1200, 'x'),
+        'lib/client.js': 'new client'.padEnd(1200, 'y'),
+        'cordis.patch.yml': '- insert: []',
+      }),
+    })
+    await service.check(true)
+    expect((await service.apply()).ok).toBe(false)
+    expect(await readFile(join(root, 'lib', 'index.js'), 'utf8')).toBe('old host')
+    expect(await readFile(join(root, 'lib', 'client.js'), 'utf8')).toBe('old client')
+    expect(JSON.parse(await readFile(join(root, 'package.json'), 'utf8')).version).toBe('0.1.1')
+    expect(await readFile(join(root, 'cordis.patch.yml'), 'utf8')).toBe('- insert: []')
+  })
+
+  it('restores every installed file after a replacement fails', async () => {
+    const root = await pluginRoot()
+    await mkdir(join(root, 'lib', `client.js.update-${process.pid}`))
+    const service = new UpdateService({
+      current: '0.1.1', root, enabled: true, checkHours: 6,
+      fetchImpl: releaseFetch({
+        'lib/index.js': 'new host'.padEnd(1200, 'x'),
+        'lib/client.js': 'new client'.padEnd(1200, 'y'),
+        'cordis.patch.yml': '- insert: []',
+      }),
+    })
+    await service.check(true)
+    expect((await service.apply()).ok).toBe(false)
+    expect(await readFile(join(root, 'lib', 'index.js'), 'utf8')).toBe('old host')
+    expect(await readFile(join(root, 'lib', 'client.js'), 'utf8')).toBe('old client')
+    expect(JSON.parse(await readFile(join(root, 'package.json'), 'utf8')).version).toBe('0.1.1')
+  })
+
   it('does not replace a source checkout', async () => {
     const root = await pluginRoot('0.1.1', true)
     const service = new UpdateService({

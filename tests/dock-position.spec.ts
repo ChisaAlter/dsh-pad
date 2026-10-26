@@ -1,9 +1,46 @@
 import { describe, expect, it } from 'vitest'
-import { attachedDock } from '../src/client/dock-position.ts'
+import { attachedDock, retainedDockControl, resizedDockControl } from '../src/client/dock-position.ts'
 import { positionAtBallEdge, type BallEdge } from '../src/client/ball-position.ts'
 import { overlapsWindowControls } from '../src/client/window-controls.ts'
 
 const viewport = { width: 1000, height: 700 }
+
+describe('retained edge controls follow the resized dock', () => {
+  it.each([288, 400, 700, 980])('recovers a stale right control at width %s', width => {
+    expect(retainedDockControl({ edge: 'right', point: { x: 230, y: 2 } }, width, 600))
+      .toEqual({ x: width - 28, y: 2 })
+  })
+
+  it('keeps top and bottom toggles stationary while resizing from the left', () => {
+    for (const edge of ['top', 'bottom'] as const) {
+      const control = { edge, point: { x: 320, y: edge === 'top' ? 0 : 472 } }
+      const resized = resizedDockControl(control, { x: 260, y: 1 }, { x: 200, y: 1 }, 700, 500)
+      expect(resized.point.x + 200).toBe(control.point.x + 260)
+      expect(resized.point.y).toBe(control.point.y)
+    }
+  })
+
+  it('keeps a side toggle stationary while resizing from above', () => {
+    const resized = resizedDockControl({ edge: 'right', point: { x: 672, y: 150 } }, { x: 100, y: 80 }, { x: 100, y: 40 }, 700, 540)
+    expect(resized).toEqual({ edge: 'right', point: { x: 672, y: 190 } })
+  })
+
+  it('anchors the bottom and preserves the position along it', () => {
+    expect(retainedDockControl({ edge: 'bottom', point: { x: 250, y: 300 } }, 700, 600))
+      .toEqual({ x: 250, y: 572 })
+    expect(retainedDockControl({ edge: 'bottom', point: { x: 650, y: 300 } }, 400, 180))
+      .toEqual({ x: 372, y: 152 })
+  })
+
+  it('keeps left and top controls on their edges and inside a small dock', () => {
+    expect(retainedDockControl({ edge: 'left', point: { x: 200, y: 500 } }, 200, 180))
+      .toEqual({ x: 0, y: 152 })
+    expect(retainedDockControl({ edge: 'top', point: { x: 500, y: 100 } }, 200, 180))
+      .toEqual({ x: 172, y: 0 })
+    expect(retainedDockControl({ edge: 'right', point: { x: 200, y: -1 } }, 28, 28))
+      .toEqual({ x: 0, y: 0 })
+  })
+})
 
 describe('an attached panel contains its toggle at the original ball position', () => {
   it.each(['left', 'right', 'top', 'bottom'] as BallEdge[])('keeps the %s control inside the panel, including near corners', edge => {

@@ -1,13 +1,13 @@
-import { describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
   BALL_SIZE, BALL_MARGIN, BALL_SNAP_INSET, HISTORY_LIMIT, MAX_WIDTH, MIN_WIDTH, MIN_DOCK_HEIGHT,
   awaitingFirstData, normalizeDockLayout, seedPanelHistory,
 } from '../src/client/pad-client.ts'
 import { PadClient } from '../src/client/pad-client.ts'
 import type { HistoryPoint } from '../src/client/pad-client.ts'
-import type { PanelData, PanelDefinition, PanelSource, PanelView } from '../src/shared/types.ts'
+import type { HttpSource, PanelData, PanelDefinition, PanelSource, PanelView, StreamEvent } from '../src/shared/types.ts'
 
-const source = (id: string): PanelSource => ({ id, kind: 'http', url: 'https://example.com', parse: 'json', intervalSec: 30 })
+const source = (id: string): HttpSource => ({ id, kind: 'http', url: 'https://example.com', parse: 'json', intervalSec: 30 })
 
 const definition = (sources: PanelSource[]): PanelDefinition => ({
   title: 'panel',
@@ -40,6 +40,13 @@ describe('a panel waits for its first readings', () => {
     expect(awaitingFirstData(definition([source('metric')]), data({ metric: failed }))).toBe(false)
   })
 
+  it('waits for an own reading when the source is named constructor', () => {
+    const own = definition([source('constructor')])
+    expect(awaitingFirstData(own, data())).toBe(true)
+    expect(awaitingFirstData(own, data(JSON.parse(JSON.stringify({ constructor: reading }))))).toBe(false)
+    expect(awaitingFirstData(own, data(JSON.parse('{"constructor":{"ok":false,"error":"offline","at":"2026-10-26T00:00:00Z"}}')))).toBe(false)
+  })
+
   it('lets panels without sources render straight away', () => {
     expect(awaitingFirstData(definition([]), data())).toBe(false)
     expect(awaitingFirstData(definition([]), data({ stale: reading }))).toBe(false)
@@ -68,6 +75,31 @@ const view = (history: PanelView['history']): PanelView => ({
   history,
 })
 
+class FakeEventSource {
+  static instances: FakeEventSource[] = []
+  readyState = 0
+  onopen: (() => void) | null = null
+  onerror: (() => void) | null = null
+  onmessage: ((event: { data: string }) => void) | null = null
+  close = vi.fn(() => { this.readyState = 2 })
+
+  constructor(readonly url: string) { FakeEventSource.instances.push(this) }
+
+  emit(event: StreamEvent): void { this.onmessage?.({ data: JSON.stringify(event) }) }
+}
+
+function latestStream(): FakeEventSource {
+  return FakeEventSource.instances.at(-1)!
+}
+
+function emitPanels(...panels: PanelView[]): void {
+  latestStream().emit({ type: 'panels', panels })
+}
+
+function emitReading(value: number, at: string): void {
+  latestStream().emit({ type: 'data', panelId: 'p_1', data: data({ metric: { ok: true, value, at } }) })
+}
+
 describe('history cached on the Host', () => {
   it('seeds a fresh page with the points kept from the last session', () => {
     const store = new Map<string, Map<string, HistoryPoint[]>>()
@@ -81,6 +113,51 @@ describe('history cached on the Host', () => {
     const store = new Map([['p_1', new Map([['metric', live]])]])
     seedPanelHistory(store, view({ metric: [point(1, '2026-10-23T07:00:00.000Z')] }))
     expect(store.get('p_1')?.get('metric')).toEqual(live)
+  })
+
+  it('merges readings missed during a disconnect, sorting and deduplicating timestamps', () => {
+    const a = point(1, '2026-10-23T07:00:00.000Z')
+    const b = point(2, '2026-10-23T07:05:00.000Z')
+    const c = point(3, '2026-10-23T07:10:00.000Z')
+    const store = new Map([['p_1', new Map([['metric', [a]]])]])
+    const snapshot = view({ metric: [c, b, point(99, a.at), b] })
+    seedPanelHistory(store, snapshot)
+    seedPanelHistory(store, snapshot)
+    expect(store.get('p_1')?.get('metric')).toEqual([a, b, c])
+  })
+
+  it('does not revive points older than the local window when a newer snapshot arrives', () => {
+    const kept = point(2, '2026-10-23T07:05:00.000Z')
+    const newer = point(3, '2026-10-23T07:10:00.000Z')
+    const store = new Map([['p_1', new Map([['metric', [kept]]])]])
+    seedPanelHistory(store, view({ metric: [point(1, '2026-10-23T07:00:00.000Z'), kept, newer] }))
+    expect(store.get('p_1')?.get('metric')).toEqual([kept, newer])
+  })
+
+  it('sorts fresh snapshots by time and keeps the last value at duplicate instants', () => {
+    const store = new Map<string, Map<string, HistoryPoint[]>>()
+    seedPanelHistory(store, view({ metric: [
+      point(3, '2026-10-23T07:10:00.000Z'),
+      point(1, '2026-10-23T07:00:00.000Z'),
+      point(2, '2026-10-23T07:00:00+00:00'),
+    ] }))
+    expect(store.get('p_1')?.get('metric')).toEqual([
+      point(2, '2026-10-23T07:00:00+00:00'), point(3, '2026-10-23T07:10:00.000Z'),
+    ])
+  })
+
+  it('limits merged history after filling missed readings', () => {
+    const points = Array.from({ length: HISTORY_LIMIT + 1 }, (_, index) =>
+      point(index, new Date(Date.UTC(2026, 9, 23, 0, index)).toISOString()))
+    const store = new Map([['p_1', new Map([['metric', points.slice(0, 1)]])]])
+    seedPanelHistory(store, view({ metric: points.slice().reverse() }))
+    expect(store.get('p_1')?.get('metric')).toEqual(points.slice(1))
+  })
+
+  it('ignores cached points of sources the panel no longer declares', () => {
+    const store = new Map<string, Map<string, HistoryPoint[]>>()
+    seedPanelHistory(store, view({ removed: [point(1, '2026-10-23T07:00:00.000Z')] }))
+    expect(store.get('p_1')?.get('removed')).toBeUndefined()
   })
 
   it('drops points without a usable timestamp', () => {
@@ -125,6 +202,134 @@ describe('history cached on the Host', () => {
   })
 })
 
+describe('history follows source definitions and live readings', () => {
+  let client: PadClient
+  const at = '2026-10-23T07:00:00.000Z'
+  const http: PanelSource = {
+    id: 'metric', kind: 'http', url: 'https://example.com', method: 'POST',
+    headers: { authorization: 'token', accept: 'application/json' }, body: '{}',
+    parse: 'json', intervalSec: 30, timeoutMs: 5000,
+  }
+  const command: PanelSource = { id: 'metric', kind: 'command', command: 'echo 1', parse: 'json', intervalSec: 30, timeoutMs: 5000 }
+
+  beforeEach(() => {
+    FakeEventSource.instances = []
+    vi.stubGlobal('EventSource', FakeEventSource)
+    client = new PadClient()
+    client.start()
+  })
+
+  afterEach(() => { client.stop(); vi.unstubAllGlobals() })
+
+  const edits: { label: string, before: PanelSource, after: PanelSource }[] = [
+    { label: 'HTTP URL', before: http, after: { ...http, url: 'https://other.example.com' } },
+    { label: 'HTTP method', before: http, after: { ...http, method: 'GET' } },
+    { label: 'HTTP headers', before: http, after: { ...http, headers: { authorization: 'other' } } },
+    { label: 'HTTP body', before: http, after: { ...http, body: 'changed' } },
+    { label: 'HTTP parser', before: http, after: { ...http, parse: 'text' } },
+    { label: 'HTTP interval', before: http, after: { ...http, intervalSec: 60 } },
+    { label: 'HTTP timeout', before: http, after: { ...http, timeoutMs: 8000 } },
+    { label: 'command text', before: command, after: { ...command, command: 'echo 2' } },
+    { label: 'command parser', before: command, after: { ...command, parse: 'text' } },
+    { label: 'command interval', before: command, after: { ...command, intervalSec: 60 } },
+    { label: 'command timeout', before: command, after: { ...command, timeoutMs: 8000 } },
+    { label: 'source kind', before: http, after: command },
+  ]
+
+  it.each(edits)('invalidates only the changed source after editing $label', ({ before, after }) => {
+    const metric = point(1, at)
+    const other = point(10, at)
+    const oldPanel = { ...view({ metric: [metric], other: [other] }), definition: definition([before, source('other')]) }
+    emitPanels(oldPanel)
+    const replacement = point(2, '2026-10-23T07:05:00.000Z')
+    emitPanels({ ...oldPanel, definition: definition([source('other'), after]), history: { metric: [replacement] } })
+    expect(client.historyOf('p_1', 'metric')).toEqual([replacement])
+    expect(client.historyOf('p_1', 'other')).toEqual([other])
+  })
+
+  it('preserves history across presentation edits, source order and canonical HTTP defaults', () => {
+    const metric = point(1, at)
+    const other = point(10, at)
+    const initial: PanelSource = { id: 'metric', kind: 'http', url: 'https://example.com', headers: http.headers, parse: 'json', intervalSec: 30 }
+    const panel = { ...view({ metric: [metric], other: [other] }), definition: definition([initial, source('other')]) }
+    emitPanels(panel)
+    emitPanels({
+      ...panel, version: 2, history: {},
+      definition: { ...panel.definition, title: 'renamed', css: 'p { color: red }', sources: [
+        source('other'), { ...initial, method: 'GET', headers: { accept: 'application/json', authorization: 'token' } },
+      ] },
+    })
+    expect(client.historiesOf('p_1')).toEqual({ metric: [metric], other: [other] })
+
+    emitPanels(view({ metric: [metric] }))
+    emitPanels({ ...view({}), definition: definition([{ ...source('metric'), method: 'GET', headers: {} }]) })
+    expect(client.historyOf('p_1', 'metric')).toEqual([metric])
+  })
+
+  it('drops removed sources and ignores their stale history and readings until re-added', () => {
+    const metric = point(1, at)
+    const other = point(10, at)
+    const panel = { ...view({ metric: [metric], other: [other] }), definition: definition([source('metric'), source('other')]) }
+    emitPanels(panel)
+    emitPanels({ ...panel, definition: definition([source('other')]), data: data({ metric: { ok: true, value: 2, at } }) })
+    emitReading(3, '2026-10-23T07:05:00.000Z')
+    expect(client.historiesOf('p_1')).toEqual({ other: [other] })
+    emitPanels({ ...panel, history: {} })
+    expect(client.historyOf('p_1', 'metric')).toEqual([])
+    emitReading(4, '2026-10-23T07:10:00.000Z')
+    expect(client.historyOf('p_1', 'metric').map(entry => entry.value)).toEqual([4])
+  })
+
+  it('forgets deleted panels and rejects late readings before the same id is re-added', () => {
+    emitPanels(view({ metric: [point(1, at)] }))
+    emitPanels()
+    emitReading(2, at)
+    expect(client.historiesOf('p_1')).toEqual({})
+    emitPanels(view({}))
+    expect(client.historiesOf('p_1')).toEqual({})
+  })
+
+  it('replaces values at an existing timestamp, including one behind the newest point', () => {
+    const newer = point(3, '2026-10-23T07:10:00.000Z')
+    emitPanels(view({ metric: [point(1, at), newer] }))
+    emitReading(30, newer.at)
+    emitReading(10, at)
+    expect(client.historyOf('p_1', 'metric')).toEqual([point(10, at), point(30, newer.at)])
+  })
+
+  it('keeps snapshot merges and stale current readings ordered inside the retained window', () => {
+    const a = point(1, at)
+    const b = point(2, '2026-10-23T07:05:00.000Z')
+    const c = point(3, '2026-10-23T07:10:00.000Z')
+    emitPanels(view({ metric: [a] }))
+    emitPanels({ ...view({ metric: [c, a, b] }), data: data({ metric: { ok: true, ...b } }) })
+    expect(client.historyOf('p_1', 'metric')).toEqual([a, b, c])
+    emitPanels({ ...view({ metric: [point(0, '2026-10-23T06:55:00.000Z')] }), data: data({ metric: { ok: true, value: 0, at: '2026-10-23T06:55:00.000Z' } }) })
+    expect(client.historyOf('p_1', 'metric')).toEqual([a, b, c])
+  })
+
+  it('keeps only the latest 120 live points and does not revive evicted readings', () => {
+    const points = Array.from({ length: HISTORY_LIMIT + 2 }, (_, index) =>
+      point(index, new Date(Date.UTC(2026, 9, 23, 0, index)).toISOString()))
+    emitPanels(view({}))
+    for (const entry of points) emitReading(entry.value as number, entry.at)
+    const old = points[0]!
+    emitPanels({ ...view({ metric: [old] }), data: data({ metric: { ok: true, ...old } }) })
+    expect(client.historyOf('p_1', 'metric')).toEqual(points.slice(2))
+  })
+
+  it('ignores failed, absent-value and invalid-timestamp readings', () => {
+    emitPanels(view({ metric: [point(1, at)] }))
+    const stream = latestStream()
+    for (const reading of [
+      { ok: false, value: 2, at },
+      { ok: true, at },
+      { ok: true, value: 2, at: 'not a date' },
+    ]) stream.emit({ type: 'data', panelId: 'p_1', data: data({ metric: reading }) })
+    expect(client.historyOf('p_1', 'metric')).toEqual([point(1, at)])
+  })
+})
+
 describe('stream setup recovery', () => {
   it('shows the setup error and clears it when a retry opens', async () => {
     vi.useFakeTimers()
@@ -158,6 +363,108 @@ describe('stream setup recovery', () => {
       await vi.advanceTimersByTimeAsync(9000)
       expect(construct).toHaveBeenCalledOnce()
     } finally { client.stop(); vi.unstubAllGlobals(); vi.useRealTimers() }
+  })
+})
+
+describe('stream terminal-error recovery', () => {
+  let client: PadClient
+
+  beforeEach(() => {
+    vi.useFakeTimers()
+    FakeEventSource.instances = []
+    vi.stubGlobal('EventSource', FakeEventSource)
+    client = new PadClient()
+    client.start()
+  })
+
+  afterEach(() => { client.stop(); vi.unstubAllGlobals(); vi.useRealTimers() })
+
+  it('replaces a CLOSED stream after one three-second retry even when the watch set is unchanged', async () => {
+    emitPanels(view({}))
+    client.setLayout({ expanded: true })
+    const stream = latestStream()
+    const count = FakeEventSource.instances.length
+    stream.onopen?.()
+    stream.readyState = 2
+    stream.onerror?.()
+    stream.onerror?.()
+    expect(stream.close).toHaveBeenCalledOnce()
+    expect(client.getSnapshot().connected).toBe(false)
+    expect(vi.getTimerCount()).toBe(1)
+    await vi.advanceTimersByTimeAsync(2999)
+    expect(FakeEventSource.instances).toHaveLength(count)
+    await vi.advanceTimersByTimeAsync(1)
+    expect(FakeEventSource.instances).toHaveLength(count + 1)
+    expect(latestStream().url).toBe(stream.url)
+    expect(latestStream().url).toContain('watch=p_1')
+    latestStream().onopen?.()
+    expect(client.getSnapshot().connected).toBe(true)
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
+  it('leaves CONNECTING errors to native reconnection without an extra timer', async () => {
+    const stream = latestStream()
+    stream.onopen?.()
+    stream.readyState = 0
+    stream.onerror?.()
+    stream.onerror?.()
+    client.setLayout({ expanded: true })
+    expect(client.getSnapshot().connected).toBe(false)
+    expect(vi.getTimerCount()).toBe(0)
+    await vi.advanceTimersByTimeAsync(9000)
+    expect(FakeEventSource.instances).toHaveLength(1)
+    expect(stream.close).not.toHaveBeenCalled()
+    stream.onopen?.()
+    expect(client.getSnapshot().connected).toBe(true)
+  })
+
+  it('cancels terminal-error retries on stop and ignores callbacks from the stopped stream', async () => {
+    const stream = latestStream()
+    stream.readyState = 2
+    stream.onerror?.()
+    client.stop()
+    const stopped = client.getSnapshot()
+    stream.onopen?.()
+    stream.onerror?.()
+    stream.emit({ type: 'panels', panels: [view({ metric: [point(99, '2026-10-23T07:00:00.000Z')] })] })
+    await vi.advanceTimersByTimeAsync(9000)
+    expect(FakeEventSource.instances).toHaveLength(1)
+    expect(client.getSnapshot()).toBe(stopped)
+    expect(client.historiesOf('p_1')).toEqual({})
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
+  it('ignores a retired stream after a watch change, including across stop and start', async () => {
+    emitPanels(view({}))
+    const retired = latestStream()
+    client.setLayout({ expanded: true })
+    const current = latestStream()
+    const count = FakeEventSource.instances.length
+    const snapshot = client.getSnapshot()
+    retired.onerror?.()
+    retired.onopen?.()
+    retired.emit({ type: 'panels', panels: [] })
+    expect(client.getSnapshot()).toBe(snapshot)
+    expect(current.close).not.toHaveBeenCalled()
+    expect(vi.getTimerCount()).toBe(0)
+    client.stop()
+    client.start()
+    current.onerror?.()
+    current.onopen?.()
+    await vi.advanceTimersByTimeAsync(9000)
+    expect(FakeEventSource.instances).toHaveLength(count + 1)
+    expect(client.getSnapshot()).toBe(snapshot)
+  })
+
+  it('cancels a pending retry when a layout change already opens a replacement', async () => {
+    const stream = latestStream()
+    stream.readyState = 2
+    stream.onerror?.()
+    client.setLayout({ expanded: true })
+    expect(FakeEventSource.instances).toHaveLength(2)
+    expect(vi.getTimerCount()).toBe(0)
+    await vi.advanceTimersByTimeAsync(9000)
+    expect(FakeEventSource.instances).toHaveLength(2)
   })
 })
 
