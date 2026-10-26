@@ -9,7 +9,9 @@ import {
   moveToRoot,
   nodeAtPath,
   normalizeTree,
+  normalizedWeights,
   parseTree,
+  rowTemplate,
   removeLeaf,
   swapLeaves,
   totalWeight,
@@ -138,6 +140,35 @@ describe('layout tree', () => {
     expect(withWeightsAtPath(base, [], [-1, 2])).toEqual({
       kind: 'split', dir: 'row', children: [l('a'), l('b')], weights: [1, 2],
     })
+  })
+
+  it('fills a row after a large sibling is removed, keeping the remaining ratio', () => {
+    const before = makeSplit('row', [l('a'), l('b'), l('c')], [1.5, 0.25, 0.25])!
+    const after = removeLeaf(before, 'a')
+    if (after?.kind !== 'split') throw new Error('expected a split')
+    expect(after.weights).toEqual([0.25, 0.25])
+    expect(rowTemplate(after, 6)).toBe('minmax(0, 1fr) 6px minmax(0, 1fr)')
+    expect(normalizedWeights(after)).toEqual([1, 1])
+  })
+
+  it('uses the same proportions at any saved weight scale', () => {
+    for (const weights of [[0.1, 0.4], [1, 4], [4, 16]]) {
+      const split = makeSplit('row', [l('a'), l('b')], weights)
+      if (split?.kind !== 'split') throw new Error('expected a split')
+      expect(rowTemplate(split, 6)).toBe('minmax(0, 0.4fr) 6px minmax(0, 1.6fr)')
+    }
+  })
+
+  it('lets a fractional row reach the 80px pane minimum without weight clamping', () => {
+    const split = makeSplit('row', [l('a'), l('b')], [0.25, 0.25])
+    if (split?.kind !== 'split') throw new Error('expected a split')
+    const weights = normalizedWeights(split)
+    const total = weights.reduce((sum, weight) => sum + weight, 0)
+    const cardArea = 960
+    const rightWeight = 80 / cardArea * total
+    const resized = withWeightsAtPath(split, [], [total - rightWeight, rightWeight])
+    if (resized.kind !== 'split') throw new Error('expected a split')
+    expect(resized.weights[1]! / totalWeight(resized) * cardArea).toBeCloseTo(80)
   })
 
   it('turns pointer positions into drop zones', () => {

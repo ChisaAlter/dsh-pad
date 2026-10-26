@@ -13,6 +13,7 @@ import {
   type PointerEvent as ReactPointerEvent,
   type ReactNode,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -20,7 +21,7 @@ import {
 } from 'react'
 import { composer } from './composer.ts'
 import { clampBall, nearestBallEdge, positionAtBallEdge, type BallEdge } from './ball-position.ts'
-import { attachedDock } from './dock-position.ts'
+import { attachedDock, retainedDockControl, resizedDockControl } from './dock-position.ts'
 import { dockSafeTop, readViewport, watchViewport, type Viewport } from './window-controls.ts'
 import {
   BALL_SIZE,
@@ -29,6 +30,7 @@ import {
   MIN_DOCK_HEIGHT,
   MIN_WIDTH,
   awaitingFirstData,
+  type DockControl,
   type PadClient,
   type Point,
 } from './pad-client.ts'
@@ -36,13 +38,13 @@ import type { HistoryPoint } from './pad-client.ts'
 import {
   type DropZone,
   type LayoutNode,
-  type LayoutSplit,
   dropOnLeaf,
   dropZoneFor,
   moveToRoot,
   nodeAtPath,
   normalizeTree,
-  totalWeight,
+  normalizedWeights,
+  rowTemplate,
   withWeightsAtPath,
 } from './layout.ts'
 import type { PadUpdateInfo } from '../shared/types.ts'
@@ -122,15 +124,6 @@ function clampDock(point: Point, width: number, viewport: Viewport, heightHint: 
   return { x, y: Math.round(clamp(point.y, top, Math.max(top, viewport.height - height - margin))) }
 }
 
-function rowTemplate(split: LayoutSplit): string {
-  const parts: string[] = []
-  split.children.forEach((_, index) => {
-    if (index > 0) parts.push(`${SPLITTER_W}px`)
-    parts.push(`${split.weights[index] ?? 1}fr`)
-  })
-  return parts.join(' ')
-}
-
 const DROP_LABEL: Record<DropZone | 'root' | 'hint', PadKey> = {
   left: 'drop.left',
   right: 'drop.right',
@@ -160,6 +153,7 @@ export function createDock(client: PadClient) {
     const [theme, setTheme] = useState<ThemeSnapshot>({ mode: 'light', css: ':root{}' })
     const [notice, setNotice] = useState<string>()
     const [viewport, setViewport] = useState<Viewport>(readViewport)
+    const [measuredHeight, setMeasuredHeight] = useState<number>()
     const initialBallEdge = useRef(snap.layout.ballEdge === undefined
       ? nearestBallEdge(snap.layout.ball, viewport.width, viewport.height, viewport.controls)
       : snap.layout.ballEdge)
@@ -170,6 +164,8 @@ export function createDock(client: PadClient) {
     const [dockDrag, setDockDrag] = useState<Point>()
     const [dragHeight, setDragHeight] = useState<number>()
     const [dragWidth, setDragWidth] = useState<number>()
+    const [dragControl, setDragControl] = useState<DockControl>()
+    const [splitDragging, setSplitDragging] = useState(false)
     const [drag, setDrag] = useState<{ id: string, x: number, y: number, target?: string, zone?: DropZone, blank: boolean }>()
     const [focusedId, setFocusedId] = useState<string>()
     const [closing, setClosing] = useState(false)
@@ -203,6 +199,22 @@ export function createDock(client: PadClient) {
       // not on every SSE data tick.
       // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [treeSignature])
+
+    // Automatic content height can be shorter than the viewport allowance.
+    // Observe the actual dock so retained edge controls stay inside it after
+    // restoring auto height, folding a card or resizing panel content.
+    useLayoutEffect(() => {
+      const dock = asideRef.current
+      if (!snap.layout.expanded || dock === null) return
+      const measure = (): void => {
+        const height = dock.getBoundingClientRect().height
+        setMeasuredHeight(previous => previous === height ? previous : height)
+      }
+      measure()
+      const observer = new ResizeObserver(measure)
+      observer.observe(dock)
+      return () => observer.disconnect()
+    }, [snap.layout.expanded])
 
     useEffect(() => watchViewport(() => {
       const next = readViewport()
@@ -331,7 +343,7 @@ export function createDock(client: PadClient) {
     const edgeAnchor = ballEdge !== null && snap.layout.dock === null && dockDrag === undefined
     const attached = edgeAnchor ? attachedDock(ballPoint, ballEdge, viewport, requestedDockWidth, savedHeight ?? openHeight) : undefined
     const dockWidth = attached?.width ?? requestedDockWidth
-    const retainedControl = snap.layout.dockControl
+    const retainedControl = dragControl ?? snap.layout.dockControl
     const dockMargin = attached !== undefined || retainedControl != null ? BALL_MARGIN : EDGE_GAP
     const controlEdge = attached === undefined ? retainedControl?.edge : ballEdge
     const baseDock = snap.layout.dock ?? defaultDockPoint(ballPoint, dockWidth, viewport, defaultOpenHeight)
@@ -345,10 +357,11 @@ export function createDock(client: PadClient) {
     const availableHeight = Math.max(BALL_SIZE, viewport.height - dockPoint.y - dockMargin)
     const renderedHeight = attached?.height ?? (savedHeight === undefined ? undefined : Math.min(savedHeight, availableHeight))
     const maxHeight = renderedHeight ?? availableHeight
-    const control = attached?.control ?? (retainedControl == null ? undefined : {
-      x: clamp(retainedControl.point.x, 0, dockWidth - BALL_SIZE),
-      y: clamp(retainedControl.point.y, 0, maxHeight - BALL_SIZE),
-    })
+    const controlHeight = renderedHeight ?? Math.min(measuredHeight ?? maxHeight, maxHeight)
+    const control = attached?.control ?? (retainedControl == null ? undefined : retainedDockControl(retainedControl, dockWidth, controlHeight))
+    // A side control inside the toolbar needs no gutter beside the cards.
+    const controlInHeader = control !== undefined && control.y + BALL_SIZE <= 32
+    const controlGutter = (controlEdge === 'left' || controlEdge === 'right') && !controlInHeader
     // Rewrite inaccessible persisted positions after load/resize, without
     // interfering with a pointer gesture that is still choosing its position.
     useEffect(() => {
@@ -516,18 +529,21 @@ export function createDock(client: PadClient) {
       const rect = areaElement.getBoundingClientRect()
       const gaps = SPLITTER_W * (split.children.length - 1)
       const cardArea = Math.max(1, rect.width - gaps)
-      const total = totalWeight(split)
-      const pairWeight = (split.weights[boundary] ?? 1) + (split.weights[boundary + 1] ?? 1)
-      const startPx = ((split.weights[boundary] ?? 1) / total) * cardArea
+      const baseWeights = normalizedWeights(split)
+      const total = baseWeights.reduce((sum, weight) => sum + weight, 0)
+      const pairWeight = (baseWeights[boundary] ?? 1) + (baseWeights[boundary + 1] ?? 1)
+      const startPx = ((baseWeights[boundary] ?? 1) / total) * cardArea
       const pairPx = (pairWeight / total) * cardArea
       const minLeft = Math.min(MIN_PANE, pairPx / 2)
       const maxLeft = Math.max(minLeft, pairPx - MIN_PANE)
       const startX = event.clientX
       let final = baseTree
+      // Keep events in the parent document while crossing sandboxed iframes.
+      setSplitDragging(true)
       const move = (pointer: PointerEvent): void => {
         const leftPx = clamp(startPx + pointer.clientX - startX, minLeft, maxLeft)
         const leftWeight = (leftPx / cardArea) * total
-        const weights = split.weights.map((weight, index) => index === boundary
+        const weights = baseWeights.map((weight, index) => index === boundary
           ? leftWeight
           : index === boundary + 1
             ? pairWeight - leftWeight
@@ -537,6 +553,7 @@ export function createDock(client: PadClient) {
       }
       const up = (): void => {
         cleanup()
+        setSplitDragging(false)
         setTree(final)
         client.setTree(final)
       }
@@ -781,12 +798,18 @@ export function createDock(client: PadClient) {
       const right = dockPoint.x + startWidth
       const maxWidth = Math.max(BALL_SIZE, Math.min(MAX_WIDTH, right - dockMargin))
       const minWidth = Math.min(MIN_WIDTH, maxWidth)
-      if (control !== undefined && controlEdge != null) client.setLayout({ dockControl: { edge: controlEdge, point: control } })
+      const startControl = control === undefined || controlEdge == null ? undefined : { edge: controlEdge, point: control }
+      if (startControl !== undefined) client.setLayout({ dockControl: startControl })
+      let finalControl = startControl
       let finalWidth = startWidth
       let finalPoint = dockPoint
       const move = (pointer: PointerEvent): void => {
         finalWidth = Math.round(clamp(startWidth + (startX - pointer.clientX), minWidth, maxWidth))
         finalPoint = clampDock({ x: Math.round(right - finalWidth), y: dockPoint.y }, finalWidth, viewport, savedHeight ?? maxHeight, dockMargin)
+        if (startControl !== undefined) {
+          finalControl = resizedDockControl(startControl, dockPoint, finalPoint, finalWidth, controlHeight)
+          setDragControl(finalControl)
+        }
         setDragWidth(finalWidth)
         setDockDrag(finalPoint)
       }
@@ -794,7 +817,8 @@ export function createDock(client: PadClient) {
         cleanup()
         setDragWidth(undefined)
         setDockDrag(undefined)
-        client.setLayout({ width: finalWidth, dock: finalPoint })
+        setDragControl(undefined)
+        client.setLayout({ width: finalWidth, dock: finalPoint, ...(finalControl === undefined ? {} : { dockControl: finalControl }) })
       }
       const cleanup = (): void => {
         document.removeEventListener('pointermove', move)
@@ -822,13 +846,19 @@ export function createDock(client: PadClient) {
       const minTop = dockSafeTop(dockPoint.x, dockWidth, viewport, dockMargin)
       const maxTop = Math.max(minTop, bottom - Math.min(MIN_DOCK_HEIGHT, boxHeight))
       setDragWidth(dockWidth)
-      if (control !== undefined && controlEdge != null) client.setLayout({ dockControl: { edge: controlEdge, point: control } })
+      const startControl = control === undefined || controlEdge == null ? undefined : { edge: controlEdge, point: control }
+      if (startControl !== undefined) client.setLayout({ dockControl: startControl })
+      let finalControl = startControl
       let finalHeight = bottom - startTop
       let finalPoint = dockPoint
       const move = (pointer: PointerEvent): void => {
         const nextTop = Math.round(clamp(startTop + pointer.clientY - startY, minTop, maxTop))
         finalHeight = Math.round(bottom - nextTop)
         finalPoint = { x: dockPoint.x, y: nextTop }
+        if (startControl !== undefined) {
+          finalControl = resizedDockControl(startControl, dockPoint, finalPoint, dockWidth, finalHeight)
+          setDragControl(finalControl)
+        }
         setDragHeight(finalHeight)
         setDockDrag(finalPoint)
       }
@@ -837,7 +867,8 @@ export function createDock(client: PadClient) {
         setDragHeight(undefined)
         setDragWidth(undefined)
         setDockDrag(undefined)
-        client.setLayout({ dockHeight: finalHeight, dock: finalPoint, width: dockWidth })
+        setDragControl(undefined)
+        client.setLayout({ dockHeight: finalHeight, dock: finalPoint, width: dockWidth, ...(finalControl === undefined ? {} : { dockControl: finalControl }) })
       }
       const cleanup = (): void => {
         document.removeEventListener('pointermove', move)
@@ -924,7 +955,7 @@ export function createDock(client: PadClient) {
         )
       }
       return (
-        <div className="dshpad-split is-row" key={pathKey} style={{ gridTemplateColumns: rowTemplate(node) }}>
+        <div className="dshpad-split is-row" key={pathKey} style={{ gridTemplateColumns: rowTemplate(node, SPLITTER_W) }}>
           {node.children.map((child, index) => (
             <Fragment key={`${pathKey}.${index}`}>
               {index > 0
@@ -985,7 +1016,7 @@ export function createDock(client: PadClient) {
           : t(DROP_LABEL.hint)
     return (
       <div className="dshpad-root" ref={rootRef}>
-        <aside ref={asideRef} className={`dshpad-dock${control === undefined ? '' : ` is-attached is-attached-${controlEdge}`}${dockWidth < 160 ? ' is-narrow' : ''}${dockDrag !== undefined ? ' is-moving' : ''}${closing ? ' is-closing' : ''}`}
+        <aside ref={asideRef} className={`dshpad-dock${control === undefined ? '' : ` is-attached is-attached-${controlEdge}`}${controlGutter ? ' has-control-gutter' : ''}${dockWidth < 160 ? ' is-narrow' : ''}${dockDrag !== undefined ? ' is-moving' : ''}${closing ? ' is-closing' : ''}`}
           style={dockStyle} aria-label={t('dock.title')}>
           <div className="dshpad-dock-edge is-top" role="separator" aria-orientation="horizontal" title={t('dock.resizeHeight')} onPointerDown={onTopEdgePointerDown}
             onDoubleClick={() => { setDragHeight(undefined); client.setDockHeight(undefined) }} />
@@ -1104,6 +1135,7 @@ export function createDock(client: PadClient) {
         {dockDrag !== undefined ? <div className="dshpad-drag-shield" aria-hidden="true" /> : null}
         {dragHeight !== undefined && dockDrag === undefined ? <div className="dshpad-drag-shield" aria-hidden="true" /> : null}
 
+        {splitDragging ? <div className="dshpad-drag-shield is-splitting" aria-hidden="true" /> : null}
         {drag !== undefined ? <div className="dshpad-drag-shield" ref={shieldRef} aria-hidden="true" /> : null}
 
         {drag !== undefined && dragView !== undefined

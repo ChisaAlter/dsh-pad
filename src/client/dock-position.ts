@@ -1,7 +1,26 @@
 /** Geometry for an edge-attached dock and its in-place toggle. */
-import { BALL_MARGIN, BALL_SIZE, type Point } from './pad-client.ts'
+import { BALL_MARGIN, BALL_SIZE, type DockControl, type Point } from './pad-client.ts'
 import { positionAtBallEdge, type BallEdge } from './ball-position.ts'
 import { dockSafeTop, WINDOW_CONTROL_GAP, type Viewport } from './window-controls.ts'
+
+/** Resolve a saved toggle against the current size, including legacy positions
+ * saved before the window was resized. Only the coordinate along its edge is
+ * retained; the perpendicular coordinate always follows the edge itself. */
+export function retainedDockControl(control: DockControl, width: number, height: number): Point {
+  const maxX = Math.max(0, width - BALL_SIZE)
+  const maxY = Math.max(0, height - BALL_SIZE)
+  return {
+    x: control.edge === 'left' ? 0 : control.edge === 'right' ? maxX : Math.max(0, Math.min(control.point.x, maxX)),
+    y: control.edge === 'top' ? 0 : control.edge === 'bottom' ? maxY : Math.max(0, Math.min(control.point.y, maxY)),
+  }
+}
+
+/** Preserve the toggle's viewport position along its edge when an edge resize
+ * moves the dock origin. The edge perpendicular to that coordinate still wins. */
+export function resizedDockControl(control: DockControl, before: Point, after: Point, width: number, height: number): DockControl {
+  const point = { x: control.point.x + before.x - after.x, y: control.point.y + before.y - after.y }
+  return { edge: control.edge, point: retainedDockControl({ edge: control.edge, point }, width, height) }
+}
 
 export interface AttachedDock {
   readonly point: Point

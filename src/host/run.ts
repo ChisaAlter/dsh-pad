@@ -60,6 +60,8 @@ interface DefaultModelService {
 export class PanelRunner {
   private readonly active = new Map<string, number>()
   private readonly lastRun = new Map<string, number>()
+  private readonly controllers = new Set<AbortController>()
+  private disposed = false
 
   constructor(
     private readonly ctx: Context,
@@ -73,7 +75,9 @@ export class PanelRunner {
    * @param system - optional system instruction authored by the panel.
    * @returns text, or a short error safe to render in the panel.
    */
-  async run(panel: PanelRecord, prompt: string, system?: string): Promise<PanelRunResult> {
+  async run(panel: PanelRecord, prompt: string, system?: string, signal?: AbortSignal): Promise<PanelRunResult> {
+    if (this.disposed) return { ok: false, error: '面板模型服务已停止' }
+    if (signal?.aborted) return { ok: false, error: '模型调用被中止' }
     if (!this.options.enabled) return { ok: false, error: '这个 dsh 关闭了面板内模型调用' }
     const text = prompt.trim()
     if (text === '') return { ok: false, error: '提示词是空的' }
@@ -93,60 +97,103 @@ export class PanelRunner {
     }
     this.lastRun.set(panel.id, now)
     this.active.set(panel.id, running + 1)
-    try {
-      return await this.call(panel, text, system)
-    } catch (error) {
-      return { ok: false, error: error instanceof Error ? error.message : String(error) }
-    } finally {
+    let streaming: Promise<PanelRunResult> | undefined
+    const release = (): void => {
       const left = (this.active.get(panel.id) ?? 1) - 1
       if (left <= 0) this.active.delete(panel.id)
       else this.active.set(panel.id, left)
     }
+    try {
+      return await this.call(panel, text, system, signal, work => { streaming = work })
+    } catch (error) {
+      return { ok: false, error: error instanceof Error ? error.message : String(error) }
+    } finally {
+      // A provider ignoring abort still owns a concurrency slot until its
+      // iterator exits, even though the caller receives a timeout immediately.
+      if (streaming !== undefined) void streaming.then(release, release)
+      else release()
+    }
   }
 
-  private async call(panel: PanelRecord, prompt: string, system?: string): Promise<PanelRunResult> {
+  /** Abort open model calls when the plugin unloads. */
+  dispose(): void {
+    this.disposed = true
+    for (const controller of this.controllers) controller.abort()
+    this.controllers.clear()
+    this.lastRun.clear()
+  }
+
+  private async call(panel: PanelRecord, prompt: string, system: string | undefined, signal: AbortSignal | undefined, track: (work: Promise<PanelRunResult>) => void): Promise<PanelRunResult> {
     const llm = this.ctx.get('llm') as unknown as LlmStreamService | undefined
     if (llm === undefined) return { ok: false, error: '这个 dsh 组合没有 llm 服务' }
     const selection = panel.definition.model
       ?? (this.ctx.get('agentDefaultModel') as unknown as DefaultModelService | undefined)?.currentSelection()
     if (selection === undefined) return { ok: false, error: '没有可用的模型' }
     const controller = new AbortController()
+    this.controllers.add(controller)
     let timedOut = false
+    const abortFailure = (): PanelRunResult => ({ ok: false, error: timedOut ? '模型调用超时' : '模型调用被中止' })
+    const cancel = (): void => controller.abort()
+    signal?.addEventListener('abort', cancel, { once: true })
+    if (signal?.aborted) cancel()
+    let onAbort: () => void = () => {}
+    const aborted = new Promise<PanelRunResult>(resolve => {
+      onAbort = () => resolve(abortFailure())
+      controller.signal.addEventListener('abort', onAbort, { once: true })
+      if (controller.signal.aborted) onAbort()
+    })
     const timer = setTimeout(() => {
       timedOut = true
       controller.abort()
     }, this.options.timeoutMs)
-    let output = ''
-    let failure: string | undefined
-    try {
-      for await (const chunk of llm.stream({
-        provider: selection.provider,
-        model: selection.model,
-        ...(selection.reasoningEffort === undefined ? {} : { reasoningEffort: selection.reasoningEffort }),
-        system: system ?? DEFAULT_SYSTEM,
-        messages: [{ role: 'user', content: [{ type: 'text', text: prompt }] }],
-        maxTokens: this.options.maxTokens,
-        signal: controller.signal,
-      })) {
-        if (chunk.type === 'text-delta' && typeof chunk.text === 'string') output += chunk.text
-        else if (chunk.type === 'finish') {
-          if (chunk.reason?.kind === 'error') {
-            failure = chunk.reason.failure?.message ?? '模型调用出错'
-          } else if (chunk.reason?.kind === 'aborted') {
-            failure = timedOut ? '模型调用超时' : '模型调用被中止'
+    const consume = async (): Promise<PanelRunResult> => {
+      let output = ''
+      let failure: string | undefined
+      try {
+        if (controller.signal.aborted) return abortFailure()
+        for await (const chunk of llm.stream({
+          provider: selection.provider,
+          model: selection.model,
+          ...(selection.reasoningEffort === undefined ? {} : { reasoningEffort: selection.reasoningEffort }),
+          system: system ?? DEFAULT_SYSTEM,
+          messages: [{ role: 'user', content: [{ type: 'text', text: prompt }] }],
+          maxTokens: this.options.maxTokens,
+          signal: controller.signal,
+        })) {
+          if (controller.signal.aborted) return abortFailure()
+          if (chunk.type === 'text-delta' && typeof chunk.text === 'string') {
+            // Enforce the output bound while streaming, not only at the end.
+            output += chunk.text.slice(0, Math.max(0, this.options.maxOutputChars - output.length))
+          } else if (chunk.type === 'finish') {
+            if (chunk.reason?.kind === 'error') {
+              failure = chunk.reason.failure?.message ?? '模型调用出错'
+            } else if (chunk.reason?.kind === 'aborted') {
+              failure = timedOut ? '模型调用超时' : '模型调用被中止'
+            }
           }
         }
+      } catch (error) {
+        failure ??= controller.signal.aborted
+          ? timedOut ? '模型调用超时' : '模型调用被中止'
+          : error instanceof Error ? error.message : String(error)
       }
-    } catch (error) {
-      failure ??= timedOut
-        ? '模型调用超时'
-        : error instanceof Error ? error.message : String(error)
+      if (controller.signal.aborted) return abortFailure()
+      if (failure !== undefined) return { ok: false, error: failure }
+      const text = output.trim()
+      if (text === '') return { ok: false, error: '模型没有返回文本' }
+      return { ok: true, text }
+    }
+    const work = consume()
+    track(work)
+    try {
+      // Providers should honor abort, but a stuck iterator must not hold the
+      // HTTP request beyond this service's timeout.
+      return await Promise.race([work, aborted])
     } finally {
       clearTimeout(timer)
+      signal?.removeEventListener('abort', cancel)
+      controller.signal.removeEventListener('abort', onAbort)
+      this.controllers.delete(controller)
     }
-    if (failure !== undefined) return { ok: false, error: failure }
-    const text = output.trim()
-    if (text === '') return { ok: false, error: '模型没有返回文本' }
-    return { ok: true, text: text.slice(0, this.options.maxOutputChars) }
   }
 }

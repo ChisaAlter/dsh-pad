@@ -65,7 +65,19 @@ export const composer = {
     }
     const editor = findEditor()
     if (editor === undefined) return 'unavailable'
-    focusEditor(editor)
+    // Focusing a dock button must not turn insertion into append. Keep a
+    // selection that still belongs to the editor; fall back to its end only
+    // when no usable caret exists.
+    const selection = window.getSelection()
+    const range = selection !== null && selection.rangeCount > 0 && editor.contains(selection.getRangeAt(0).commonAncestorContainer)
+      ? selection.getRangeAt(0).cloneRange() : undefined
+    editor.focus()
+    if (selection !== null && range !== undefined) {
+      selection.removeAllRanges()
+      selection.addRange(range)
+    } else {
+      focusEditor(editor)
+    }
     document.execCommand('insertText', false, text)
     return 'filled'
   },

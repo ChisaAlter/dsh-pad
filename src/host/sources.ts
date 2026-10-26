@@ -20,16 +20,17 @@ const SECRET_REF = /\{\{\s*env:([A-Za-z_][A-Za-z0-9_]*)\s*\}\}/g
  * @returns the parsed value.
  * @throws when `json` output does not parse.
  */
-export function parseOutput(raw: string, parse: SourceParse): Json {
+export function parseOutput(raw: string, parse: SourceParse, secrets: ReadonlySet<string> = new Set()): Json {
   if (parse === 'json') {
     try {
-      return JSON.parse(raw) as Json
+      return redactValue(JSON.parse(raw) as Json, secrets)
     } catch {
-      throw new Error(`输出不是合法 JSON（开头：${raw.slice(0, 120)}）`)
+      throw new Error(`输出不是合法 JSON（开头：${redact(raw, secrets).slice(0, 120)}）`)
     }
   }
-  if (parse === 'lines') return raw.split(/\r?\n/).filter(line => line.trim() !== '')
-  return raw.replace(/\s+$/, '')
+  const safe = redact(raw, secrets)
+  if (parse === 'lines') return safe.split(/\r?\n/).filter(line => line.trim() !== '')
+  return safe.replace(/\s+$/, '')
 }
 
 /** Names of every secret a source references. */
@@ -53,8 +54,41 @@ async function fillSecrets(text: string, resolve: SecretResolver, used: Set<stri
 
 function redact(message: string, secrets: ReadonlySet<string>): string {
   let out = message
-  for (const secret of secrets) if (secret.length >= 4) out = out.split(secret).join('***')
+  const variants = new Set<string>()
+  for (const secret of secrets) {
+    if (secret === '') continue
+    variants.add(secret)
+    variants.add(JSON.stringify(secret).slice(1, -1))
+    try {
+      variants.add(encodeURIComponent(secret))
+    } catch {
+      // A credential with an unpaired surrogate still has a literal form.
+    }
+  }
+  // Hide longer values first so overlapping credentials cannot expose a suffix.
+  for (const secret of [...variants].sort((a, b) => b.length - a.length)) out = out.split(secret).join('***')
   return out
+}
+
+/** Redact parsed JSON strings and keys, including values escaped in the wire JSON. */
+function redactValue(value: Json, secrets: ReadonlySet<string>): Json {
+  if (secrets.size === 0) return value
+  if (typeof value === 'string') return redact(value, secrets)
+  if (typeof value === 'number' && secrets.has(String(value))) return '***'
+  if (value === null || typeof value !== 'object') return value
+  const pending: Array<Json[] | { [key: string]: Json }> = [value]
+  while (pending.length > 0) {
+    const object = pending.pop()!
+    for (const [key, child] of Object.entries(object)) {
+      const safeKey = Array.isArray(object) ? key : redact(key, secrets)
+      const safeValue = typeof child === 'string' ? redact(child, secrets)
+        : typeof child === 'number' && secrets.has(String(child)) ? '***' : child
+      if (key !== safeKey) delete (object as { [key: string]: Json })[key]
+      Object.defineProperty(object, safeKey, { value: safeValue, enumerable: true, configurable: true, writable: true })
+      if (child !== null && typeof child === 'object') pending.push(child)
+    }
+  }
+  return value
 }
 
 function killCommandTree(child: ChildProcess): void {
@@ -95,6 +129,10 @@ function killCommandTree(child: ChildProcess): void {
 
 function runCommand(command: string, timeoutMs: number, signal?: AbortSignal): Promise<string> {
   return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(new Error('已取消'))
+      return
+    }
     const child = spawn(command, {
       shell: true,
       windowsHide: true,
@@ -103,6 +141,7 @@ function runCommand(command: string, timeoutMs: number, signal?: AbortSignal): P
     })
     const stdout: Buffer[] = []
     const stderr: Buffer[] = []
+    let stderrSize = 0
     let size = 0
     let settled = false
     const finish = (error: Error | undefined, value?: string): void => {
@@ -135,7 +174,10 @@ function runCommand(command: string, timeoutMs: number, signal?: AbortSignal): P
       stdout.push(chunk)
     })
     child.stderr.on('data', (chunk: Buffer) => {
-      if (Buffer.concat(stderr).length < 8192) stderr.push(chunk)
+      if (stderrSize >= 8192) return
+      const part = chunk.subarray(0, 8192 - stderrSize)
+      stderr.push(part)
+      stderrSize += part.length
     })
     child.on('error', error => finish(error))
     child.on('close', code => {
@@ -155,6 +197,7 @@ async function runHttp(source: HttpSource, timeoutMs: number, resolve: SecretRes
   const headers: Record<string, string> = {}
   for (const [key, value] of Object.entries(source.headers ?? {})) headers[key] = await fillSecrets(value, resolve, used)
   const body = source.body === undefined ? undefined : await fillSecrets(source.body, resolve, used)
+  if (signal?.aborted) throw new Error('已取消')
   const timeout = AbortSignal.timeout(timeoutMs)
   const response = await fetch(url, {
     method: source.method ?? 'GET',
@@ -179,7 +222,7 @@ async function runHttp(source: HttpSource, timeoutMs: number, resolve: SecretRes
     }
   }
   const text = Buffer.concat(chunks).toString('utf8')
-  if (!response.ok) throw new Error(`HTTP ${response.status}${text ? `：${text.slice(0, 300)}` : ''}`)
+  if (!response.ok) throw new Error(`HTTP ${response.status}${text ? `：${redact(text, used).slice(0, 300)}` : ''}`)
   return text
 }
 
@@ -195,12 +238,14 @@ export async function runSource(source: PanelSource, resolve: SecretResolver, si
   const timeoutMs = source.timeoutMs ?? DEFAULT_TIMEOUT_MS
   const used = new Set<string>()
   try {
+    if (signal?.aborted) throw new Error('已取消')
     const raw = source.kind === 'command'
       ? await runCommand(source.command, timeoutMs, signal)
       : await runHttp(source, timeoutMs, resolve, used, signal)
-    return { ok: true, value: parseOutput(raw, source.parse), at: new Date().toISOString(), durationMs: Date.now() - started }
+    if (signal?.aborted) throw new Error('已取消')
+    return { ok: true, value: parseOutput(raw, source.parse, used), at: new Date().toISOString(), durationMs: Date.now() - started }
   } catch (error) {
-    const message = error instanceof Error
+    const message = signal?.aborted ? '已取消' : error instanceof Error
       ? (error.name === 'TimeoutError' ? `请求超时（${timeoutMs}ms）` : error.message)
       : String(error)
     return { ok: false, error: redact(message, used), at: new Date().toISOString(), durationMs: Date.now() - started }

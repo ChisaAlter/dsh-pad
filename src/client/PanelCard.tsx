@@ -104,6 +104,10 @@ export function PanelCard({ view, client, theme, lang, t, clockActive, fresh, dr
   const [scriptError, setScriptError] = useState<string>()
   const [actionError, setActionError] = useState<string>()
   const [folded, setFolded] = useState(view.collapsed)
+  const [foldBusy, setFoldBusy] = useState(false)
+  const foldPending = useRef(false)
+  const serverFolded = useRef(view.collapsed)
+  serverFolded.current = view.collapsed
   const menuRef = useRef<HTMLDivElement>(null)
   const { definition } = view
 
@@ -185,14 +189,20 @@ export function PanelCard({ view, client, theme, lang, t, clockActive, fresh, dr
   }
 
   const toggleFold = (): void => {
+    if (foldPending.current) return
+    foldPending.current = true
+    setFoldBusy(true)
     const next = !folded
     setFolded(next)
     setActionError(undefined)
     void client.act({ op: 'collapse', panelId: view.id, collapsed: next }).then(result => {
       if (!result.ok) {
-        setFolded(!next)
+        setFolded(serverFolded.current)
         setActionError(result.error)
       }
+    }).finally(() => {
+      foldPending.current = false
+      setFoldBusy(false)
     })
   }
 
@@ -254,6 +264,8 @@ export function PanelCard({ view, client, theme, lang, t, clockActive, fresh, dr
           type="button"
           className="dshpad-card-title"
           aria-expanded={!folded}
+          aria-busy={foldBusy}
+          disabled={foldBusy}
           title={folded ? t('card.unfold') : t('card.fold')}
           onClick={toggleFold}
         >

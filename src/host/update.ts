@@ -185,7 +185,8 @@ export class UpdateService {
 
   private async replaceFiles(): Promise<PadUpdateResponse> {
     const latest = this.state.latest
-    if (!this.state.available || latest === undefined || this.tag === undefined) {
+    const tag = this.tag
+    if (!this.state.available || latest === undefined || tag === undefined) {
       return { ok: false, update: this.state, error: this.state.reason === 'source' ? 'source' : 'no-update' }
     }
     if (this.source) {
@@ -195,7 +196,7 @@ export class UpdateService {
     const contents = new Map<string, string>()
     try {
       const fetched = await Promise.all(UPDATE_FILES.map(async file => {
-        const response = await this.fetchImpl(`${RAW_ROOT}/${encodeURIComponent(this.tag ?? '')}/${file}`, {
+        const response = await this.fetchImpl(`${RAW_ROOT}/${encodeURIComponent(tag)}/${file}`, {
           headers: { 'user-agent': `dsh-pad/${this.current}` },
           signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
         })
@@ -229,6 +230,12 @@ export class UpdateService {
           await copyFile(target, join(backup, file))
         }
       }
+    } catch (error) {
+      // No installed file has changed yet. A partial/missing backup must never
+      // be used to restore: absent entries would delete the originals.
+      return this.fail(`备份失败：${error instanceof Error ? error.message : String(error)}`)
+    }
+    try {
       for (const file of UPDATE_FILES) {
         const content = contents.get(file)
         if (content === undefined) continue

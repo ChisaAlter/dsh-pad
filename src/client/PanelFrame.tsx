@@ -17,7 +17,7 @@ import type { ThemeSnapshot } from './theme.ts'
 const CSP = "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src data:; font-src data:; media-src data:"
 const BASE_CSS = `*,*::before,*::after{box-sizing:border-box}
 html,body{margin:0;padding:0;background:transparent;color:var(--pad-fg);font:13px/1.45 var(--pad-font);-webkit-font-smoothing:antialiased}
-html[data-height=auto]{overflow:hidden}
+html[data-height=auto]{overflow-x:hidden;overflow-y:auto}
 body{padding:2px 0 4px}
 a{color:var(--pad-accent);text-decoration:none}
 a:hover{text-decoration:underline dotted;text-underline-offset:3px}
@@ -181,8 +181,12 @@ export function PanelFrame({ view, histories, theme, lang, onRefresh, onAsk, onR
         case 'run':
           if (typeof message.id === 'string' && typeof message.prompt === 'string' && message.prompt.trim() !== '') {
             const id = message.id
-            const prompt = message.prompt.slice(0, 24_000)
-            const system = typeof message.system === 'string' ? message.system.slice(0, 8_000) : undefined
+            const prompt = message.prompt
+            const system = typeof message.system === 'string' ? message.system : undefined
+            if (prompt.length > 24_000 || (system?.length ?? 0) > 8_000) {
+              post({ kind: 'run-result', id, ok: false, error: 'Prompt must be at most 24000 characters and system text at most 8000 characters.' })
+              break
+            }
             void latest.current.onRun(prompt, system)
               .then(result => post({ kind: 'run-result', id, ...result }))
               .catch((error: unknown) => post({
@@ -235,16 +239,22 @@ export function PanelFrame({ view, histories, theme, lang, onRefresh, onAsk, onR
     target.setPointerCapture(event.pointerId)
     const heightAt = (y: number): number => clampPanelHeight(startHeight + (y - startY))
     const move = (e: PointerEvent): void => setDragHeight(heightAt(e.clientY))
-    const up = (e: PointerEvent): void => {
+    const cleanup = (): void => {
       target.removeEventListener('pointermove', move)
       target.removeEventListener('pointerup', up)
-      target.removeEventListener('pointercancel', up)
+      target.removeEventListener('pointercancel', cancel)
+      target.removeEventListener('lostpointercapture', cancel)
       setDragHeight(undefined)
+    }
+    const up = (e: PointerEvent): void => {
+      cleanup()
       onHeightChange?.(heightAt(e.clientY))
     }
+    const cancel = (): void => { cleanup() }
     target.addEventListener('pointermove', move)
     target.addEventListener('pointerup', up)
-    target.addEventListener('pointercancel', up)
+    target.addEventListener('pointercancel', cancel)
+    target.addEventListener('lostpointercapture', cancel)
   }
 
   return (

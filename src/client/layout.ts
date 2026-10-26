@@ -367,6 +367,23 @@ export function dropZoneFor(rect: { readonly left: number; readonly top: number;
   return nearest[1] <= edge ? nearest[0] : 'center'
 }
 
+/** Proportions with an average of one. Rendering and splitter gestures use the
+ * same scale so fractional saved weights cannot leave unused grid space or
+ * hit the storage weight clamps before reaching the pane's pixel minimum. */
+export function normalizedWeights(split: LayoutSplit): number[] {
+  const weights = split.children.map((_, index) => clampWeight(split.weights[index]))
+  const total = weights.reduce((sum, weight) => sum + weight, 0) || 1
+  return weights.map(weight => weight / total * weights.length)
+}
+
+/** Zero track minima keep iframe intrinsic widths from overriding proportions. */
+export function rowTemplate(split: LayoutSplit, gap: number): string {
+  return normalizedWeights(split).flatMap((weight, index) => [
+    ...(index > 0 ? [`${gap}px`] : []),
+    `minmax(0, ${weight}fr)`,
+  ]).join(' ')
+}
+
 /** Total weight of a split, never zero. */
 export function totalWeight(split: LayoutSplit): number {
   return split.weights.reduce((sum, weight) => sum + clampWeight(weight), 0) || 1

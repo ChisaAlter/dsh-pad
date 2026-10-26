@@ -52,7 +52,7 @@ node scripts/doctor.mjs
 dsh plugin --profile web add /path/to/dsh-pad
 
 # from GitHub (the repo ships a built lib/, so no build script is needed)
-dsh plugin --profile web add github:ChisaAlter/dsh-pad#v0.3.0
+dsh plugin --profile web add github:ChisaAlter/dsh-pad#v0.3.2
 ```
 
 `lib/index.js` and `lib/client.js` are the only runtime entry points. The repository commits them to git precisely so that installing from GitHub does not depend on build scripts (pnpm refuses to run a dependency’s build scripts by default). If you change the source, run `npm install && npm run build` in the plugin directory first, then install.
