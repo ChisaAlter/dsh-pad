@@ -129,7 +129,7 @@ describe('DataHub source concurrency', () => {
 
   it('deduplicates each source independently within each panel', async () => {
     const { hub, store, panel } = await setup([source('a'), source('b')])
-    const other = await store.create(definition(source('a')))
+    const other = await store.create({ ...definition(source('a')), title: 'other' })
     const first = hub.runAll(panel.id)
     const otherRun = hub.runAll(other.id)
     expect(runSource).toHaveBeenCalledTimes(3)
