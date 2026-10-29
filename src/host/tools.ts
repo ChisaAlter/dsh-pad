@@ -231,14 +231,38 @@ export function registerTools(deps: ToolDeps): void {
     async execute(args, exec) {
       const definition = validate({ css: '', script: '', height: 'auto', sources: [], ...args })
       if (definition.model) await assertModel(ctx, definition.model)
+      // A repeated pad_create for a title that already exists is almost
+      // always the same request replayed in another session; minting a second
+      // record leaves the dock with confusing duplicates. Reuse the existing
+      // panel instead and refresh its definition, so the caller sees the new
+      // design without multiplying cards. Identical calls are pure no-ops.
       const duplicate = store.list().find(p => p.definition.title === definition.title)
-      let panel = await store.create(definition, args.data as Json | undefined)
+      if (duplicate && JSON.stringify(duplicate.definition) === JSON.stringify(definition)) {
+        // The definition is identical, so the call itself is a no-op — but a
+        // replayed create may still carry fresh seed data. Apply it like the
+        // data-only path of pad_update instead of dropping it silently.
+        const lines = [`面板 ${duplicate.id}「${definition.title}」已存在，定义相同，没有新建。`]
+        if (args.data !== undefined) {
+          await store.setAgentData(duplicate.id, args.data as Json)
+          hub.pushData(duplicate.id)
+          lines.push('已把这次提交的 data 更新到面板上。')
+        }
+        lines.push(`要改内容请用 pad_update 传 id；要并排再放一张请先给新面板换个标题。`)
+        return lines.join('\n')
+      }
+      let panel: PanelRecord
+      if (duplicate) {
+        panel = await store.update(duplicate.id, definition, args.data as Json | undefined)
+      } else {
+        panel = await store.create(definition, args.data as Json | undefined)
+      }
       if (!store.approved(panel) && await askToRun(exec, 'pad_create', definition.title, definition.sources)) {
         await store.approve(panel.id, sourcesFingerprint(definition.sources))
         panel = store.get(panel.id)
       }
-      const lines = [`已创建面板 ${panel.id}「${definition.title}」，已经出现在悬浮面板坞。`]
-      if (duplicate) lines.push(`注意：已有同名面板 ${duplicate.id}，如果是重复创建请用 pad_delete 删掉一张。`)
+      const lines = duplicate
+        ? [`已有同名面板 ${panel.id}「${definition.title}」，已把内容更新为这次提交的版本（版本 ${panel.version}），没有新建重复面板。`]
+        : [`已创建面板 ${panel.id}「${definition.title}」，已经出现在悬浮面板坞。`]
       lines.push(...await firstReadings(panel))
       if (definition.agent && args.data === undefined) lines.push('提醒：AI 刷新面板没有交第一版 data，面板在第一次后台刷新前是空的。最好现在取一次真实数据，用 pad_update 的 data 补上。')
       return lines.join('\n')
@@ -268,6 +292,9 @@ export function registerTools(deps: ToolDeps): void {
       const changesDefinition = Object.keys(fields).length > 0
       if (!changesDefinition) {
         if (data === undefined) throw new Error('没有要改的字段')
+        // A panel without agent refresh never reads agentData — writing it
+        // would silently discard the payload. Reject so the caller notices.
+        if (!current.definition.agent) throw new Error(`面板「${current.definition.title}」没有 AI 刷新，data 只适用于有 agent 的面板`)
         await store.setAgentData(id, data as Json)
         hub.pushData(id)
         return `已更新面板「${current.definition.title}」的数据。`

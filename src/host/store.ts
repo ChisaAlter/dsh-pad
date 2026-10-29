@@ -94,6 +94,12 @@ export class PanelStore {
   }
 
   async create(definition: PanelDefinition, data?: Json): Promise<PanelRecord> {
+    // Safety net: a store must never hold two panels with the same title.
+    // Callers are expected to resolve duplicates themselves, but if one slips
+    // through we fold the request into the existing record instead of
+    // silently minting a second card for the user to clean up.
+    const existing = this.panels.find(p => p.definition.title === definition.title)
+    if (existing !== undefined) return this.update(existing.id, definition, data)
     const now = new Date().toISOString()
     const panel: PanelRecord = {
       id: `p_${randomUUID().slice(0, 8)}`,

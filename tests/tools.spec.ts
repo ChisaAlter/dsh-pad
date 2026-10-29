@@ -96,6 +96,39 @@ describe('pad_* tools', () => {
     hub.dispose()
   })
 
+  it('applies data on an identical pad_create instead of dropping it', async () => {
+    const { call, store, hub } = await setup(undefined)
+    await call('pad_create', { title: '余额', html: '', sources: [], agent: { instruction: '查余额', everyMinutes: 60 }, data: { v: 1 } })
+    const id = store.list()[0]!.id
+    const text = await call('pad_create', { title: '余额', html: '', sources: [], agent: { instruction: '查余额', everyMinutes: 60 }, data: { v: 2 } })
+    expect(text).toMatch(/已存在，定义相同，没有新建/)
+    expect(text).toMatch(/已把这次提交的 data 更新到面板上/)
+    expect(store.list()).toHaveLength(1)
+    expect(store.get(id)).toMatchObject({ version: 1, agentData: { value: { v: 2 } } })
+    hub.dispose()
+  })
+
+  it('still skips data on an identical pad_create when data is absent', async () => {
+    const { call, store, hub } = await setup(undefined)
+    await call('pad_create', { title: '余额', html: '', sources: [], agent: { instruction: '查余额', everyMinutes: 60 }, data: { v: 1 } })
+    const id = store.list()[0]!.id
+    const text = await call('pad_create', { title: '余额', html: '', sources: [], agent: { instruction: '查余额', everyMinutes: 60 } })
+    expect(text).toMatch(/已存在，定义相同，没有新建/)
+    expect(text).not.toMatch(/已把这次提交的 data 更新到面板上/)
+    expect(store.get(id)).toMatchObject({ version: 1, agentData: { value: { v: 1 } } })
+    hub.dispose()
+  })
+
+  it('rejects data on pad_update for a panel without agent refresh', async () => {
+    const { call, store, hub } = await setup(undefined)
+    await call('pad_create', { title: '静态', html: '<b></b>', sources: [] })
+    const id = store.list()[0]!.id
+    await expect(call('pad_update', { id, data: { v: 1 } })).rejects.toThrow(/没有 AI 刷新/)
+    expect(store.get(id).version).toBe(1)
+    expect(store.get(id).agentData).toBeUndefined()
+    hub.dispose()
+  })
+
   it('refuses pad_test_source when the user declines', async () => {
     const { call } = await setup('rejected')
     await expect(call('pad_test_source', { source: { id: 'x', kind: 'command', command: 'id', parse: 'text' } })).rejects.toThrow(/没有允许/)
