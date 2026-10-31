@@ -3,6 +3,7 @@ import { createServer } from 'node:http'
 import type { AddressInfo } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { setImmediate as nextEventLoopTurn } from 'node:timers/promises'
 import type { Context } from '@deepseek-ai/cordis'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { DataHub, type Subscriber } from '../src/host/hub.ts'
@@ -77,7 +78,10 @@ describe('SSE subscription lifetime', () => {
 
   it('turns a real deep HTTP source into a serializable failure and keeps polling', async () => {
     const { routes, hub, store } = await setup()
-    const server = createServer((_req, res) => { res.end('['.repeat(10_000) + '1' + ']'.repeat(10_000)) })
+    const server = createServer((_req, res) => {
+      res.setHeader('connection', 'close')
+      res.end('['.repeat(10_000) + '1' + ']'.repeat(10_000))
+    })
     await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve))
     const panel = await store.create({ title: 'Deep fixture', html: '', css: '', script: '', height: 'auto', sources: [{ id: 'fixture', kind: 'http', url: `http://127.0.0.1:${(server.address() as AddressInfo).port}`, parse: 'json', intervalSec: 60 }] })
     const response = await routes.get(ROUTES.stream)!(new Request('http://local' + ROUTES.stream + '?watch=' + panel.id))
@@ -97,11 +101,18 @@ describe('SSE subscription lifetime', () => {
       await reader.cancel()
       server.closeAllConnections()
       await new Promise<void>(resolve => server.close(() => resolve()))
+      // Let the client-side socket/undici teardown finish before the next test
+      // replaces global timers; otherwise it can schedule into that fake clock.
+      await nextEventLoopTurn()
     }
   })
 
   it('coalesces unread updates per panel and retains only the latest values', async () => {
     vi.useFakeTimers()
+    const timeouts = vi.spyOn(globalThis, 'setTimeout')
+    const intervals = vi.spyOn(globalThis, 'setInterval')
+    const clearTimeouts = vi.spyOn(globalThis, 'clearTimeout')
+    const clearIntervals = vi.spyOn(globalThis, 'clearInterval')
     const { routes, hub } = await setup()
     let subscriber!: Subscriber
     const unsubscribe = vi.fn()
@@ -126,7 +137,25 @@ describe('SSE subscription lifetime', () => {
     expect(unsubscribe).not.toHaveBeenCalled()
     await reader.cancel()
     expect(unsubscribe).toHaveBeenCalledTimes(1)
-    expect(vi.getTimerCount()).toBe(0)
+    const stalls = timeouts.mock.calls.flatMap((call, index) => call[1] === SSE_STALL_MS ? [timeouts.mock.results[index]!.value] : [])
+    const heartbeats = intervals.mock.calls.flatMap((call, index) => call[1] === 20_000 ? [intervals.mock.results[index]!.value] : [])
+    expect(stalls.length).toBeGreaterThan(0)
+    expect(heartbeats).toHaveLength(1)
+    for (const timer of stalls) expect(clearTimeouts).toHaveBeenCalledWith(timer)
+    for (const timer of heartbeats) expect(clearIntervals).toHaveBeenCalledWith(timer)
+    const remaining = vi.getTimerCount()
+    if (remaining !== 0) {
+      // Safe CI diagnostic: only duration and callback code, never event data.
+      console.info('coalescing timer callbacks', {
+        timeouts: timeouts.mock.calls.map(([callback, ms]) => ({ ms, callback: String(callback).slice(0, 80) })),
+        intervals: intervals.mock.calls.map(([callback, ms]) => ({ ms, callback: String(callback).slice(0, 80) })),
+      })
+    }
+    timeouts.mockRestore()
+    intervals.mockRestore()
+    clearTimeouts.mockRestore()
+    clearIntervals.mockRestore()
+    expect(remaining).toBe(0)
   })
 
   it('disconnects a stalled consumer even when repeated data can be coalesced', async () => {
