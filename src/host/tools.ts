@@ -1,17 +1,17 @@
 /**
  * Model-facing tools: the conversation creates, inspects, edits and removes
- * panels through these. New or changed data sources are put to the user
- * through dsh's own approval prompt; a declined or unavailable prompt leaves
- * the panel waiting for approval in the dock instead.
+ * panels through these. A panel's data sources belong to that panel, so a
+ * create or update that carries sources runs them at once and reports the
+ * first readings; nothing waits for a separate confirmation.
  */
 import type { Context } from '@deepseek-ai/cordis'
-import type {} from '@deepseek-ai/dsh-user-approval'
-import { type ToolRunContext, defineTool } from '@deepseek-ai/dsh-tools'
-import type { Json, PanelDefinition, PanelRecord, PanelSource } from '../shared/types.ts'
+import { defineTool } from '@deepseek-ai/dsh-tools'
+import type { Json, PanelDefinition, PanelRecord } from '../shared/types.ts'
 import { type Limits, PanelValidationError, validateDefinition } from '../shared/validate.ts'
 import type { AgentRefresher } from './agent-refresh.ts'
-import { PANEL_GUIDE } from './guide.ts'
+import { PANEL_GUIDE, PANEL_TOPICS, panelManual, type PanelTopic } from './guide.ts'
 import type { DataHub } from './hub.ts'
+import { formatLint, lintPanel } from './lint.ts'
 import { assertModel, modelCatalog } from './models.ts'
 import { type SecretResolver, runSource } from './sources.ts'
 import { type PanelStore, sourcesFingerprint } from './store.ts'
@@ -22,7 +22,6 @@ export interface ToolDeps {
   readonly hub: DataHub
   readonly refresher: AgentRefresher | undefined
   readonly limits: Limits
-  readonly autoApprove: boolean
   readonly resolveSecret: SecretResolver
 }
 
@@ -77,13 +76,7 @@ function sample(value: Json | undefined): string {
   return text.length > SAMPLE_CHARS ? `${text.slice(0, SAMPLE_CHARS)}…（共 ${text.length} 字符，已截断）` : text
 }
 
-function describeSources(sources: readonly PanelSource[]): string {
-  return sources.map(source => source.kind === 'command'
-    ? `• [${source.id}] 每 ${source.intervalSec} 秒运行命令：${source.command}`
-    : `• [${source.id}] 每 ${source.intervalSec} 秒请求：${source.method ?? 'GET'} ${source.url}`).join('\n')
-}
-
-function panelSummary(panel: PanelRecord, store: PanelStore, refresher: AgentRefresher | undefined, hub: DataHub): Json {
+function panelSummary(panel: PanelRecord, refresher: AgentRefresher | undefined, hub: DataHub): Json {
   const view = hub.views().find(v => v.id === panel.id)
   return {
     id: panel.id,
@@ -97,7 +90,6 @@ function panelSummary(panel: PanelRecord, store: PanelStore, refresher: AgentRef
       intervalSec: s.intervalSec,
       lastError: view?.data.sources[s.id]?.ok === false ? view.data.sources[s.id]!.error ?? null : null,
     })),
-    waitingForApproval: !store.approved(panel),
     agent: panel.definition.agent
       ? {
           everyMinutes: panel.definition.agent.everyMinutes,
@@ -116,31 +108,12 @@ function panelSummary(panel: PanelRecord, store: PanelStore, refresher: AgentRef
 export function registerTools(deps: ToolDeps): void {
   const { ctx, store, hub, refresher, limits, resolveSecret } = deps
 
-  async function askToRun(exec: ToolRunContext, toolName: string, title: string, sources: readonly PanelSource[]): Promise<boolean> {
-    if (sources.length === 0 || deps.autoApprove) return true
-    const approval = ctx.get('approval')
-    if (approval === undefined || exec.agent === undefined) return false
-    const reason = `面板「${title}」要在这台机器上运行：\n${describeSources(sources)}`
-    const outcome = await approval.request({
-      agent: exec.agent,
-      toolName,
-      callId: exec.callId,
-      reason,
-      displayReason: { en: `Panel "${title}" wants to run on this machine:\n${describeSources(sources)}`, zh: reason },
-      signal: exec.signal,
-    })
-    return outcome === 'allowed-once'
-  }
-
   function readingsReport(readings: readonly { id: string, ok: boolean, value?: Json, error?: string }[]): string[] {
     return readings.map(r => r.ok ? `- ${r.id}: ✓ ${sample(r.value)}` : `- ${r.id}: ✗ ${r.error}`)
   }
 
   async function firstReadings(panel: PanelRecord): Promise<string[]> {
     if (panel.definition.sources.length === 0) return []
-    if (!store.approved(panel)) {
-      return ['数据源还没被允许运行：已在面板上显示「允许运行」，用户点了之后才会开始取数。告诉用户这一点。']
-    }
     const readings = await hub.runAll(panel.id)
     return ['数据源读数：', ...readingsReport(readings)]
   }
@@ -154,6 +127,31 @@ export function registerTools(deps: ToolDeps): void {
     }
   }
 
+  /**
+   * Enforce the glance contract on a definition the model just wrote.
+   *
+   * Errors refuse the write: a wall of text is not a panel, and reporting it
+   * after the card is on screen leaves the user with the thing they complained
+   * about. Warnings ride along with the successful result instead.
+   * @param definition - the definition about to be stored.
+   * @param plain - the user explicitly asked for a text card; skip the gate.
+   * @returns advisory lines for the tool result.
+   */
+  function lintNotes(definition: PanelDefinition, plain: boolean): string[] {
+    const issues = lintPanel(definition)
+    const errors = issues.filter(issue => issue.severity === 'error')
+    if (errors.length > 0 && !plain) {
+      throw new Error(`面板排版不合格，没有写入：\n${formatLint(errors)}\n\n按 pad_guide(topic="recipes") 里的配方改成「一个主数字 + 几行数据」再提交；如果用户明确只要一张文字卡片（便签、引用、说明），传 plain: true 跳过这项检查。`)
+    }
+    if (errors.length > 0) {
+      // plain is the user's call, not the model's: say in the transcript that
+      // the check was skipped, so a bad layout cannot disappear quietly.
+      return [`已按 plain 跳过排版检查，仍有 ${errors.length} 处问题（${errors.map(issue => issue.rule).join('、')}）。只有在用户确实只想要一张便签时才这样做。`]
+    }
+    const warnings = formatLint(issues)
+    return warnings === '' ? [] : ['排版建议（不阻塞，顺手改掉更好）：', warnings]
+  }
+
   ctx.effect(() => ctx.tools.register(defineTool({
     name: 'pad_list',
     description: '列出悬浮面板坞里的所有面板（id、标题、数据源、最近的错误、AI 刷新状态）。改面板、修面板前先调用。',
@@ -161,7 +159,7 @@ export function registerTools(deps: ToolDeps): void {
     output: textOutput,
     isConcurrencySafe: () => true,
     async execute() {
-      const panels = store.list().map(p => panelSummary(p, store, refresher, hub))
+      const panels = store.list().map(p => panelSummary(p, refresher, hub))
       return panels.length === 0 ? '还没有面板。' : JSON.stringify(panels, null, 2)
     },
   })), 'dsh-pad: pad_list')
@@ -189,13 +187,12 @@ export function registerTools(deps: ToolDeps): void {
 
   ctx.effect(() => ctx.tools.register(defineTool({
     name: 'pad_test_source',
-    description: '试跑一个数据源（不保存），返回真实输出。写面板脚本前先用它看清输出格式。需要用户允许。',
+    description: '试跑一个数据源（不保存），返回真实输出。写面板脚本前先用它看清输出格式。',
     parameters: { source: { ...sourceItem, required: true } },
     output: textOutput,
     async execute(args, exec) {
       const probe = validate({ title: 'test', html: '', css: '', script: '', height: 'auto', sources: [{ intervalSec: limits.minIntervalSec, ...(args.source as Record<string, unknown>) }] })
       const source = probe.sources[0]!
-      if (!(await askToRun(exec, 'pad_test_source', '试跑数据源', [source]))) throw new Error('用户没有允许运行这个数据源')
       const reading = await runSource(source, resolveSecret, exec.signal)
       return reading.ok ? `✓ 用时 ${reading.durationMs}ms，输出：\n${sample(reading.value)}` : `✗ ${reading.error}`
     },
@@ -213,12 +210,29 @@ export function registerTools(deps: ToolDeps): void {
   })), 'dsh-pad: pad_models')
 
   ctx.effect(() => ctx.tools.register(defineTool({
+    name: 'pad_guide',
+    description: '悬浮面板的编写手册：版式（layout）、kit 类名（kit）、完整可跑的 html + script 配方（recipes）、取数方式（data）、面板里的 dsh API（api）、提交前自检（check）。写面板或改版面之前先调用，默认返回全部。',
+    parameters: {
+      topic: {
+        type: 'string',
+        enum: [...PANEL_TOPICS],
+        description: '只看其中一节；不传返回全部。改版面看 layout + recipes，接数据看 data，写脚本看 api + kit。',
+      },
+    },
+    output: textOutput,
+    isConcurrencySafe: () => true,
+    async execute(args) {
+      return panelManual((args.topic ?? 'all') as PanelTopic)
+    },
+  })), 'dsh-pad: pad_guide')
+
+  ctx.effect(() => ctx.tools.register(defineTool({
     name: 'pad_create',
     description: `在悬浮面板坞里新建一张面板。\n\n${PANEL_GUIDE}`,
     parameters: {
       title: { type: 'string', required: true, description: '简短标题（≤40 字）' },
       icon: { type: 'string', description: '一个 emoji' },
-      html: { type: 'string', required: true, description: '面板 body 内的 HTML' },
+      html: { type: 'string', required: true, description: '面板 body 内的 HTML，优先用 pad-* 类' },
       css: { type: 'string', description: '面板样式，用 --pad-* 变量' },
       script: { type: 'string', description: '面板脚本，用 dsh.onData 渲染' },
       height: { oneOf: [{ type: 'string', enum: ['auto'] }, { type: 'integer' }], description: '"auto"（默认，跟随内容）或固定像素高度' },
@@ -226,9 +240,10 @@ export function registerTools(deps: ToolDeps): void {
       model: modelSelection,
       agent: agentBlock,
       data: { type: 'json', description: 'AI 刷新面板的第一版数据（你刚取到的真实数据）' },
+      plain: { type: 'boolean', description: '用户明确只要一张文字卡片（便签、引用、说明）时传 true，跳过排版检查' },
     },
     output: textOutput,
-    async execute(args, exec) {
+    async execute(args) {
       const definition = validate({ css: '', script: '', height: 'auto', sources: [], ...args })
       if (definition.model) await assertModel(ctx, definition.model)
       // A repeated pad_create for a title that already exists is almost
@@ -250,20 +265,15 @@ export function registerTools(deps: ToolDeps): void {
         lines.push(`要改内容请用 pad_update 传 id；要并排再放一张请先给新面板换个标题。`)
         return lines.join('\n')
       }
-      let panel: PanelRecord
-      if (duplicate) {
-        panel = await store.update(duplicate.id, definition, args.data as Json | undefined)
-      } else {
-        panel = await store.create(definition, args.data as Json | undefined)
-      }
-      if (!store.approved(panel) && await askToRun(exec, 'pad_create', definition.title, definition.sources)) {
-        await store.approve(panel.id, sourcesFingerprint(definition.sources))
-        panel = store.get(panel.id)
-      }
+      const notes = lintNotes(definition, args.plain === true)
+      const panel = duplicate
+        ? await store.update(duplicate.id, definition, args.data as Json | undefined)
+        : await store.create(definition, args.data as Json | undefined)
       const lines = duplicate
         ? [`已有同名面板 ${panel.id}「${definition.title}」，已把内容更新为这次提交的版本（版本 ${panel.version}），没有新建重复面板。`]
         : [`已创建面板 ${panel.id}「${definition.title}」，已经出现在悬浮面板坞。`]
       lines.push(...await firstReadings(panel))
+      lines.push(...notes)
       if (definition.agent && args.data === undefined) lines.push('提醒：AI 刷新面板没有交第一版 data，面板在第一次后台刷新前是空的。最好现在取一次真实数据，用 pad_update 的 data 补上。')
       return lines.join('\n')
     },
@@ -284,32 +294,43 @@ export function registerTools(deps: ToolDeps): void {
       model: { oneOf: [modelSelection, { type: 'null' }] },
       agent: { oneOf: [agentBlock, { type: 'null' }] },
       data: { type: 'json', description: '新的 AI 刷新数据' },
+      plain: { type: 'boolean', description: '用户明确只要一张文字卡片时传 true，跳过排版检查' },
     },
     output: textOutput,
-    async execute(args, exec) {
+    async execute(args) {
       const current = store.get(args.id)
-      const { id, data, ...fields } = args
+      const { id, data, plain, ...fields } = args
       const changesDefinition = Object.keys(fields).length > 0
       if (!changesDefinition) {
         if (data === undefined) throw new Error('没有要改的字段')
         // A panel without agent refresh never reads agentData — writing it
         // would silently discard the payload. Reject so the caller notices.
-        if (!current.definition.agent) throw new Error(`面板「${current.definition.title}」没有 AI 刷新，data 只适用于有 agent 的面板`)
-        await store.setAgentData(id, data as Json)
+        await store.setAgentData(id, data as Json, latest => {
+          if (!latest.definition.agent) throw new Error(`面板「${latest.definition.title}」没有 AI 刷新，data 只适用于有 agent 的面板`)
+          return true
+        })
         hub.pushData(id)
         return `已更新面板「${current.definition.title}」的数据。`
       }
-      const definition = validate({ ...current.definition, ...fields })
-      if (definition.model) await assertModel(ctx, definition.model)
-      let panel = await store.update(id, definition, data as Json | undefined)
-      if (!store.approved(panel) && await askToRun(exec, 'pad_update', definition.title, definition.sources)) {
-        await store.approve(panel.id, sourcesFingerprint(definition.sources))
-        panel = store.get(panel.id)
-      }
-      const sourcesChanged = sourcesFingerprint(current.definition.sources) !== sourcesFingerprint(definition.sources)
+      const candidate = validate({ ...current.definition, ...fields })
+      if (candidate.model) await assertModel(ctx, candidate.model)
+      // Model lookup is asynchronous. Merge only the requested fields into the
+      // latest committed definition after it returns, inside the store transaction.
+      let notes: string[] = []
+      let sourcesChanged = false
+      const panel = await store.updateDefinition(id, latest => {
+        const definition = validate({ ...latest.definition, ...fields })
+        const editedLayout = definition.html !== latest.definition.html
+          || definition.css !== latest.definition.css
+          || definition.script !== latest.definition.script
+        notes = editedLayout ? lintNotes(definition, plain === true) : []
+        sourcesChanged = sourcesFingerprint(latest.definition.sources) !== sourcesFingerprint(definition.sources)
+        return definition
+      }, data as Json | undefined)
       return [
-        `已更新面板 ${panel.id}「${definition.title}」（版本 ${panel.version}）。`,
+        `已更新面板 ${panel.id}「${panel.definition.title}」（版本 ${panel.version}）。`,
         ...(sourcesChanged ? await firstReadings(panel) : []),
+        ...notes,
       ].join('\n')
     },
   })), 'dsh-pad: pad_update')

@@ -71,7 +71,7 @@ describe('per-panel model catalog', () => {
         },
       },
     } as unknown as Context
-    const store = new PanelStore(join(await mkdtemp(join(tmpdir(), 'dsh-pad-routes-')), 'panels.json'), false)
+    const store = new PanelStore(join(await mkdtemp(join(tmpdir(), 'dsh-pad-routes-')), 'panels.json'))
     const hub = new DataHub(store, async () => undefined, () => {})
     registerRoutes({ ctx: routeCtx, store, hub, refresher: undefined })
     const handler = routes.get('/api/dsh-pad.models')
@@ -95,7 +95,7 @@ describe('per-panel model catalog', () => {
         },
       },
     } as unknown as Context
-    const store = new PanelStore(join(await mkdtemp(join(tmpdir(), 'dsh-pad-run-')), 'panels.json'), false)
+    const store = new PanelStore(join(await mkdtemp(join(tmpdir(), 'dsh-pad-run-')), 'panels.json'))
     const panel = await store.create({ title: 'T', html: '', css: '', script: '', height: 'auto', sources: [] })
     const hub = new DataHub(store, async () => undefined, () => {})
     registerRoutes({ ctx: routeCtx, store, hub, refresher: undefined })

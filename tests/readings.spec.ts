@@ -22,8 +22,6 @@ const panel = (id: string, sources: PanelSource[]): PanelRecord => ({
 
 const reading = (value: unknown, at = '2026-10-23T08:00:00.000Z'): SourceReading => ({ ok: true, value: value as never, at })
 
-const sleep = (ms: number): Promise<void> => new Promise(resolve => setTimeout(resolve, ms))
-
 async function cachePath(): Promise<string> {
   return join(await mkdtemp(join(tmpdir(), 'dsh-pad-cache-')), 'readings.json')
 }
@@ -154,6 +152,19 @@ describe('ReadingCache', () => {
     expect(cache.history('p_1')['balance']).toHaveLength(1)
   })
 
+  it('rejects deep legacy cache values even when their serialized size is small', async () => {
+    const file = await cachePath()
+    const source = httpSource('balance')
+    const key = sourcesFingerprint([source])
+    const deep = '['.repeat(1000) + '1' + ']'.repeat(1000)
+    await writeFile(file, `{"version":1,"panels":{"p_1":{"balance":{"key":"${key}","reading":{"ok":true,"value":${deep},"at":"2026-10-23T08:00:00.000Z"}}}}}`)
+    const cache = new ReadingCache(file)
+    expect((await cache.load([panel('p_1', [source])])).size).toBe(0)
+    cache.remember('p_1', 'balance', key, reading(JSON.parse(deep)))
+    expect(cache.history('p_1')).toEqual({})
+    cache.dispose()
+  })
+
   it('ignores a corrupt cache file', async () => {
     const file = await cachePath()
     await writeFile(file, '{not json')
@@ -167,7 +178,9 @@ describe('ReadingCache', () => {
     const cache = new ReadingCache(file, 20)
     cache.remember('p_1', 'balance', sourcesFingerprint([source]), reading(1))
     cache.remember('p_1', 'balance', sourcesFingerprint([source]), reading(2))
-    await sleep(120)
+    // Wait for the pending write itself rather than for a wall-clock window:
+    // under a loaded suite the debounce timer can miss any fixed sleep.
+    await cache.flush()
     const restored = await new ReadingCache(file).load([panel('p_1', [source])])
     expect(restored.get('p_1')?.get('balance')?.value).toBe(2)
     cache.dispose()
@@ -190,7 +203,7 @@ describe('DataHub reading cache', () => {
   it('hands the last reading to the next run of the Host', async () => {
     const panelsFile = join(await mkdtemp(join(tmpdir(), 'dsh-pad-')), 'panels.json')
     const file = join(dirname(panelsFile), 'readings.json')
-    const store = new PanelStore(panelsFile, true)
+    const store = new PanelStore(panelsFile)
     const cache = new ReadingCache(file, 10)
     const hub = new DataHub(store, async () => undefined, () => {}, { cache })
     const panel = await store.create(definition('echo hi'))
@@ -200,7 +213,7 @@ describe('DataHub reading cache', () => {
     cache.dispose()
 
     // A fresh Host process: same panels, restored readings.
-    const nextStore = new PanelStore(panelsFile, true)
+    const nextStore = new PanelStore(panelsFile)
     await nextStore.load()
     const restored = await new ReadingCache(file).load(nextStore.list())
     const nextHub = new DataHub(nextStore, async () => undefined, () => {}, { restored })
@@ -211,7 +224,7 @@ describe('DataHub reading cache', () => {
   it('forgets a reading when the panel is deleted', async () => {
     const panelsFile = join(await mkdtemp(join(tmpdir(), 'dsh-pad-')), 'panels.json')
     const file = join(dirname(panelsFile), 'readings.json')
-    const store = new PanelStore(panelsFile, true)
+    const store = new PanelStore(panelsFile)
     const cache = new ReadingCache(file, 10)
     const hub = new DataHub(store, async () => undefined, () => {}, { cache })
     store.onChange(() => hub.storeChanged())

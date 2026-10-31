@@ -6,7 +6,7 @@
 import type { Context as ClientContext } from '@deepseek-ai/cordis'
 import type { InputActions } from '@deepseek-ai/dsh-client-ui-conversation/client'
 import type { PropsLocale, PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots'
-import { Component, createElement, useEffect, type ReactNode } from 'react'
+import { createElement, useEffect, useSyncExternalStore } from 'react'
 // Type-only: the locale plugin's Context merge (ctx.locale).
 import type {} from '@deepseek-ai/dsh-client-locale/client'
 // Type-only: the renderer-owned slots service (ctx.slots).
@@ -18,6 +18,8 @@ import { createDock } from './Dock.tsx'
 import { en, type PadKey, zh } from './locales.ts'
 import { PadClient } from './pad-client.ts'
 import { DOCK_CSS } from './styles.ts'
+import { recoverableSlot } from './recoverable-slot.ts'
+import { RenderBoundary } from './RenderBoundary.tsx'
 
 declare module '@deepseek-ai/dsh-client-ui-slots' {
   interface LocaleNamespaceMap {
@@ -34,30 +36,6 @@ export const inject = ['slots', 'locale']
 function ComposerBridge({ inputActions }: { inputActions: InputActions }): null {
   useEffect(() => composer.attach(inputActions), [inputActions])
   return null
-}
-
-/**
- * A dock that fails to render would otherwise vanish without a trace: show the
- * message in place of the dock so the failure is reportable.
- */
-class DockBoundary extends Component<{ children?: ReactNode }, { error?: Error }> {
-  state: { error?: Error } = {}
-
-  static getDerivedStateFromError(error: Error): { error: Error } {
-    return { error }
-  }
-
-  render(): ReactNode {
-    const error = this.state.error
-    if (error === undefined) return this.props.children
-    return createElement('div', {
-      style: {
-        position: 'fixed', right: '12px', top: '64px', zIndex: 99999, maxWidth: 'min(420px,80vw)',
-        padding: '10px 12px', borderRadius: '12px', background: '#b00020', color: '#fff',
-        font: '12px/18px ui-monospace,Consolas,monospace', whiteSpace: 'pre-wrap', wordBreak: 'break-word',
-      },
-    }, `面板坞渲染失败：${error.message}`)
-  }
 }
 
 /**
@@ -94,14 +72,21 @@ function start(ctx: ClientContext): void {
 
   const client = new PadClient()
   const Dock = createDock(client)
-  ctx.slots.inject('shell.overlay', () => ctx.slots.register({
+  function DockEntrance(props: PropsRuntime<'shell.overlay'> & PropsLocale<'dsh-pad'>) {
+    const snapshot = useSyncExternalStore(client.subscribe, client.getSnapshot)
+    // Only a definition/layout change retries a failed chrome automatically;
+    // ordinary source ticks must not repeatedly remount a broken dock.
+    const resetKey = JSON.stringify([snapshot.layout, snapshot.panels.map(panel => [panel.id, panel.version])])
+    return createElement(RenderBoundary, { t: props.t, resetKey, dock: true }, createElement(Dock, { t: props.t }))
+  }
+  recoverableSlot(ctx, 'shell.overlay', 'dsh-pad', () => ctx.slots.register({
     name: 'shell.overlay',
     id: 'dsh-pad',
     order: 50,
     locale: NS,
-  }, (props: PropsRuntime<'shell.overlay'> & PropsLocale<'dsh-pad'>) => createElement(DockBoundary, null, createElement(Dock, { t: props.t }))))
+  }, DockEntrance))
 
-  ctx.slots.inject('conversation.input.overlay', () => ctx.slots.register({
+  recoverableSlot(ctx, 'conversation.input.overlay', 'dsh-pad.composer-bridge', () => ctx.slots.register({
     name: 'conversation.input.overlay',
     id: 'dsh-pad.composer-bridge',
     order: 1000,

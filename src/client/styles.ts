@@ -15,11 +15,34 @@ export const DOCK_CSS = `
   --dshpad-danger:var(--dsw-alias-state-error-primary,#e5484d);
   --dshpad-warn:var(--dsw-alias-state-warn-primary,#d97706);
   --dshpad-ball-hi:color-mix(in srgb,var(--dshpad-surface) 90%,var(--dshpad-fg) 10%);
+  --dshpad-card-tint:color-mix(in srgb,var(--dsw-alias-settings-card-fill,transparent) 55%,transparent);
   --dshpad-ease:cubic-bezier(.22,.8,.24,1);
   color:var(--dshpad-fg)}
+/* When dsh's --dsw-* aliases do not resolve (or resolve to a light surface in
+   a dark theme), every var() above lands on the light fallback and the dock
+   turns white inside a dark app. The dock reports the mode it detected, and a
+   dark mode gets a dark palette outright: a missing token must never be able to
+   make a dark dock light. */
+.dshpad-root[data-mode=dark]{
+  --dshpad-fg:#e9e9ec;
+  --dshpad-fg-2:#b7b9bf;
+  --dshpad-fg-3:#8e9198;
+  --dshpad-surface:#232326;
+  --dshpad-hover:rgba(255,255,255,.08);
+  --dshpad-border:rgba(255,255,255,.14);
+  --dshpad-accent:#7c93ff;
+  --dshpad-danger:#ff6369;
+  --dshpad-warn:#f5a524;
+  --dshpad-card-tint:rgba(255,255,255,.035)}
 .dshpad-root svg{width:14px;height:14px;fill:none;stroke:currentColor;stroke-width:1.5;stroke-linecap:round;stroke-linejoin:round}
 .dshpad-root circle{fill:currentColor;stroke:none}
 .dshpad-root button{font:inherit;color:inherit}
+.dshpad-root.dshpad-recovery-root{width:min(340px,calc(100vw - 24px));height:auto;top:64px;right:12px}
+.dshpad-recovery{display:flex;align-items:center;flex-wrap:wrap;gap:8px;padding:12px;border-radius:12px;background:var(--dshpad-surface);color:var(--dshpad-fg);box-shadow:inset 0 0 0 1px var(--dshpad-border);font:13px/18px system-ui,sans-serif;pointer-events:auto}
+.dshpad-recovery strong{flex-basis:100%;overflow-wrap:anywhere}
+.dshpad-recovery button{padding:4px 8px;border:1px solid var(--dshpad-border);border-radius:6px;background:var(--dshpad-hover);cursor:pointer}
+.dshpad-recovery details{width:100%;font-size:12px;color:var(--dshpad-fg-2)}
+.dshpad-recovery pre{margin:6px 0 0;white-space:pre-wrap;overflow-wrap:anywhere}
 
 .dshpad-root #dshpad-ball{position:fixed!important;display:grid;place-items:center;width:28px!important;height:28px!important;padding:0!important;border:0!important;border-radius:0!important;background:none!important;box-shadow:none!important;clip-path:none!important;cursor:grab;touch-action:none;user-select:none;-webkit-user-select:none;-webkit-app-region:no-drag;overflow:visible!important;
   opacity:1!important;pointer-events:auto!important}
@@ -52,7 +75,7 @@ export const DOCK_CSS = `
 .dshpad-collapse-star{visibility:hidden}
 
 .dshpad-dock{position:fixed;left:8px;top:52px;max-height:calc(100vh - 16px);max-width:calc(100vw - 16px);pointer-events:auto;display:flex;flex-direction:column;
-  background:color-mix(in srgb, var(--dshpad-surface) 70%, transparent);border:0;border-radius:var(--dsw-radius-xl,16px);box-shadow:var(--dsw-elevation-panel,0 8px 28px rgba(0,0,0,.14));
+  background:color-mix(in srgb, var(--dshpad-surface) 88%, transparent);border:0;border-radius:var(--dsw-radius-xl,16px);box-shadow:var(--dsw-elevation-panel,0 8px 28px rgba(0,0,0,.14));
   -webkit-backdrop-filter:blur(26px) saturate(1.45);backdrop-filter:blur(26px) saturate(1.45);
   font-size:13px;line-height:18px;animation:dshpad-dock-in .18s var(--dshpad-ease)}
 .dshpad-dock.is-attached{border-radius:12px;max-height:calc(100vh - 2px)}
@@ -93,7 +116,7 @@ export const DOCK_CSS = `
 .dshpad-icon-btn{flex:none;display:grid;place-items:center;width:28px;height:28px;padding:0;border:0;border-radius:8px;background:transparent;color:var(--dshpad-fg-2)!important;cursor:pointer;transition:background-color .15s,color .15s}
 .dshpad-icon-btn:hover:not(:disabled),.dshpad-icon-btn.is-active{background:var(--dshpad-hover);color:var(--dshpad-fg)!important}
 .dshpad-icon-btn:disabled{opacity:.4;cursor:default}
-.dshpad-update{flex:none;margin:0 6px 5px;padding:8px 9px;border-radius:11px;background:color-mix(in srgb, var(--dshpad-surface) 55%, transparent);
+.dshpad-update{flex:none;margin:0 6px 5px;padding:8px 9px;border-radius:11px;background-color:var(--dshpad-surface);background-image:linear-gradient(var(--dshpad-card-tint),var(--dshpad-card-tint));
   box-shadow:inset 0 0 0 .5px var(--dshpad-border);font-size:12px}
 .dshpad-update-head{display:flex;align-items:center;justify-content:space-between;gap:6px}
 .dshpad-update-close{display:grid;place-items:center;width:22px;height:22px;padding:0;border:0;border-radius:6px;background:transparent;color:var(--dshpad-fg-3);cursor:pointer}
@@ -124,7 +147,7 @@ export const DOCK_CSS = `
 .dshpad-splitter::before{content:"";position:absolute;top:0;bottom:0;left:50%;width:1px;transform:translateX(-50%);border-radius:1px;background:var(--dshpad-fg-3);opacity:.42;transition:background-color .15s,opacity .15s}
 .dshpad-splitter:hover::before,.dshpad-splitter:active::before{background:var(--dshpad-fg-3);opacity:.68}
 
-.dshpad-card{position:relative;min-width:0;border-radius:12px;background:color-mix(in srgb, var(--dsw-alias-settings-card-fill, transparent) 55%, transparent);box-shadow:inset 0 0 0 .5px var(--dsw-alias-settings-card-stroke,var(--dshpad-border));animation:dshpad-fade .24s ease-out}
+.dshpad-card{position:relative;min-width:0;border-radius:12px;background-color:var(--dshpad-surface);background-image:linear-gradient(var(--dshpad-card-tint),var(--dshpad-card-tint));box-shadow:inset 0 0 0 .5px var(--dsw-alias-settings-card-stroke,var(--dshpad-border));animation:dshpad-fade .24s ease-out}
 .dshpad-card.is-dragging{opacity:.45}
 .dshpad-card.is-drop-target{box-shadow:inset 0 0 0 2px var(--dshpad-accent),0 8px 24px rgba(0,0,0,.12)}
 .dshpad-card.is-drop-left::after,.dshpad-card.is-drop-right::after,.dshpad-card.is-drop-top::after,.dshpad-card.is-drop-bottom::after,.dshpad-card.is-drop-center::after{content:"";position:absolute;z-index:3;pointer-events:none;border-radius:12px;background:color-mix(in srgb,var(--dshpad-accent) 14%, transparent)}
@@ -194,14 +217,17 @@ export const DOCK_CSS = `
 .dshpad-models-hint{margin:4px;color:var(--dshpad-fg-3);font-size:11px}
 .dshpad-models-error{margin:4px;color:var(--dshpad-danger);font-size:11px}
 
-.dshpad-frame{display:block;width:100%;border:0;background:transparent;transition:height .2s var(--dshpad-ease)}
+/* Opaque, not transparent, and its own compositing layer: inside the dock's
+   composited subtree Electron painted this frame's canvas but culled the
+   content layer, so the panel came up blank while its document had loaded. */
+.dshpad-frame{display:block;width:100%;border:0;background:var(--dshpad-surface);transform:translateZ(0);transition:height .2s var(--dshpad-ease)}
 .dshpad-frame.is-resizing{transition:none}
 .dshpad-frame-handle{height:10px;margin-top:2px;display:flex;align-items:center;justify-content:center;cursor:ns-resize;touch-action:none}
 .dshpad-frame-handle::after{content:"";width:28px;height:3px;border-radius:2px;background:var(--dshpad-border);opacity:.7;transition:opacity .15s,background-color .15s}
 .dshpad-frame-handle:hover::after{opacity:1;background:var(--dshpad-fg-3)}
 
 .dshpad-menu{position:absolute;left:0;top:28px;z-index:10;min-width:176px;padding:6px;display:flex;flex-direction:column;gap:1px;border-radius:12px;
-  background:color-mix(in srgb, var(--dsw-alias-settings-card-fill,var(--dshpad-surface)) 86%, transparent);-webkit-backdrop-filter:blur(18px) saturate(1.15);backdrop-filter:blur(18px) saturate(1.15);border:.5px solid var(--dshpad-border);
+  background-color:var(--dshpad-surface);background-image:linear-gradient(var(--dshpad-card-tint),var(--dshpad-card-tint));-webkit-backdrop-filter:blur(18px) saturate(1.15);backdrop-filter:blur(18px) saturate(1.15);border:.5px solid var(--dshpad-border);
   box-shadow:var(--dsw-elevation-prominent,0 10px 30px rgba(0,0,0,.18));animation:dshpad-pop .14s ease-out}
 .dshpad-menu button{display:flex;align-items:center;gap:9px;width:100%;padding:7px 9px;border:0;border-radius:8px;background:none;text-align:left;font-size:13px;color:inherit;cursor:pointer}
 .dshpad-menu button:hover:not(:disabled){background:var(--dshpad-hover)}
@@ -213,16 +239,9 @@ export const DOCK_CSS = `
 .dshpad-menu button.is-danger .dshpad-mi{color:inherit}
 
 .dshpad-focus{position:fixed;inset:0;z-index:40;display:flex;align-items:center;justify-content:center;padding:24px;background:rgba(0,0,0,.42);animation:dshpad-fade .18s ease-out}
-.dshpad-focus-panel{display:flex;flex-direction:column;width:min(640px,92vw);padding:8px 14px 12px;border-radius:16px;background:color-mix(in srgb, var(--dsw-alias-bg-layer-1,var(--dshpad-surface)) 82%, transparent);-webkit-backdrop-filter:blur(40px) saturate(1.2);backdrop-filter:blur(40px) saturate(1.2);border:.5px solid var(--dshpad-border);box-shadow:var(--dsw-elevation-prominent,0 24px 60px rgba(0,0,0,.35))}
+.dshpad-focus-panel{display:flex;flex-direction:column;width:min(640px,92vw);padding:8px 14px 12px;border-radius:16px;background-color:var(--dshpad-surface);background-image:linear-gradient(var(--dshpad-card-tint),var(--dshpad-card-tint));-webkit-backdrop-filter:blur(40px) saturate(1.2);backdrop-filter:blur(40px) saturate(1.2);border:.5px solid var(--dshpad-border);box-shadow:var(--dsw-elevation-prominent,0 24px 60px rgba(0,0,0,.35))}
 .dshpad-focus-head{display:flex;align-items:center;gap:8px;height:40px;flex:none}
 .dshpad-focus-title{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:600}
-
-.dshpad-approve{margin:0 0 5px;padding:5px 6px;border-radius:10px;background:var(--dsw-alias-state-warn-tertiary,rgba(217,119,6,.1));font-size:12px}
-.dshpad-approve p{margin:0 0 3px}
-.dshpad-approve ul{margin:0 0 5px;padding:0;list-style:none;display:flex;flex-direction:column;gap:2px}
-.dshpad-approve code{display:block;max-height:76px;overflow:auto;padding:2px 4px;border-radius:6px;background:var(--dshpad-hover);font:11px/16px ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;word-break:break-all;white-space:pre-wrap}
-.dshpad-primary{height:28px;padding:0 12px;border:0;border-radius:8px;background:var(--dshpad-accent,#4d6bfe);color:var(--dsw-alias-label-primary-foreground,#fff)!important;box-shadow:inset 0 0 0 1px rgba(0,0,0,.08);font-size:12px;font-weight:500;cursor:pointer}
-.dshpad-primary:hover{filter:brightness(1.06)}
 
 .dshpad-empty{padding:14px 5px 4px;color:var(--dshpad-fg-2);font-size:12px;text-align:center}
 .dshpad-empty p{margin:0 0 6px}

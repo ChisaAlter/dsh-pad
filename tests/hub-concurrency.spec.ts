@@ -5,7 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { DataHub, type Subscriber } from '../src/host/hub.ts'
 import { ReadingCache } from '../src/host/readings.ts'
 import { runSource } from '../src/host/sources.ts'
-import { PanelStore, sourcesFingerprint } from '../src/host/store.ts'
+import { PanelStore } from '../src/host/store.ts'
 import type { PanelDefinition, PanelSource, SourceReading, StreamEvent } from '../src/shared/types.ts'
 
 vi.mock('../src/host/sources.ts', () => ({ runSource: vi.fn() }))
@@ -50,7 +50,7 @@ afterEach(async () => {
 
 async function setup(sources = [source()], withCache = false) {
   const directory = await mkdtemp(join(tmpdir(), 'dsh-pad-concurrency-'))
-  const store = new PanelStore(join(directory, 'panels.json'), true)
+  const store = new PanelStore(join(directory, 'panels.json'))
   const panel = await store.create(definition(...sources))
   const cache = withCache ? new ReadingCache(join(directory, 'readings.json')) : undefined
   const hub = new DataHub(store, async () => undefined, () => {}, { cache })
@@ -64,38 +64,85 @@ async function setup(sources = [source()], withCache = false) {
 }
 
 describe('DataHub source concurrency', () => {
-  it('does not run unapproved sources through runAll', async () => {
-    const directory = await mkdtemp(join(tmpdir(), 'dsh-pad-approval-'))
-    const store = new PanelStore(join(directory, 'panels.json'), false)
+  it('isolates a failed subscriber without rejecting readings or blocking healthy pages', async () => {
+    const { hub, panel, subscriber, dataEvents } = await setup()
+    hub.rewatch(subscriber, new Set([panel.id]))
+    const close = vi.fn()
+    const send = vi.fn((event: StreamEvent) => { if (event.type === 'data') throw new Error('broken transport') })
+    hub.subscribe({ watch: new Set([panel.id]), send, close })
+    const first = hub.runAll(panel.id)
+    pending[0]!.resolve(reading('first'))
+    expect(await first).toEqual([expect.objectContaining({ value: 'first' })])
+    expect(close).toHaveBeenCalledTimes(1)
+    expect(dataEvents()).toHaveLength(1)
+    const second = hub.runAll(panel.id)
+    pending[1]!.resolve(reading('second'))
+    await second
+    expect(dataEvents()).toHaveLength(2)
+    expect(send).toHaveBeenCalledTimes(2) // initial panels + one failing data
+  })
+
+  it('releases a subscriber that fails on its initial snapshot', async () => {
+    const { hub, panel } = await setup()
+    const close = vi.fn(() => { throw new Error('already closed') })
+    expect(() => hub.subscribe({ watch: new Set([panel.id]), send: () => { throw new Error('snapshot') }, close })).not.toThrow()
+    expect(close).toHaveBeenCalledTimes(1)
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
+  it('rearms polling after a rejected source run and catches hidden refresh failures', async () => {
+    const { hub, panel, subscriber, dataEvents } = await setup()
+    vi.mocked(runSource).mockRejectedValueOnce(new Error('unexpected runner failure'))
+    hub.rewatch(subscriber, new Set([panel.id]))
+    await vi.advanceTimersByTimeAsync(0)
+    expect(runSource).toHaveBeenCalledTimes(1)
+    expect(vi.getTimerCount()).toBe(1)
+    await vi.advanceTimersByTimeAsync(10_000)
+    expect(runSource).toHaveBeenCalledTimes(2)
+    const retry = hub.runAll(panel.id)
+    pending[0]!.resolve(reading('recovered'))
+    await retry
+    expect(dataEvents()).toHaveLength(1)
+    hub.rewatch(subscriber, new Set())
+    vi.mocked(runSource).mockRejectedValueOnce(new Error('manual failure'))
+    hub.refresh(panel.id)
+    await vi.advanceTimersByTimeAsync(0)
+    const next = hub.runAll(panel.id)
+    pending[1]!.resolve(reading('manual recovered'))
+    expect(await next).toEqual([expect.objectContaining({ value: 'manual recovered' })])
+  })
+
+  it('runs a panel\'s sources through runAll with no approval step', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'dsh-pad-sources-'))
+    const store = new PanelStore(join(directory, 'panels.json'))
     const panel = await store.create(definition(source()))
     const hub = new DataHub(store, async () => undefined, () => {})
     hubs.push(hub)
     const result = hub.runAll(panel.id)
-    const started = pending[0]
-    // Resolve an accidental start so the failing regression cannot hang.
-    started?.resolve(reading('should not run'))
-    const readings = await result
-    expect(runSource).not.toHaveBeenCalled()
-    expect(readings).toEqual([expect.objectContaining({ id: 'a', ok: false, error: expect.stringMatching(/允许/) })])
+    expect(runSource).toHaveBeenCalledTimes(1)
+    pending[0]!.resolve(reading('ran'))
+    expect(await result).toEqual([expect.objectContaining({ id: 'a', ok: true, value: 'ran' })])
   })
 
-  it('cancels an unchanged source when editing another source withdraws panel approval', async () => {
-    const directory = await mkdtemp(join(tmpdir(), 'dsh-pad-approval-'))
-    const store = new PanelStore(join(directory, 'panels.json'), false)
+  it('keeps an unchanged source running when another source is edited', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'dsh-pad-sources-'))
+    const store = new PanelStore(join(directory, 'panels.json'))
     const panel = await store.create(definition(source('a'), source('b')))
-    await store.approve(panel.id, sourcesFingerprint(panel.definition.sources))
     const cache = new ReadingCache(join(directory, 'readings.json'))
     const hub = new DataHub(store, async () => undefined, () => {}, { cache })
     hubs.push(hub)
     store.onChange(() => hub.storeChanged())
     const active = hub.runAll(panel.id)
     await store.update(panel.id, definition(source('a'), source('b', 'echo changed')))
-    expect(pending[0]!.signal?.aborted).toBe(true)
-    pending[0]!.resolve(reading('unapproved late a'))
-    pending[1]!.resolve(reading('unapproved late b'))
+    // Only the edited source is invalidated; a run of an unchanged source lives on.
+    expect(pending[0]!.signal?.aborted).toBe(false)
+    expect(pending[1]!.signal?.aborted).toBe(true)
+    pending[0]!.resolve(reading('kept a'))
+    pending[1]!.resolve(reading('stale b'))
     await active
-    expect(hub.views()[0]?.data.sources).toEqual({})
-    expect(cache.history(panel.id)).toEqual({})
+    expect(hub.views()[0]?.data.sources).toEqual({ a: expect.objectContaining({ value: 'kept a' }) })
+    expect(cache.history(panel.id)['a']?.map(point => point.value)).toEqual(['kept a'])
+    expect(cache.history(panel.id)['b']).toBeUndefined()
     cache.dispose()
   })
 

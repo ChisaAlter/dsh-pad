@@ -1,8 +1,9 @@
 /**
  * Build both halves of the plugin.
  *
- * - lib/index.js — Host half (Node ESM). Every @deepseek-ai package stays an
- *   import so the running dsh install answers it (peer resolution).
+ * - lib/index.js — Host half (Node ESM). A dependency-free recovery bootstrap
+ *   evaluates the embedded body only after verifying the complete release.
+ *   Platform peers stay external and resolve from the running dsh installation.
  * - lib/client.js — Browser half in the dsh client-module closure format:
  *   `window.__ModuleLoader__.load({ id, factory: (require) => { … } })`.
  *   Only the shell's platform modules are left to the injected `require`;
@@ -10,6 +11,7 @@
  */
 import { readFileSync } from 'node:fs'
 import { build, context } from 'esbuild'
+import { buildHost } from './host-build.mjs'
 
 const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'))
 const watch = process.argv.includes('--watch')
@@ -22,18 +24,6 @@ const PLATFORM_MODULES = [
   '@deepseek-ai/dsh-client-ui-primitives',
   '@deepseek-ai/dsh-client-ui-dockkit',
 ]
-
-const host = {
-  entryPoints: ['src/index.ts'],
-  outfile: 'lib/index.js',
-  bundle: true,
-  format: 'esm',
-  platform: 'node',
-  target: 'node22',
-  sourcemap: 'linked',
-  external: ['@deepseek-ai/*'],
-  logLevel: 'info',
-}
 
 const client = {
   entryPoints: ['src/client/index.ts'],
@@ -54,7 +44,21 @@ const client = {
 }
 
 if (watch) {
-  for (const options of [host, client]) await (await context(options)).watch()
+  // The host build contains two dependent bundles. A small dependency watcher
+  // invokes them together so each rebuild gets matching embedded code and ids.
+  const { watch: watchFiles } = await import('node:fs')
+  let hostBuild = Promise.resolve()
+  let timer
+  const rebuildHost = () => {
+    clearTimeout(timer)
+    timer = setTimeout(() => {
+      hostBuild = hostBuild.catch(() => {}).then(() => buildHost())
+      void hostBuild.catch(error => console.error('[dsh-pad] Host rebuild failed', error))
+    }, 60)
+  }
+  await buildHost()
+  watchFiles(new URL('../src/', import.meta.url), { recursive: true }, rebuildHost)
+  await (await context(client)).watch()
 } else {
-  await Promise.all([build(host), build(client)])
+  await Promise.all([buildHost(), build(client)])
 }

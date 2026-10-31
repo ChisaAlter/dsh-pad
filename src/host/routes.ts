@@ -20,6 +20,14 @@ import { PanelNotFoundError, type PanelStore } from './store.ts'
 import type { UpdateService } from './update.ts'
 
 const HEARTBEAT_MS = 20_000
+/** Total encoded backlog, including the frame held inside ReadableStream. */
+export const MAX_SSE_QUEUED_BYTES = 8 * 1024 * 1024
+export const SSE_STALL_MS = 30_000
+
+interface SseFrame {
+  readonly key: string
+  readonly bytes: Uint8Array
+}
 
 function json(value: unknown, status = 200): Response {
   return new Response(JSON.stringify(value), {
@@ -54,8 +62,6 @@ function parseAction(value: unknown): PanelAction | undefined {
     case 'delete':
     case 'undo':
       return action as PanelAction
-    case 'approve':
-      return typeof action['fingerprint'] === 'string' ? action as PanelAction : undefined
     case 'collapse':
       return typeof action['collapsed'] === 'boolean' ? action as PanelAction : undefined
     case 'move':
@@ -110,55 +116,117 @@ export function registerRoutes({ ctx, store, hub, runOptions, update }: RouteDep
       const watch = new Set(watchParam.split(',').map(id => id.trim()).filter(Boolean))
       const encoder = new TextEncoder()
       let cleanup: (() => void) | undefined
+      let drain: (() => void) | undefined
       const body = new ReadableStream<Uint8Array>({
         start(controller) {
           let open = true
           let unsubscribe: (() => void) | undefined
           let heartbeat: ReturnType<typeof setInterval> | undefined
-          const close = (): void => {
+          let stalled: ReturnType<typeof setTimeout> | undefined
+          let queuedBytes = 0
+          let streamBytes = 0
+          const queue: SseFrame[] = []
+          const close = (error?: Error): void => {
             if (!open) return
             open = false
             clearInterval(heartbeat)
+            clearTimeout(stalled)
+            queue.length = 0
+            queuedBytes = 0
+            streamBytes = 0
             unsubscribe?.()
-            streams.delete(close)
-            request.signal.removeEventListener('abort', close)
+            streams.delete(cleanup!)
+            request.signal.removeEventListener('abort', cleanup!)
             try {
-              controller.close()
+              // Erroring also discards the stream's internal queue on overflow.
+              if (error !== undefined) controller.error(error)
+              else controller.close()
             } catch {
               // Already closed by the consumer.
             }
           }
-          cleanup = close
+          cleanup = () => close()
           if (request.signal.aborted) {
             close()
             return
           }
-          streams.add(close)
-          request.signal.addEventListener('abort', close, { once: true })
-          const write = (text: string): void => {
+          streams.add(cleanup)
+          request.signal.addEventListener('abort', cleanup, { once: true })
+          const updateStall = (): void => {
+            if (!open) return
+            if (queue.length === 0 && (controller.desiredSize ?? 0) > 0) {
+              clearTimeout(stalled)
+              stalled = undefined
+            } else if (stalled === undefined) {
+              stalled = setTimeout(() => close(new Error('SSE 消费过慢，请重新连接')), SSE_STALL_MS)
+            }
+          }
+          drain = (): void => {
             if (!open) return
             try {
-              controller.enqueue(encoder.encode(text))
+              // highWaterMark 1 retains at most one frame inside ReadableStream;
+              // account for it in the same byte budget as the coalescing queue.
+              if ((controller.desiredSize ?? 0) > 0) streamBytes = 0
+              while (queue.length > 0 && (controller.desiredSize ?? 0) > 0) {
+                const frame = queue.shift()!
+                queuedBytes -= frame.bytes.byteLength
+                controller.enqueue(frame.bytes)
+                streamBytes = (controller.desiredSize ?? 0) > 0 ? 0 : frame.bytes.byteLength
+                clearTimeout(stalled)
+                stalled = undefined
+              }
+              updateStall()
             } catch {
               close()
             }
           }
+          const write = (key: string, text: string): void => {
+            if (!open) return
+            const bytes = encoder.encode(text)
+            const previous = queue.findIndex(frame => frame.key === key)
+            if (previous >= 0) queuedBytes -= queue.splice(previous, 1)[0]!.bytes.byteLength
+            if ((controller.desiredSize ?? 0) > 0) streamBytes = 0
+            if (streamBytes + queuedBytes + bytes.byteLength > MAX_SSE_QUEUED_BYTES) {
+              close(new Error('SSE 积压超过上限，请重新连接'))
+              return
+            }
+            queue.push({ key, bytes })
+            queuedBytes += bytes.byteLength
+            drain?.()
+          }
           const subscriber: Subscriber = {
             watch,
-            send: (event: StreamEvent) => write(`data: ${JSON.stringify(event)}\n\n`),
+            close: () => close(new Error('SSE 推送失败，请重新连接')),
+            send: (event: StreamEvent) => {
+              if (!open) return
+              try {
+                // A new full snapshot supersedes every queued data update.
+                const text = `data: ${JSON.stringify(event)}\n\n`
+                if (event.type === 'panels') {
+                  queue.length = 0
+                  queuedBytes = 0
+                }
+                write(event.type === 'data' ? `data:${event.panelId}` : 'panels', text)
+              } catch {
+                close(new Error('SSE 数据无法序列化，请重新连接'))
+              }
+            },
           }
-          write('retry: 3000\n\n')
+          write('retry', 'retry: 3000\n\n')
           unsubscribe = hub.subscribe(subscriber)
           if (!open) {
             unsubscribe()
             return
           }
-          heartbeat = setInterval(() => write(': ping\n\n'), HEARTBEAT_MS)
+          heartbeat = setInterval(() => write('heartbeat', ': ping\n\n'), HEARTBEAT_MS)
+        },
+        pull() {
+          drain?.()
         },
         cancel() {
           cleanup?.()
         },
-      })
+      }, { highWaterMark: 1 })
       return new Response(body, {
         headers: {
           'content-type': 'text/event-stream; charset=utf-8',
@@ -251,11 +319,6 @@ export function registerRoutes({ ctx, store, hub, runOptions, update }: RouteDep
             break
           case 'undo':
             await store.undo(action.panelId)
-            break
-          case 'approve':
-            if (!(await store.approve(action.panelId, action.fingerprint))) {
-              return json({ ok: false, error: '数据源已经变了，请重新确认' }, 409)
-            }
             break
           case 'collapse':
             await store.setCollapsed(action.panelId, action.collapsed)

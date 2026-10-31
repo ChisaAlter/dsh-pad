@@ -5,44 +5,61 @@
  * overwritten: it keeps its normal `git pull && npm run build` workflow.
  */
 import { existsSync } from 'node:fs'
-import { copyFile, mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
-import { dirname, join } from 'node:path'
+import { readFile } from 'node:fs/promises'
+import { join } from 'node:path'
 import type { PadUpdateInfo, PadUpdateResponse } from '../shared/types.ts'
+import { replaceUpdateFiles, UPDATE_FILES, UPDATE_JOURNAL } from './update-transaction.ts'
 
 const REPO = 'ChisaAlter/dsh-pad'
 const RELEASE_FEED = `https://github.com/${REPO}/releases.atom`
 const RAW_ROOT = `https://raw.githubusercontent.com/${REPO}`
 const REQUEST_TIMEOUT_MS = 15_000
 const FIRST_CHECK_DELAY_MS = 7_000
-const UPDATE_FILES = ['lib/index.js', 'lib/client.js', 'package.json', 'cordis.patch.yml'] as const
 
 interface ParsedVersion {
-  readonly parts: readonly [number, number, number]
-  readonly pre?: string
+  readonly parts: readonly string[]
+  readonly pre?: readonly string[]
 }
 
 function parseVersion(value: string): ParsedVersion | undefined {
-  const match = /^v?(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?$/.exec(value.trim())
+  const match = /^v?(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/i.exec(value.trim())
   if (match === null) return undefined
-  return {
-    parts: [Number(match[1]), Number(match[2]), Number(match[3])],
-    ...(match[4] === undefined ? {} : { pre: match[4] }),
-  }
+  const pre = match[4]?.split('.')
+  if (pre?.some(part => /^\d+$/.test(part) && part.length > 1 && part[0] === '0')) return undefined
+  return { parts: [match[1]!, match[2]!, match[3]!], pre }
 }
 
-/** Semver ordering for the release tags this plugin uses; 0 for equal, NaN-ish input sorts as equal. */
+/** Compare decimal identifiers without losing precision for long numeric tags. */
+function compareNumeric(left: string, right: string): number {
+  if (left.length !== right.length) return left.length < right.length ? -1 : 1
+  return left === right ? 0 : left < right ? -1 : 1
+}
+
+/** SemVer precedence (build metadata is ignored); invalid input sorts as equal. */
 export function compareVersions(left: string, right: string): number {
   const a = parseVersion(left)
   const b = parseVersion(right)
   if (a === undefined || b === undefined) return 0
   for (let index = 0; index < 3; index += 1) {
-    const delta = (a.parts[index] ?? 0) - (b.parts[index] ?? 0)
+    const delta = compareNumeric(a.parts[index]!, b.parts[index]!)
     if (delta !== 0) return delta
   }
-  if (a.pre === b.pre) return 0
+  if (a.pre === undefined && b.pre === undefined) return 0
   if (a.pre === undefined) return 1
   if (b.pre === undefined) return -1
-  return a.pre < b.pre ? -1 : 1
+  for (let index = 0; index < Math.max(a.pre.length, b.pre.length); index += 1) {
+    const leftPart = a.pre[index]
+    const rightPart = b.pre[index]
+    if (leftPart === rightPart) continue
+    if (leftPart === undefined) return -1
+    if (rightPart === undefined) return 1
+    const leftNumeric = /^\d+$/.test(leftPart)
+    const rightNumeric = /^\d+$/.test(rightPart)
+    if (leftNumeric && rightNumeric) return compareNumeric(leftPart, rightPart)
+    if (leftNumeric !== rightNumeric) return leftNumeric ? -1 : 1
+    return leftPart < rightPart ? -1 : 1
+  }
+  return 0
 }
 
 export interface UpdateServiceOptions {
@@ -90,6 +107,7 @@ export class UpdateService {
       canApply: false,
       reason: this.enabled ? 'unchecked' : 'disabled',
     }
+    this.pendingRecovery()
   }
 
   start(): void {
@@ -122,7 +140,7 @@ export class UpdateService {
   }
 
   async check(force = false): Promise<PadUpdateInfo> {
-    if (!this.enabled || this.applied !== undefined) return this.state
+    if (this.pendingRecovery() || !this.enabled || this.applied !== undefined) return this.state
     if (this.checking !== undefined) return this.checking
     if (!force && this.state.checkedAt !== undefined && Date.now() - Date.parse(this.state.checkedAt) < this.checkHours * 60 * 60 * 1000) {
       return this.state
@@ -144,6 +162,9 @@ export class UpdateService {
       })
       if (!response.ok) throw new Error(`GitHub ${response.status}`)
       const xml = await response.text()
+      // A check that started before apply must not replace its committed or
+      // pending-recovery status when the delayed feed finally settles.
+      if (this.applied !== undefined || this.state.requiresRestart || this.pendingRecovery()) return this.state
       // The newest entry is first; its <link> is the release tag page.
       const match = /<entry>[\s\S]*?<link[^>]+href="([^"]+\/releases\/tag\/([^"/]+))"/.exec(xml)
       const tag = match?.[2] ?? ''
@@ -160,7 +181,9 @@ export class UpdateService {
         url,
         checkedAt: new Date().toISOString(),
       }
+      this.pendingRecovery()
     } catch (error) {
+      if (this.applied !== undefined || this.state.requiresRestart || this.pendingRecovery()) return this.state
       this.state = {
         ...this.state,
         available: false,
@@ -184,6 +207,7 @@ export class UpdateService {
   }
 
   private async replaceFiles(): Promise<PadUpdateResponse> {
+    if (this.pendingRecovery()) return { ok: false, update: this.state, error: this.state.error }
     const latest = this.state.latest
     const tag = this.tag
     if (!this.state.available || latest === undefined || tag === undefined) {
@@ -220,39 +244,17 @@ export class UpdateService {
       return this.fail(`校验失败：${error instanceof Error ? error.message : String(error)}`)
     }
 
-    const backup = join(this.root, '.dsh-pad-update-backup', new Date().toISOString().replace(/[:.]/g, '-'))
     try {
-      await mkdir(backup, { recursive: true })
-      for (const file of UPDATE_FILES) {
-        const target = join(this.root, file)
-        if (existsSync(target)) {
-          await mkdir(dirname(join(backup, file)), { recursive: true })
-          await copyFile(target, join(backup, file))
-        }
-      }
+      await replaceUpdateFiles(this.root, contents)
     } catch (error) {
-      // No installed file has changed yet. A partial/missing backup must never
-      // be used to restore: absent entries would delete the originals.
-      return this.fail(`备份失败：${error instanceof Error ? error.message : String(error)}`)
-    }
-    try {
-      for (const file of UPDATE_FILES) {
-        const content = contents.get(file)
-        if (content === undefined) continue
-        const target = join(this.root, file)
-        await mkdir(dirname(target), { recursive: true })
-        const temp = `${target}.update-${process.pid}`
-        await writeFile(temp, content, 'utf8')
-        try {
-          await rename(temp, target)
-        } catch {
-          await rm(target, { force: true })
-          await rename(temp, target)
-        }
+      const pending = existsSync(join(this.root, UPDATE_JOURNAL))
+      if (pending) {
+        this.state = { ...this.state, canApply: false, reason: 'error', requiresRestart: true }
       }
-    } catch (error) {
-      await this.restore(backup)
-      return this.fail(`写入失败：${error instanceof Error ? error.message : String(error)}`)
+      const detail = error instanceof Error ? error.message : String(error)
+      return this.fail(pending
+        ? `更新未完成，请重启以恢复完整更新：${detail}`
+        : `准备更新失败（原文件未改动）：${detail}`)
     }
 
     this.applied = latest
@@ -268,17 +270,13 @@ export class UpdateService {
     return { ok: true, update: this.state }
   }
 
-  private async restore(backup: string): Promise<void> {
-    for (const file of UPDATE_FILES) {
-      const saved = join(backup, file)
-      const target = join(this.root, file)
-      try {
-        if (existsSync(saved)) await copyFile(saved, target)
-        else await rm(target, { force: true })
-      } catch {
-        // Keep trying the remaining files; the update route reports the first error.
-      }
+  private pendingRecovery(): boolean {
+    if (!existsSync(join(this.root, UPDATE_JOURNAL))) return false
+    this.state = {
+      ...this.state, available: false, canApply: false, reason: 'error', requiresRestart: true,
+      error: '更新未完成，请重启以恢复完整更新',
     }
+    return true
   }
 
   private fail(error: string): PadUpdateResponse {

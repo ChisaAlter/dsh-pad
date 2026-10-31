@@ -27,8 +27,6 @@ export const inject = ['tools', 'connection']
 export interface Config {
   /** Where panels are stored. Defaults to `$DSH_HOME/dsh-pad/panels.json`. */
   dataFile?: string
-  /** Run new or changed data sources without asking the user. */
-  autoApprove: boolean
   /** Shortest poll interval for direct sources, in seconds. */
   minIntervalSec: number
   /** Allow panels refreshed by a background agent turn. */
@@ -57,7 +55,6 @@ export interface Config {
 
 export const Config: Schema<Config> = Schema.object({
   dataFile: Schema.string().description('面板存储文件，默认 $DSH_HOME/dsh-pad/panels.json'),
-  autoApprove: Schema.boolean().default(false).description('新建或修改数据源时不再询问，直接运行'),
   minIntervalSec: Schema.natural().min(1).default(2).description('直接数据源的最短刷新间隔（秒）'),
   agentRefresh: Schema.boolean().default(true).description('允许由后台 AI 定时刷新的面板'),
   minAgentMinutes: Schema.natural().min(1).default(15).description('AI 刷新的最短间隔（分钟）'),
@@ -82,7 +79,8 @@ function defaultDataFile(): string {
  *
  * The load must never take the Host down: a panel dock is a convenience, and a
  * broken install has to degrade to "no dock" instead of "dsh will not start".
- * Any failure is logged and swallowed so dsh keeps booting.
+ * Cordis contains activation failures and rolls back the plugin's effects.
+ * Report failures to it so a failed dock cannot retain live routes or timers.
  * @param ctx - Host context with `tools` and `connection`.
  * @param config - resolved plugin config.
  */
@@ -90,7 +88,8 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   try {
     await start(ctx, config)
   } catch (error) {
-    console.error('[dsh-pad] 插件启动失败，面板坞已禁用，dsh 继续启动。在插件目录运行 `node scripts/doctor.mjs` 自检：', error)
+    console.error('[dsh-pad] 插件启动失败，正在回滚面板坞，dsh 继续启动。在插件目录运行 `node scripts/doctor.mjs` 自检：', error)
+    throw error
   }
 }
 
@@ -101,7 +100,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
  */
 async function start(ctx: Context, config: Config): Promise<void> {
   const dataFile = config.dataFile ?? defaultDataFile()
-  const store = new PanelStore(dataFile, config.autoApprove)
+  const store = new PanelStore(dataFile)
   await store.load()
 
   // The newest reading of every source is kept next to the panels, so a
@@ -180,7 +179,6 @@ async function start(ctx: Context, config: Config): Promise<void> {
     hub,
     refresher,
     limits: { minIntervalSec: config.minIntervalSec, minAgentMinutes: config.minAgentMinutes },
-    autoApprove: config.autoApprove,
     resolveSecret,
   })
 }

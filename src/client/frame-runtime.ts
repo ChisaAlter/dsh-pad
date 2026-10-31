@@ -209,6 +209,64 @@ export const FRAME_RUNTIME = String.raw`
     }
   };
 
+  /** is-ok / is-warn / … from a short tone word, for the kit's classes. */
+  function toneClass(tone) {
+    return tone === 'ok' || tone === 'warn' || tone === 'danger' || tone === 'live' ? ' is-' + tone : '';
+  }
+  /** Only semantic tones and the exact token values returned by dsh.tone. */
+  function toneColor(tone) {
+    if (tone === 'ok' || tone === 'var(--pad-ok)') return 'var(--pad-ok)';
+    if (tone === 'warn' || tone === 'var(--pad-warn)') return 'var(--pad-warn)';
+    if (tone === 'danger' || tone === 'var(--pad-danger)') return 'var(--pad-danger)';
+    if (tone === 'accent' || tone === 'var(--pad-accent)') return 'var(--pad-accent)';
+    return '';
+  }
+  // Markup builders for the panel kit (see shared/kit.ts). They exist so the
+  // common card shapes are written once, escaped correctly, and stay in step
+  // with the CSS instead of being hand-assembled per panel.
+  var ui = {
+    metric: function (opt) {
+      opt = opt || {};
+      var tone = toneColor(opt.tone);
+      var color = tone ? ' style="color:' + esc(tone) + '"' : '';
+      return '<div class="pad-metric">' +
+        (opt.label != null ? '<span class="pad-label">' + esc(opt.label) + '</span>' : '') +
+        '<span class="pad-metric-value"' + color + '>' + esc(opt.value == null ? '—' : opt.value) +
+          (opt.unit != null ? '<span class="pad-unit">' + esc(opt.unit) + '</span>' : '') +
+        '</span>' +
+        (opt.foot != null ? '<span class="pad-foot">' + esc(opt.foot) + '</span>' : '') +
+        '</div>';
+    },
+    item: function (row) {
+      row = row || {};
+      var f = Number(row.meter);
+      var meter = isFinite(f)
+        ? '<span class="pad-meter' + toneClass(row.tone) + '"><i style="width:' + (clamp01(f) * 100).toFixed(1) + '%"></i></span>'
+        : '';
+      return '<div class="pad-item">' +
+        '<span class="pad-item-name">' + esc(row.name) + '</span>' +
+        '<span class="pad-item-value">' + esc(row.value == null ? '—' : row.value) + '</span>' +
+        (row.foot != null ? '<span class="pad-foot pad-item-foot">' + esc(row.foot) + '</span>' : '') +
+        meter +
+        '</div>';
+    },
+    list: function (items) {
+      return '<div class="pad-list">' + (items || []).map(ui.item).join('') + '</div>';
+    },
+    status: function (label, tone) {
+      return '<span class="pad-status' + toneClass(tone) + '">' + esc(label) + '</span>';
+    },
+    chip: function (text, tone) {
+      return '<span class="pad-chip' + toneClass(tone) + '">' + esc(text) + '</span>';
+    },
+    empty: function (text) {
+      return '<p class="pad-empty">' + esc(text == null ? '等待数据' : text) + '</p>';
+    },
+    alert: function (text) {
+      return '<p class="pad-alert">' + esc(text) + '</p>';
+    }
+  };
+
   var dsh = {
     get data() { return current; },
     onData: function (fn) {
@@ -254,7 +312,8 @@ export const FRAME_RUNTIME = String.raw`
     },
     escape: esc,
     fmt: fmt,
-    chart: chart
+    chart: chart,
+    ui: ui
   };
   window.dsh = dsh;
   post({ kind: 'ready' });

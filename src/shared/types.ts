@@ -88,11 +88,6 @@ export interface PanelRecord {
   readonly definition: PanelDefinition
   /** The definition before the last edit, for undo. */
   readonly previous?: PanelDefinition
-  /**
-   * Fingerprint of the sources the user allowed to run. Sources only run when
-   * it equals the fingerprint of the current definition's sources.
-   */
-  readonly approvedSources?: string
   /** Latest data submitted by the model (in chat or by an agent refresh). */
   readonly agentData?: { readonly value: Json, readonly at: string }
   readonly agentRun?: AgentRunState
@@ -130,10 +125,6 @@ export interface PanelView {
   readonly updatedAt: string
   readonly definition: PanelDefinition
   readonly canUndo: boolean
-  /** Sources wait for the user's approval before running. */
-  readonly needsApproval: boolean
-  /** Fingerprint of the current sources; echoed back by the `approve` action. */
-  readonly fingerprint: string
   readonly agentRun: AgentRunState | null
   readonly data: PanelData
   /**
@@ -216,7 +207,6 @@ export type PanelAction =
   | { readonly op: 'refresh', readonly panelId: string }
   | { readonly op: 'delete', readonly panelId: string }
   | { readonly op: 'undo', readonly panelId: string }
-  | { readonly op: 'approve', readonly panelId: string, readonly fingerprint: string }
   | { readonly op: 'collapse', readonly panelId: string, readonly collapsed: boolean }
   | { readonly op: 'move', readonly panelId: string, readonly delta: -1 | 1 }
   | { readonly op: 'span', readonly panelId: string, readonly span: 1 | 2 | 3 }

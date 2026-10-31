@@ -16,7 +16,19 @@
   - **直接数据源**：在本机跑 shell 命令，或者从本机请求 HTTP 接口，按秒级间隔刷新，不消耗 token。适合服务器性能、套餐余额这类接口数据。
   - **AI 刷新**：按间隔在后台跑一轮 agent，让它重新取数后提交。适合只能靠搜索、读网页、多步推理才拿得到的数据。
 - **面板内模型**：面板里的按钮可以调用 `dsh.run(prompt)`，用这张面板自己的模型跑一次并把结果显示在卡片里；也支持 AI 刷新用同一模型。
-- **安全**：新建或修改数据源时，会弹 dsh 自带的审批（「允许一次 / 拒绝」）。拒绝后，面板上会留一个「允许运行」按钮。密钥用 `{{env:NAME}}` 引用，只在宿主侧解析，不会发到浏览器。
+- **建好就跑**：数据源不设「允许运行」这一步——面板建好或改好后立刻开始取数，用户不需要在卡片上点任何按钮。也就是说模型写进面板的命令会直接在本机执行，和所有能跑命令的工具一样，请只在信任当前对话的前提下使用。密钥用 `{{env:NAME}}` 引用，只在宿主侧解析，不会发到浏览器。
+
+## 面板长什么样
+
+面板不是一页报告，是一张 200–400px 的卡片：一个数字、几行数据、一条趋势。为了让它每次都是这样，插件在三处下了手：
+
+- **面板 kit**：沙箱 iframe 里预置了一组 `pad-*` 类（`.pad-metric` / `.pad-item` / `.pad-meter` / `.pad-status` / `.pad-spark` …）和 `dsh.ui.metric` / `dsh.ui.list` 之类的生成器。颜色全部走 `--pad-*` 令牌，亮色 / 暗色自动跟随，面板不需要（也不应该）写死颜色。
+- **版式手册**：`pad_guide` 把五种版式——单值 + 趋势、排行 / 分布、状态板、额度环、动态列表——和四套完整的 `html` + `script` 配方交给模型，写面板之前先选版式、再写代码。
+- **排版检查**：`pad_create` / `pad_update` 会跑一遍确定性的 lint。文字墙、长段落、把 JSON 贴到卡片上、只有文字没有可视元素，直接退回重写；写死颜色、全大写 + 加字距的标签、脚本不处理取数失败，作为警告报给模型。
+
+卡片里的一切仍然由模型写的 HTML / CSS / JS 决定，kit 只是它的起点；lint 拦的是「读不出信息」的排版，不是某种审美。
+
+![面板 kit 的四种版式（亮色 / 暗色）](docs/images/panel-kit.png)
 
 面板模型参考了 [ChisaBot](https://github.com/ChisaAlter/ChisaBot) 的两种面板：沙箱 HTML 自定义面板，以及机器人定时刷新的实时面板。
 
@@ -52,7 +64,7 @@ node scripts/doctor.mjs
 dsh plugin --profile web add /path/to/dsh-pad
 
 # 从 GitHub（仓库里带着构建好的 lib/，不需要跑构建脚本）
-dsh plugin --profile web add github:ChisaAlter/dsh-pad#v0.3.2
+dsh plugin --profile web add github:ChisaAlter/dsh-pad#v0.4.5
 ```
 
 `lib/index.js` 与 `lib/client.js` 是唯一的运行入口，本仓库把它们提交进 git，就是为了让 GitHub 安装不依赖构建脚本（pnpm 会默认拒绝执行依赖的构建脚本）。改了源码就先在插件目录跑 `npm install && npm run build`，再安装。
@@ -65,8 +77,10 @@ dsh plugin --profile web add github:ChisaAlter/dsh-pad#v0.3.2
 
 1. 面板坞顶部出现下载图标（没有新版本时不显示）；
 2. 点开，看到当前版本和新版本，点「更新」；
-3. 插件从 Release 下载构建好的 `lib/index.js`、`lib/client.js`、`package.json` 和 `cordis.patch.yml`，先备份到 `.dsh-pad-update-backup/`；
-4. 重启 `dsh web` / 鲸屿后生效。
+3. 插件先下载并校验完整的 `lib/index.js`、`lib/client.js`、`package.json` 和 `cordis.patch.yml`，备份到 `.dsh-pad-update-backup/`，记录更新事务后再替换；
+4. 重启 `dsh web` / 鲸屿后生效。更新中断时，加载入口会先完成已记录的事务；暂存文件损坏会阻止插件加载，避免使用混合版本。
+
+事务恢复从 0.4.5 的更新器开始生效。旧版更新器首次升级到 0.4.5 时仍沿用旧流程，建议关闭应用后安装完整版本。
 
 如果当前是**开发目录链接**安装（插件目录里有 `.git/`），自动更新只提示新版本，不会覆盖源码；请在插件目录执行 `git pull && npm run build`。更新面板里的「重新检查」可以立即查一次；关闭后台检查设 `updateCheck: false`。
 
@@ -134,9 +148,9 @@ dsh plugin --profile web add github:ChisaAlter/dsh-pad#v0.3.2
 }
 ```
 
-- **直接数据源**只在面板坞展开、卡片没折叠时才轮询；关掉浏览器或收起成悬浮球后宿主上就不再跑。命令输出上限 512KB，默认超时 10 秒。
+- **直接数据源**在展开的卡片或放大视图可见时轮询；所有客户端都关闭、或面板坞收起后停止轮询。命令与 HTTP 输出上限 512KB，默认超时 10 秒；解析后的 JSON 最多 64 层、100,000 个节点。
 - **重启后先显示上次的数值**：每个数据源最近一次成功读数、以及最近 20 个点写在 `$DSH_HOME/dsh-pad/readings.json`（10 秒合并写一次，单条 JSON 超过 16KB 不缓存，单个数据源的历史最多留 128KB，数据源改过之后旧读数自动作废）。面板坞一展开就先拿它渲染，趋势图也直接有历史，第一次轮询回来再接着往后画；这个文件只是缓存，删掉只会让面板重新等第一次读数。
-- **密钥**：`{{env:NAME}}` 先从 dsh 凭据服务里解析，没有再读宿主进程的环境变量。错误信息里出现的密钥值会被替换成 `***`。
+- **密钥**：`{{env:NAME}}` 先从 dsh 凭据服务里解析，没有再读宿主进程的环境变量。错误信息里出现的密钥值会被替换成 `***`。带密钥引用、自定义敏感头或请求体的 HTTP 请求只跟随同 origin 重定向；跨 origin 时返回错误，请直接配置可信目标网址。
 - **AI 刷新**：后台 agent 默认使用 dsh 的默认模型和默认 agent 预设（有 web_fetch / web_search 等工具），另外只多两个工具：`pad_submit_data` 和 `pad_report_failure`。面板可以带顶层 `model`（`{ provider, model, reasoningEffort? }`）单独指定模型；不写就跟随全局默认。这个模型同时用于面板里的 `dsh.run`。卡片 ⋯ 菜单里的「面板模型」可以直接切换。它只看得到 `instruction` 和上一次提交的数据。单轮最长 5 分钟（可配置），失败后过一段时间重试，原因会显示在卡片上。
 - **面板脚本**在 `sandbox="allow-scripts"` 的 iframe 里运行：不和 dsh 同源，CSP 是 `default-src 'none'`，没有网络，拿不到 cookie 和存储，也访问不到父页面。唯一的出口是 `window.dsh`：
 
@@ -155,15 +169,16 @@ dsh plugin --profile web add github:ChisaAlter/dsh-pad#v0.3.2
 
 主题变量：`--pad-fg` `--pad-fg-2` `--pad-fg-3` `--pad-bg` `--pad-bg-2` `--pad-border` `--pad-accent` `--pad-ok` `--pad-warn` `--pad-danger` `--pad-font` `--pad-mono` `--pad-radius`。
 
-给模型的完整编写指南在 `src/host/guide.ts`，作为 `pad_create` 工具说明的一部分发给模型。
+给模型的编写手册在 `src/host/guide.ts`：短版作为 `pad_create` 的工具说明常驻，完整版（版式、kit、配方、dsh API）由 `pad_guide` 按需返回。
 
 ## 模型可用的工具
 
 | 工具 | 作用 |
 |---|---|
 | `pad_list` / `pad_get` | 列出面板 / 读完整定义和最新数据 |
-| `pad_test_source` | 试跑一个数据源（需要审批），先看清输出格式再写脚本 |
-| `pad_create` / `pad_update` | 新建 / 修改（只传要改的字段）；数据源变了才重新审批 |
+| `pad_guide` | 版式手册：五种版式、kit 类名、完整配方、`dsh` API、取数方式 |
+| `pad_test_source` | 试跑一个数据源，先看清输出格式再写脚本 |
+| `pad_create` / `pad_update` | 新建 / 修改（只传要改的字段），返回排版检查结果和首次读数 |
 | `pad_models` | 列出可用于面板的 provider / 模型 / 推理强度，以及全局默认模型 |
 | `pad_refresh` | 立即刷新，并返回读数，修好面板后用来验证 |
 | `pad_delete` | 删除 |
@@ -176,14 +191,12 @@ dsh plugin --profile web add github:ChisaAlter/dsh-pad#v0.3.2
 - id: dsh-pad
   name: dsh-pad
   config:
-    autoApprove: false
     minIntervalSec: 2
 ```
 
 | 键 | 默认 | 说明 |
 |---|---|---|
 | `dataFile` | `$DSH_HOME/dsh-pad/panels.json` | 面板存储位置 |
-| `autoApprove` | `false` | 新建 / 修改数据源时不再询问 |
 | `minIntervalSec` | `2` | 直接数据源最短刷新间隔（秒） |
 | `agentRefresh` | `true` | 是否允许 AI 刷新的面板 |
 | `minAgentMinutes` | `15` | AI 刷新最短间隔（分钟） |
@@ -202,7 +215,7 @@ dsh plugin --profile web add github:ChisaAlter/dsh-pad#v0.3.2
 - 面板存在 `$DSH_HOME/dsh-pad/panels.json`；每个数据源最近一次成功读数和最近 20 个点存在同目录的 `readings.json`（只为重启后立刻有画面和趋势，可随时删除）；悬浮球位置、窗口位置 / 宽度 / 高度、嵌套分区和分隔比例按浏览器存在 localStorage。
 - 每次 AI 刷新都是一个独立的 dsh 会话，工作目录是 `$DSH_HOME/dsh-pad/refresh`。dsh 目前不提供删除会话的接口，所以这些会话日志会留在 `$DSH_HOME/sessions/` 下对应这个目录的子目录里（每轮大约十几 KB）。它们不会出现在侧栏，需要清理时手动删除即可。
 - 后台刷新的 agent 没有人在线审批，所以需要审批的工具调用（比如 workspace-write 模式下的 shell 命令）会被拒绝。AI 刷新适合用 web_fetch / web_search 取数；本机命令请用直接数据源。
-- 在 dsh 0.2.1-rc.2 的 Web 界面（`dsh web`）与鲸屿桌面端上验证过：安装后宿主半激活、8 个 `pad_*` 工具注册、六个 `/api/dsh-pad.*` 路由可用，客户端面板坞在无头 Chrome 中渲染无异常。dsh 的插件 API 还在快速变化。悬浮坞挂在 dsh 的 `shell.overlay` 槽位；宽屏让位是给外框（`data-titlebar-density`）加 `padding-right`，右侧面板因此一起左移、不会被坞盖住；回合导航条则在 `@container` 里按对话宽度（≥ 800px）重新显示。dsh 以后改掉这些属性或类名，最坏也只是退化成纯悬浮、导航条按 dsh 自己的规则隐藏，不会坏。
+- 在 dsh 0.2.1-rc.2 的 Web 界面（`dsh web`）与鲸屿桌面端上验证过：安装后宿主半激活、9 个 `pad_*` 工具注册、六个 `/api/dsh-pad.*` 路由可用，客户端面板坞在无头 Chrome 中渲染无异常。dsh 的插件 API 还在快速变化。悬浮坞挂在 dsh 的 `shell.overlay` 槽位；宽屏让位是给外框（`data-titlebar-density`）加 `padding-right`，右侧面板因此一起左移、不会被坞盖住；回合导航条则在 `@container` 里按对话宽度（≥ 800px）重新显示。dsh 以后改掉这些属性或类名，最坏也只是退化成纯悬浮、导航条按 dsh 自己的规则隐藏，不会坏。
 
 ## 开发
 
@@ -219,7 +232,7 @@ npm run doctor     # 安装前后自检：lib/、exports、profile 登记与残�
 src/
   index.ts            宿主插件入口：配置、存储、调度、路由、工具
   host/
-    store.ts          面板存储（JSON 文件、撤销、审批指纹）
+    store.ts          面板存储（JSON 文件、撤销、布局位置）
     sources.ts        命令 / HTTP 数据源执行、密钥填充与脱敏
     hub.ts            按订阅轮询，向浏览器推送 SSE
     agent-refresh.ts  后台 AI 刷新
@@ -227,7 +240,8 @@ src/
     run.ts            面板内 dsh.run 的一次性模型调用
     update.ts         检查 GitHub Release，按点击下载替换 lib/
     tools.ts          pad_* 工具
-    guide.ts          给模型的编写指南
+    lint.ts           排版检查：文字墙 / 长段落 / 贴 JSON / 没有可视元素
+    guide.ts          给模型的编写指南与版式手册（pad_guide）
     routes.ts         /api/dsh-pad.{panels,stream,action,models,run,update}（经 dsh Connection 认证）
   client/
     index.ts          浏览器插件入口：shell.overlay 悬浮坞 + 输入框桥接
@@ -235,9 +249,12 @@ src/
     PanelCard.tsx     卡片
     PanelFrame.tsx    沙箱 iframe
     layout.ts         嵌套分区树（上下 / 左右分栏、拖放插入、迁移旧布局）
-    frame-runtime.ts  iframe 内的 window.dsh
+    frame-runtime.ts  iframe 内的 window.dsh（含 dsh.ui 生成器）
     pad-client.ts     SSE 连接、历史、布局
-  shared/             两半共用的类型与校验
+  shared/
+    types.ts          两半共用的类型
+    validate.ts       面板定义校验
+    kit.ts            面板 kit：预置 CSS 与可视元素清单（iframe 与 lint 共用）
 examples/             面板定义示例
 tests/                单元测试（vitest）
 ```
@@ -245,6 +262,8 @@ tests/                单元测试（vitest）
 ## 致谢
 
 感谢 [Linux.do](https://linux.do)（L 站）社区的支持、讨论和反馈，也感谢 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) 与 [ChisaBot](https://github.com/ChisaAlter/ChisaBot) 在面板形态上的启发。
+
+面板的设计约束参考了两处：版式与视觉方向取自 [TheInternetDesigns](https://theinternetdesigns.com/) 上收集的界面风格，反「AI 味」的硬性规则（不做 eyebrow、不用追踪大写标签、不堆文字、不编数据、状态不用 emoji）取自 [Nutlope/hallmark](https://github.com/Nutlope/hallmark) 的 Floor。
 
 ## 许可
 

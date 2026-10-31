@@ -19,8 +19,21 @@ function clampSpan(value: unknown): 1 | 2 | 3 {
 }
 
 /**
- * Fingerprint of what a panel runs on the Host. Editing html, css or script
- * keeps it; touching any source changes it and withdraws the user's approval.
+ * Drop fields an earlier version wrote that this one no longer reads. A whole
+ * record is written back on every commit, so a dead key would otherwise be
+ * carried in `panels.json` forever.
+ * @param panel - one record as stored.
+ * @returns the record with the removed fields stripped.
+ */
+function migrate(panel: PanelRecord & { readonly approvedSources?: string }): PanelRecord {
+  const { approvedSources: _removedApproval, ...rest } = panel
+  return { ...rest, span: clampSpan(rest.span) }
+}
+
+/**
+ * Fingerprint of what a panel runs on the Host: the readings cache key and the
+ * hub's run identity for a source. Editing html, css or script keeps it;
+ * touching any source changes it.
  * @param sources - the definition's sources.
  * @returns a hex digest, or `''` when there is nothing to run.
  */
@@ -45,7 +58,7 @@ export class PanelStore {
   private writing: Promise<void> = Promise.resolve()
   private readonly listeners = new Set<() => void>()
 
-  constructor(private readonly file: string, private readonly autoApprove: boolean) {}
+  constructor(private readonly file: string) {}
 
   /** Load the file; a missing file is an empty store, a corrupt one is kept aside. */
   async load(): Promise<void> {
@@ -60,7 +73,7 @@ export class PanelStore {
       const parsed = JSON.parse(text) as StoreFile
       this.panels = [...parsed.panels]
         .sort((a, b) => a.position - b.position)
-        .map(panel => ({ ...panel, span: clampSpan(panel.span) }))
+        .map(migrate)
     } catch {
       await rename(this.file, `${this.file}.corrupt-${Date.now()}`)
       this.panels = []
@@ -87,111 +100,100 @@ export class PanelStore {
     return this.panels.find(p => p.id === id)
   }
 
-  /** Whether the panel's current sources may run. */
-  approved(panel: PanelRecord): boolean {
-    const fingerprint = sourcesFingerprint(panel.definition.sources)
-    return fingerprint === '' || panel.approvedSources === fingerprint
-  }
-
   async create(definition: PanelDefinition, data?: Json): Promise<PanelRecord> {
-    // Safety net: a store must never hold two panels with the same title.
-    // Callers are expected to resolve duplicates themselves, but if one slips
-    // through we fold the request into the existing record instead of
-    // silently minting a second card for the user to clean up.
-    const existing = this.panels.find(p => p.definition.title === definition.title)
-    if (existing !== undefined) return this.update(existing.id, definition, data)
-    const now = new Date().toISOString()
-    const panel: PanelRecord = {
-      id: `p_${randomUUID().slice(0, 8)}`,
-      version: 1,
-      position: this.panels.length === 0 ? 0 : Math.max(...this.panels.map(p => p.position)) + 1,
-      collapsed: false,
-      span: 1,
-      createdAt: now,
-      updatedAt: now,
-      definition,
-      ...(this.autoApprove ? { approvedSources: sourcesFingerprint(definition.sources) } : {}),
-      ...(data === undefined ? {} : { agentData: { value: data, at: now } }),
-      ...(definition.agent ? { agentRun: { status: 'idle', nextRunAt: nextRun(definition, now) } } : {}),
-    }
-    await this.commit([...this.panels, panel])
-    return panel
+    return this.transaction(async () => {
+      // Resolve duplicates inside the transaction, including concurrent creates.
+      const existing = this.panels.find(p => p.definition.title === definition.title)
+      if (existing !== undefined) return this.replaceDefinition(existing, definition, data)
+      const now = new Date().toISOString()
+      const panel: PanelRecord = {
+        id: `p_${randomUUID().slice(0, 8)}`,
+        version: 1,
+        position: this.panels.length === 0 ? 0 : Math.max(...this.panels.map(p => p.position)) + 1,
+        collapsed: false,
+        span: 1,
+        createdAt: now,
+        updatedAt: now,
+        definition,
+        ...(data === undefined ? {} : { agentData: { value: data, at: now } }),
+        ...(definition.agent ? { agentRun: { status: 'idle', nextRunAt: nextRun(definition, now) } } : {}),
+      }
+      await this.commit([...this.panels, panel])
+      return panel
+    })
   }
 
   async update(id: string, definition: PanelDefinition, data?: Json): Promise<PanelRecord> {
-    const current = this.get(id)
-    const now = new Date().toISOString()
-    const scheduleChanged = JSON.stringify(current.definition.agent ?? null) !== JSON.stringify(definition.agent ?? null)
-    const next: PanelRecord = {
-      ...current,
-      version: current.version + 1,
-      updatedAt: now,
-      definition,
-      previous: current.definition,
-      ...(this.autoApprove ? { approvedSources: sourcesFingerprint(definition.sources) } : {}),
-      ...(data === undefined ? {} : { agentData: { value: data, at: now } }),
-      ...(scheduleChanged
-        ? { agentRun: definition.agent ? { status: 'idle' as const, nextRunAt: nextRun(definition, now) } : undefined }
-        : {}),
-    }
-    await this.replace(next)
-    return next
+    return this.updateDefinition(id, () => definition, data)
+  }
+
+  /** Apply a synchronous, validated edit to the latest committed definition. */
+  async updateDefinition(id: string, edit: (current: PanelRecord) => PanelDefinition, data?: Json): Promise<PanelRecord> {
+    return this.transaction(() => {
+      const current = this.get(id)
+      return this.replaceDefinition(current, edit(current), data)
+    })
   }
 
   async undo(id: string): Promise<PanelRecord> {
-    const current = this.get(id)
-    if (current.previous === undefined) throw new Error('这个面板没有可以撤销的修改')
-    const { previous: _dropped, ...rest } = current
-    const previous = current.previous
-    const now = new Date().toISOString()
-    const scheduleChanged = JSON.stringify(current.definition.agent ?? null) !== JSON.stringify(previous.agent ?? null)
-    const next: PanelRecord = {
-      ...rest,
-      version: current.version + 1,
-      updatedAt: now,
-      definition: previous,
-      ...(scheduleChanged
-        ? { agentRun: previous.agent ? { status: 'idle' as const, nextRunAt: nextRun(previous, now) } : undefined }
-        : {}),
-    }
-    await this.replace(next)
-    return next
+    return this.transaction(async () => {
+      const current = this.get(id)
+      if (current.previous === undefined) throw new Error('这个面板没有可以撤销的修改')
+      const { previous: _dropped, ...rest } = current
+      const previous = current.previous
+      const now = new Date().toISOString()
+      const scheduleChanged = JSON.stringify(current.definition.agent ?? null) !== JSON.stringify(previous.agent ?? null)
+      const next: PanelRecord = {
+        ...rest,
+        version: current.version + 1,
+        updatedAt: now,
+        definition: previous,
+        ...(scheduleChanged
+          ? { agentRun: previous.agent ? { status: 'idle' as const, nextRunAt: nextRun(previous, now) } : undefined }
+          : {}),
+      }
+      await this.replace(next)
+      return next
+    })
   }
 
   async remove(id: string): Promise<void> {
-    this.get(id)
-    await this.commit(this.panels.filter(p => p.id !== id))
-  }
-
-  async approve(id: string, fingerprint: string): Promise<boolean> {
-    const current = this.get(id)
-    if (sourcesFingerprint(current.definition.sources) !== fingerprint) return false
-    await this.replace({ ...current, approvedSources: fingerprint })
-    return true
+    return this.transaction(async () => {
+      this.get(id)
+      await this.commit(this.panels.filter(p => p.id !== id))
+    })
   }
 
   async setCollapsed(id: string, collapsed: boolean): Promise<void> {
-    await this.replace({ ...this.get(id), collapsed })
+    return this.transaction(() => this.replace({ ...this.get(id), collapsed }))
   }
 
   /** Set how many grid columns one card wants. */
   async setSpan(id: string, span: 1 | 2 | 3): Promise<void> {
-    await this.replace({ ...this.get(id), span: clampSpan(span) })
+    return this.transaction(() => this.replace({ ...this.get(id), span: clampSpan(span) }))
   }
 
   async move(id: string, delta: -1 | 1): Promise<void> {
-    const ordered = [...this.panels]
-    const index = ordered.findIndex(p => p.id === id)
-    if (index < 0) throw new PanelNotFoundError(id)
-    const target = index + delta
-    if (target < 0 || target >= ordered.length) return
-    const [moved] = ordered.splice(index, 1)
-    ordered.splice(target, 0, moved!)
-    await this.commit(ordered.map((p, position) => ({ ...p, position })))
+    return this.transaction(async () => {
+      const ordered = [...this.panels]
+      const index = ordered.findIndex(p => p.id === id)
+      if (index < 0) throw new PanelNotFoundError(id)
+      const target = index + delta
+      if (target < 0 || target >= ordered.length) return
+      const [moved] = ordered.splice(index, 1)
+      ordered.splice(target, 0, moved!)
+      await this.commit(ordered.map((p, position) => ({ ...p, position })))
+    })
   }
 
-  async setAgentData(id: string, value: Json): Promise<void> {
-    await this.replace({ ...this.get(id), agentData: { value, at: new Date().toISOString() } })
+  /** The optional guard is checked inside the transaction, before publishing data. */
+  async setAgentData(id: string, value: Json, matches?: (current: PanelRecord) => boolean): Promise<boolean> {
+    return this.transaction(async () => {
+      const current = this.get(id)
+      if (matches !== undefined && !matches(current)) return false
+      await this.replace({ ...current, agentData: { value, at: new Date().toISOString() } })
+      return true
+    })
   }
 
   /**
@@ -202,33 +204,67 @@ export class PanelStore {
    * @param model - provider/model to use, or null to follow the default.
    */
   async setModel(id: string, model: PanelModelSelection | null): Promise<void> {
-    const current = this.get(id)
-    const definition: PanelDefinition = { ...current.definition }
-    if (model === null) delete (definition as { model?: PanelModelSelection }).model
-    else (definition as { model?: PanelModelSelection }).model = model
-    await this.replace({ ...current, updatedAt: new Date().toISOString(), definition })
+    return this.transaction(() => {
+      const current = this.get(id)
+      const definition: PanelDefinition = { ...current.definition }
+      if (model === null) delete (definition as { model?: PanelModelSelection }).model
+      else (definition as { model?: PanelModelSelection }).model = model
+      return this.replace({ ...current, updatedAt: new Date().toISOString(), definition })
+    })
   }
 
-  async setAgentRun(id: string, run: AgentRunState): Promise<void> {
-    const current = this.find(id)
-    if (current !== undefined) await this.replace({ ...current, agentRun: run })
+  /** Update a run only while it still owns the panel's state. Missing panels are a no-op. */
+  async setAgentRun(
+    id: string,
+    run: AgentRunState | ((current: PanelRecord) => AgentRunState),
+    matches?: (current: PanelRecord) => boolean,
+  ): Promise<boolean> {
+    return this.transaction(async () => {
+      const current = this.find(id)
+      if (current === undefined || (matches !== undefined && !matches(current))) return false
+      await this.replace({ ...current, agentRun: typeof run === 'function' ? run(current) : run })
+      return true
+    })
+  }
+
+  private async replaceDefinition(current: PanelRecord, definition: PanelDefinition, data?: Json): Promise<PanelRecord> {
+    const now = new Date().toISOString()
+    const scheduleChanged = JSON.stringify(current.definition.agent ?? null) !== JSON.stringify(definition.agent ?? null)
+    const next: PanelRecord = {
+      ...current,
+      version: current.version + 1,
+      updatedAt: now,
+      definition,
+      previous: current.definition,
+      ...(data === undefined ? {} : { agentData: { value: data, at: now } }),
+      ...(scheduleChanged
+        ? { agentRun: definition.agent ? { status: 'idle' as const, nextRunAt: nextRun(definition, now) } : undefined }
+        : {}),
+    }
+    await this.replace(next)
+    return next
+  }
+
+  /** Queue the read/modify/write together; a failed mutation never poisons the next one. */
+  private transaction<T>(mutation: () => Promise<T>): Promise<T> {
+    const work = this.writing.then(mutation)
+    this.writing = work.then(() => {}, () => {})
+    return work
   }
 
   private async replace(next: PanelRecord): Promise<void> {
     await this.commit(this.panels.map(p => (p.id === next.id ? next : p)))
   }
 
+  /** Called only by a transaction. Readers and observers see committed snapshots. */
   private async commit(panels: PanelRecord[]): Promise<void> {
-    this.panels = panels.sort((a, b) => a.position - b.position)
-    const snapshot: StoreFile = { version: 1, panels: this.panels }
-    const write = this.writing.then(async () => {
-      await mkdir(dirname(this.file), { recursive: true })
-      const temp = `${this.file}.${process.pid}.tmp`
-      await writeFile(temp, `${JSON.stringify(snapshot, null, 2)}\n`, 'utf8')
-      await rename(temp, this.file)
-    })
-    this.writing = write.catch(() => {})
-    await write
+    const ordered = [...panels].sort((a, b) => a.position - b.position)
+    const snapshot: StoreFile = { version: 1, panels: ordered }
+    await mkdir(dirname(this.file), { recursive: true })
+    const temp = `${this.file}.${process.pid}.tmp`
+    await writeFile(temp, `${JSON.stringify(snapshot, null, 2)}\n`, 'utf8')
+    await rename(temp, this.file)
+    this.panels = ordered
     for (const listener of this.listeners) {
       try {
         listener()

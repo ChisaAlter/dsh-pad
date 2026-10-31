@@ -1,4 +1,4 @@
-/** One panel in the dock: header with status and actions, approval prompt, the frame. */
+/** One panel in the dock: header with status and actions, the frame. */
 import { type PointerEvent as ReactPointerEvent, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react'
 import type { PanelModelCatalog, PanelModelOption, PanelModelSelection, PanelView } from '../shared/types.ts'
 import type { PadKey } from './locales.ts'
@@ -43,9 +43,8 @@ function lastUpdate(view: PanelView): string | undefined {
 
 /** Whether the card has something the user should look at. */
 export function needsAttention(view: PanelView): boolean {
-  return view.needsApproval
-    || view.agentRun?.status === 'failed'
-    || Object.values(view.data.sources).some(r => !r.ok)
+  return view.agentRun?.status === 'failed'
+    || Object.values(view.data.sources).some(r => r?.ok === false)
 }
 
 const Icon = {
@@ -236,7 +235,7 @@ export function PanelCard({ view, client, theme, lang, t, clockActive, fresh, dr
                 <button type="button" role="menuitem" onClick={() => { setMenuOpen(false); onAsk(t('card.editPrompt', { title: definition.title, id: view.id }), false) }}>
                   <span className="dshpad-mi">{MenuIcon.edit}</span>{t('card.edit')}
                 </button>
-                <button type="button" role="menuitem" disabled={view.needsApproval && !agent}
+                <button type="button" role="menuitem" disabled={definition.sources.length === 0 && !agent}
                   onClick={() => void act({ op: 'refresh', panelId: view.id })}>
                   <span className="dshpad-mi">{MenuIcon.refresh}</span>{t('card.refresh')}
                 </button>
@@ -349,24 +348,6 @@ export function PanelCard({ view, client, theme, lang, t, clockActive, fresh, dr
         ? null
         : (
           <div className="dshpad-card-body">
-            {view.needsApproval
-              ? (
-                <div className="dshpad-approve">
-                  <p>{t('approve.title')}</p>
-                  <ul>
-                    {definition.sources.map(source => (
-                      <li key={source.id}>
-                        <code>{source.kind === 'command' ? source.command : `${source.method ?? 'GET'} ${source.url}`}</code>
-                      </li>
-                    ))}
-                  </ul>
-                  <button type="button" className="dshpad-primary" onClick={async () => {
-                    const result = await client.act({ op: 'approve', panelId: view.id, fingerprint: view.fingerprint })
-                    setActionError(result.ok ? undefined : t('approve.changed'))
-                  }}>{t('approve.allow')}</button>
-                </div>
-                )
-              : null}
             {awaiting
               ? <p className="dshpad-card-note">{t('card.firstData')}</p>
               : (

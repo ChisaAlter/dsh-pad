@@ -18,21 +18,30 @@ async function tempFile(): Promise<string> {
 
 const sleep = (ms: number): Promise<void> => new Promise(resolve => setTimeout(resolve, ms))
 
+/** Wait for a condition instead of a fixed window: a spawned command can be slow on a loaded box. */
+async function waitFor(check: () => boolean, timeoutMs = 10_000): Promise<void> {
+  const started = Date.now()
+  while (!check()) {
+    if (Date.now() - started > timeoutMs) throw new Error('timed out waiting for the condition')
+    await sleep(25)
+  }
+}
+
 describe('PanelStore', () => {
   it('persists, reloads and orders panels', async () => {
     const file = await tempFile()
-    const store = new PanelStore(file, false)
+    const store = new PanelStore(file)
     const a = await store.create(definition())
     const b = await store.create({ ...definition(), title: 'B' })
     await store.move(b.id, -1)
-    const again = new PanelStore(file, false)
+    const again = new PanelStore(file)
     await again.load()
     expect(again.list().map(p => p.definition.title)).toEqual(['B', 'T'])
     expect(again.get(a.id).version).toBe(1)
   })
 
   it('sets and clears a panel model without reloading the frame', async () => {
-    const store = new PanelStore(await tempFile(), false)
+    const store = new PanelStore(await tempFile())
     const panel = await store.create(definition())
     await store.setModel(panel.id, { provider: 'magpie', model: 'codex/gpt-6.1-sol' })
     const next = store.get(panel.id)
@@ -43,34 +52,32 @@ describe('PanelStore', () => {
   })
 
   it('stores a card span for the grid', async () => {
-    const store = new PanelStore(await tempFile(), false)
+    const store = new PanelStore(await tempFile())
     const panel = await store.create(definition())
     expect(store.get(panel.id).span).toBe(1)
     await store.setSpan(panel.id, 3)
     expect(store.get(panel.id).span).toBe(3)
   })
 
-  it('requires approval for sources, and keeps it across non-source edits', async () => {
-    const store = new PanelStore(await tempFile(), false)
-    const panel = await store.create(definition())
-    expect(store.approved(panel)).toBe(false)
-    expect(await store.approve(panel.id, 'stale')).toBe(false)
-    expect(await store.approve(panel.id, sourcesFingerprint(panel.definition.sources))).toBe(true)
-    const restyled = await store.update(panel.id, { ...panel.definition, css: 'b{}' })
-    expect(store.approved(restyled)).toBe(true)
-    const rerouted = await store.update(panel.id, definition('echo 2'))
-    expect(store.approved(rerouted)).toBe(false)
+  it('fingerprints only the declared sources, so a restyle keeps the run identity', () => {
+    const base = definition()
+    expect(sourcesFingerprint(base.sources)).toBe(sourcesFingerprint({ ...base, css: 'b{}' }.sources))
+    expect(sourcesFingerprint(base.sources)).toBe(sourcesFingerprint(definition().sources))
+    expect(sourcesFingerprint(base.sources)).not.toBe(sourcesFingerprint(definition('echo 2').sources))
+    expect(sourcesFingerprint([])).toBe('')
   })
 
-  it('treats a panel without sources as approved; autoApprove approves everything', async () => {
-    const store = new PanelStore(await tempFile(), false)
-    expect(store.approved(await store.create({ ...definition(), sources: [] }))).toBe(true)
-    const auto = new PanelStore(await tempFile(), true)
-    expect(auto.approved(await auto.create(definition()))).toBe(true)
+  it('creates a panel with no approval state to wait on', async () => {
+    const file = await tempFile()
+    const store = new PanelStore(file)
+    const panel = await store.create(definition())
+    expect(panel).not.toHaveProperty('approvedSources')
+    const stored = JSON.parse(await readFile(file, 'utf8')) as { panels: Record<string, unknown>[] }
+    expect(stored.panels[0]).not.toHaveProperty('approvedSources')
   })
 
   it('undoes the last edit', async () => {
-    const store = new PanelStore(await tempFile(), false)
+    const store = new PanelStore(await tempFile())
     const panel = await store.create(definition())
     await store.update(panel.id, { ...panel.definition, title: 'New' })
     const undone = await store.undo(panel.id)
@@ -80,7 +87,7 @@ describe('PanelStore', () => {
   })
 
   it('reconciles agent scheduling when undo crosses the agent boundary', async () => {
-    const store = new PanelStore(await tempFile(), false)
+    const store = new PanelStore(await tempFile())
     const agent = { instruction: 'x', everyMinutes: 60 }
     const plain = await store.create(definition())
     const withAgent = await store.update(plain.id, { ...plain.definition, agent })
@@ -101,12 +108,12 @@ describe('PanelStore', () => {
 
   it('schedules the first agent refresh one interval out and keeps a corrupt file aside', async () => {
     const file = await tempFile()
-    const store = new PanelStore(file, false)
+    const store = new PanelStore(file)
     const panel = await store.create({ ...definition(), sources: [], agent: { instruction: 'x', everyMinutes: 60 } })
     const due = Date.parse(panel.agentRun!.nextRunAt!) - Date.now()
     expect(due).toBeGreaterThan(59 * 60_000)
     await writeFile(file, '{not json')
-    const broken = new PanelStore(file, false)
+    const broken = new PanelStore(file)
     await broken.load()
     expect(broken.list()).toEqual([])
     await expect(readFile(file, 'utf8')).rejects.toThrow()
@@ -114,22 +121,18 @@ describe('PanelStore', () => {
 })
 
 describe('DataHub', () => {
-  it('polls only watched, approved panels and streams readings', async () => {
-    const store = new PanelStore(await tempFile(), false)
+  it('polls watched panels and streams readings without any approval step', async () => {
+    const store = new PanelStore(await tempFile())
     const hub = new DataHub(store, async () => undefined, () => {})
     store.onChange(() => hub.storeChanged())
     const panel = await store.create(definition('node -e "console.log(Date.now())"', 1))
     const events: StreamEvent[] = []
     const subscriber: Subscriber = { watch: new Set([panel.id]), send: e => events.push(e) }
     const unsubscribe = hub.subscribe(subscriber)
-    await sleep(300)
-    expect(events.filter(e => e.type === 'data')).toHaveLength(0) // not approved yet
-
-    await store.approve(panel.id, sourcesFingerprint(panel.definition.sources))
-    await sleep(2300)
-    const data = events.filter(e => e.type === 'data')
-    expect(data.length).toBeGreaterThanOrEqual(2)
-    const first = data[0]
+    const dataEvents = (): number => events.filter(e => e.type === 'data').length
+    await waitFor(() => dataEvents() >= 2)
+    expect(dataEvents()).toBeGreaterThanOrEqual(2)
+    const first = events.filter(e => e.type === 'data')[0]
     expect(first?.type === 'data' && first.data.sources['a']?.ok).toBe(true)
 
     hub.rewatch(subscriber, new Set())
@@ -141,7 +144,7 @@ describe('DataHub', () => {
   })
 
   it('runAll records readings into the panel view', async () => {
-    const store = new PanelStore(await tempFile(), true)
+    const store = new PanelStore(await tempFile())
     const hub = new DataHub(store, async () => undefined, () => {})
     const panel = await store.create(definition('echo hi', 60))
     const readings = await hub.runAll(panel.id)
@@ -153,7 +156,7 @@ describe('DataHub', () => {
   it('serves the cached trend and readings to a fresh page', async () => {
     const panelsFile = join(await mkdtemp(join(tmpdir(), 'dsh-pad-')), 'panels.json')
     const cacheFile = join(dirname(panelsFile), 'readings.json')
-    const store = new PanelStore(panelsFile, true)
+    const store = new PanelStore(panelsFile)
     const cache = new ReadingCache(cacheFile, 5)
     const hub = new DataHub(store, async () => undefined, () => {}, { cache })
     const panel = await store.create(definition('echo hi', 60))
@@ -167,7 +170,7 @@ describe('DataHub', () => {
     cache.dispose()
 
     // A restarted Host: no polling yet, but the page already has the trend.
-    const nextStore = new PanelStore(panelsFile, true)
+    const nextStore = new PanelStore(panelsFile)
     await nextStore.load()
     const nextCache = new ReadingCache(cacheFile)
     const restored = await nextCache.load(nextStore.list())
