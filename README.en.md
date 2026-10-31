@@ -16,7 +16,19 @@ A floating panel plugin for [DeepSeek Harness](https://github.com/deepseek-ai/de
   - **Direct data sources**: run a shell command on this machine, or make an HTTP request from it, refreshing at intervals measured in seconds and without spending tokens. Suits API data such as server performance and plan balances.
   - **AI refresh**: run one agent turn in the background on an interval, letting it fetch the data again and submit it. Suits data you can only get through search, reading web pages or multi-step reasoning.
 - **Per-panel model**: a button inside a panel can call `dsh.run(prompt)` to run one pass with that panel’s own model and show the result in the card; AI refresh uses the same model.
-- **Security**: creating or changing data sources brings up dsh’s own approval prompt (“Allow once / Deny”). If you deny it, the panel keeps an “Allow” button. Secrets are referenced as `{{env:NAME}}`, resolved on the host side only, and never sent to the browser.
+- **It just runs**: there is no “Allow” step for data sources. A panel starts polling as soon as it is created or edited — nothing to click on the card. That also means a command the model puts in a panel runs on this machine straight away; as with every tool that can run commands, use it only in a conversation you trust. Secrets are referenced as `{{env:NAME}}`, resolved on the host side only, and never sent to the browser.
+
+## What a panel looks like
+
+A panel is not a report; it is a 200–400px card: one number, a few rows, one trend. Three things keep it that way:
+
+- **The panel kit**: the sandboxed iframe ships a set of `pad-*` classes (`.pad-metric`, `.pad-item`, `.pad-meter`, `.pad-status`, `.pad-spark`, …) plus generators such as `dsh.ui.metric` and `dsh.ui.list`. Every colour comes from a `--pad-*` token, so light and dark follow the host theme and a panel never hard-codes a colour.
+- **The authoring manual**: `pad_guide` hands the model five layouts — single value with a trend, ranked rows, status board, quota ring, feed — and four complete `html` + `script` recipes, so it picks a layout before it writes code.
+- **The layout lint**: `pad_create` / `pad_update` run a deterministic lint. A wall of text, a long paragraph, raw JSON pasted into the card, or text with nothing visual to anchor it is refused outright; hard-coded colours, tracked-caps labels and a script that never handles a failed source are reported as warnings.
+
+Everything inside the card is still the model’s own HTML / CSS / JS — the kit is a starting point, and the lint rejects layouts that cannot be read, not a particular taste.
+
+![The four kit layouts, light and dark](docs/images/panel-kit.png)
 
 The panel design draws on the two kinds of panels in [ChisaBot](https://github.com/ChisaAlter/ChisaBot): sandboxed custom HTML panels, and live panels that a bot refreshes on a schedule.
 
@@ -52,7 +64,7 @@ node scripts/doctor.mjs
 dsh plugin --profile web add /path/to/dsh-pad
 
 # from GitHub (the repo ships a built lib/, so no build script is needed)
-dsh plugin --profile web add github:ChisaAlter/dsh-pad#v0.3.2
+dsh plugin --profile web add github:ChisaAlter/dsh-pad#v0.4.5
 ```
 
 `lib/index.js` and `lib/client.js` are the only runtime entry points. The repository commits them to git precisely so that installing from GitHub does not depend on build scripts (pnpm refuses to run a dependency’s build scripts by default). If you change the source, run `npm install && npm run build` in the plugin directory first, then install.
@@ -65,8 +77,10 @@ After startup the plugin checks [GitHub Releases](https://github.com/ChisaAlter/
 
 1. a download icon appears at the top of the dock (it is not shown when there is no new version);
 2. click it to see the current and the new version, then click “Update”;
-3. the plugin downloads the built `lib/index.js`, `lib/client.js`, `package.json` and `cordis.patch.yml` from the Release, backing them up to `.dsh-pad-update-backup/` first;
-4. restart `dsh web` / Whale Isle for it to take effect.
+3. the plugin downloads and validates the complete `lib/index.js`, `lib/client.js`, `package.json` and `cordis.patch.yml` set, backs it up to `.dsh-pad-update-backup/`, and records an update transaction before replacing files;
+4. restart `dsh web` / Whale Isle for it to take effect. If interrupted, the loader completes the recorded transaction before evaluating the plugin. Corrupt staged files prevent loading a mixed version.
+
+Transaction recovery applies to updates performed by 0.4.5 and later. Older updaters retain their old behavior while first upgrading to 0.4.5; install the complete version with the application closed for that transition.
 
 If the current install is a **development-directory link** (the plugin directory has `.git/`), auto-update only reports the new version and never overwrites source code; run `git pull && npm run build` in the plugin directory instead. “Check again” in the update panel re-checks right away; set `updateCheck: false` to turn off background checks.
 
@@ -134,9 +148,9 @@ A panel definition:
 }
 ```
 
-- **Direct data sources** poll only while the dock is expanded and the card is not folded; once the browser is closed or the dock is collapsed to the floating ball, nothing runs on the host anymore. Command output is capped at 512KB, with a default timeout of 10 seconds.
+- **Direct data sources** poll while a card or its focus view is visible in an expanded dock. Polling stops when no client watches it. Command and HTTP output is capped at 512KB, with a default timeout of 10 seconds; parsed JSON is limited to 64 nesting levels and 100,000 nodes.
 - **The last value survives a restart**: the newest successful reading of every source, plus its last 20 points, are written to `$DSH_HOME/dsh-pad/readings.json` (coalesced into one write every 10 seconds; a JSON value over 16KB is not cached; one source's ring is capped at 128KB; a reading is dropped as soon as its source changes). The dock paints from it right away — trend charts start with that history — and the first poll continues from there; the file is only a cache, deleting it just makes panels wait for their first reading again.
-- **Secrets**: `{{env:NAME}}` is resolved from dsh’s credential service first, then from the host process environment variables. Secret values appearing in error messages are replaced with `***`.
+- **Secrets**: `{{env:NAME}}` is resolved from dsh’s credential service first, then from the host process environment variables. Secret values appearing in error messages are replaced with `***`. HTTP requests carrying secret references, custom sensitive headers or a body only follow same-origin redirects; configure the trusted destination URL directly when a cross-origin redirect is rejected.
 - **AI refresh**: the background agent uses dsh’s default model and default agent preset by default (with tools such as web_fetch / web_search), plus exactly two more: `pad_submit_data` and `pad_report_failure`. A panel may carry a top-level `model` (`{ provider, model, reasoningEffort? }`) to pick its own model; without it the global default applies. That model is used for `dsh.run` inside the panel too. “Panel model” in the card’s ⋯ menu switches it directly. It only ever sees the `instruction` and the data submitted last time. A single turn runs for at most 5 minutes (configurable); after a failure it retries after a while, and the reason is shown on the card.
 - **Panel scripts** run in an iframe with `sandbox="allow-scripts"`: not same-origin with dsh, CSP `default-src 'none'`, no network, no access to cookies or storage, and no access to the parent page. The only way out is `window.dsh`:
 
@@ -155,15 +169,16 @@ A panel definition:
 
 Theme variables: `--pad-fg` `--pad-fg-2` `--pad-fg-3` `--pad-bg` `--pad-bg-2` `--pad-border` `--pad-accent` `--pad-ok` `--pad-warn` `--pad-danger` `--pad-font` `--pad-mono` `--pad-radius`.
 
-The full authoring guide for models is in `src/host/guide.ts`, sent to the model as part of the `pad_create` tool description.
+The authoring manual lives in `src/host/guide.ts`: the short form rides along in the `pad_create` tool description, and the full manual (layouts, kit, recipes, dsh API) is served on demand by `pad_guide`.
 
 ## Tools available to the model
 
 | Tool | What it does |
 |---|---|
 | `pad_list` / `pad_get` | List panels / read the full definition and the latest data |
-| `pad_test_source` | Try out a data source (needs approval), to see the real output format before writing the script |
-| `pad_create` / `pad_update` | Create / edit (pass only the fields to change); approval is asked again only when the data sources change |
+| `pad_guide` | The authoring manual: five layouts, kit classes, complete recipes, the `dsh` API, how to get data |
+| `pad_test_source` | Try out a data source, to see the real output format before writing the script |
+| `pad_create` / `pad_update` | Create / edit (pass only the fields to change); returns the lint result and the first readings |
 | `pad_models` | List the provider / models / reasoning efforts available for panels, plus the global default model |
 | `pad_refresh` | Refresh now and return the reading; use it to verify a panel after fixing it |
 | `pad_delete` | Delete |
@@ -176,14 +191,12 @@ Override in `$DSH_HOME/profiles/web/cordis.patch.yml` (a patch replaces the whol
 - id: dsh-pad
   name: dsh-pad
   config:
-    autoApprove: false
     minIntervalSec: 2
 ```
 
 | Key | Default | Description |
 |---|---|---|
 | `dataFile` | `$DSH_HOME/dsh-pad/panels.json` | Where panels are stored |
-| `autoApprove` | `false` | Stop asking when creating / changing data sources |
 | `minIntervalSec` | `2` | Shortest refresh interval for direct data sources (seconds) |
 | `agentRefresh` | `true` | Whether AI-refresh panels are allowed |
 | `minAgentMinutes` | `15` | Shortest AI refresh interval (minutes) |
@@ -202,7 +215,7 @@ Override in `$DSH_HOME/profiles/web/cordis.patch.yml` (a patch replaces the whol
 - Panels are stored in `$DSH_HOME/dsh-pad/panels.json`; the newest successful reading of every source sits next to it in `readings.json` (only so a restart paints immediately, safe to delete); the ball’s position, the window’s position / width / height, the nested regions and the split ratios are stored per browser in localStorage.
 - Every AI refresh is a separate dsh session whose working directory is `$DSH_HOME/dsh-pad/refresh`. dsh currently offers no API to delete sessions, so those session logs stay under `$DSH_HOME/sessions/`, in the subdirectory that corresponds to this directory (roughly a dozen KB per turn). They never show up in the sidebar, and you can delete them by hand when you want to clean up.
 - The background refresh agent has no human online to approve anything, so any tool call that needs approval (a shell command under workspace-write mode, say) is rejected. AI refresh suits fetching data with web_fetch / web_search; use a direct data source for commands on this machine.
-- Verified on dsh 0.2.1-rc.2’s Web UI (`dsh web`) and the Whale Isle desktop app: after install the host half is active, the 8 `pad_*` tools are registered, the six `/api/dsh-pad.*` routes work, and the client dock renders without errors in headless Chrome. dsh’s plugin API is still changing quickly. The floating dock hangs on dsh’s `shell.overlay` slot; making room on wide screens is a `padding-right` on the outer frame (`data-titlebar-density`), so the right-side panel shifts left with it and is not covered by the dock; the turn-navigation rail is shown again inside a `@container` query based on conversation width (≥ 800px). If dsh later changes these attributes or class names, the worst case is that it degrades to a plain floating dock and the rail hides by dsh’s own rules — nothing breaks.
+- Verified on dsh 0.2.1-rc.2’s Web UI (`dsh web`) and the Whale Isle desktop app: after install the host half is active, the 9 `pad_*` tools are registered, the six `/api/dsh-pad.*` routes work, and the client dock renders without errors in headless Chrome. dsh’s plugin API is still changing quickly. The floating dock hangs on dsh’s `shell.overlay` slot; making room on wide screens is a `padding-right` on the outer frame (`data-titlebar-density`), so the right-side panel shifts left with it and is not covered by the dock; the turn-navigation rail is shown again inside a `@container` query based on conversation width (≥ 800px). If dsh later changes these attributes or class names, the worst case is that it degrades to a plain floating dock and the rail hides by dsh’s own rules — nothing breaks.
 
 ## Development
 
@@ -219,7 +232,7 @@ npm run doctor     # self-check before and after install: lib/, exports, profile
 src/
   index.ts            Host plugin entry: config, storage, scheduling, routes, tools
   host/
-    store.ts          Panel storage (JSON file, undo, approval fingerprints)
+    store.ts          Panel storage (JSON file, undo, layout position)
     sources.ts        Command / HTTP source execution, secret filling and redaction
     hub.ts            Polling per subscription, pushing SSE to the browser
     agent-refresh.ts  Background AI refresh
@@ -227,7 +240,8 @@ src/
     run.ts            One-off model calls for dsh.run inside a panel
     update.ts         Checks GitHub Releases, downloads and replaces lib/ on click
     tools.ts          The pad_* tools
-    guide.ts          The authoring guide sent to models
+    lint.ts           Layout lint: text walls, paragraphs, pasted JSON, nothing visual
+    guide.ts          The authoring guide and layout manual (pad_guide)
     routes.ts         /api/dsh-pad.{panels,stream,action,models,run,update} (authenticated through the dsh Connection)
   client/
     index.ts          Browser plugin entry: shell.overlay dock + composer bridge
@@ -235,9 +249,12 @@ src/
     PanelCard.tsx     Card
     PanelFrame.tsx    Sandboxed iframe
     layout.ts         Nested region tree (vertical / horizontal splits, drop insertion, migrating old layouts)
-    frame-runtime.ts  window.dsh inside the iframe
+    frame-runtime.ts  window.dsh inside the iframe (including the dsh.ui generators)
     pad-client.ts     SSE connection, history, layout
-  shared/             Types and validation shared by both halves
+  shared/
+    types.ts          Types shared by both halves
+    validate.ts       Panel definition validation
+    kit.ts            The panel kit: preset CSS and the visual class list (used by the iframe and the lint)
 examples/             Example panel definitions
 tests/                Unit tests (vitest)
 ```
@@ -245,6 +262,8 @@ tests/                Unit tests (vitest)
 ## Acknowledgements
 
 Thanks to the [Linux.do](https://linux.do) (the L site) community for its support, discussion and feedback, and to [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) and [ChisaBot](https://github.com/ChisaAlter/ChisaBot) for the inspiration on panel shapes.
+
+The panel design constraints come from two places: layout and visual direction follow the interfaces collected at [TheInternetDesigns](https://theinternetdesigns.com/), and the hard anti-AI-slop rules (no eyebrow, no tracked-caps labels, no text dumping, no invented numbers, no emoji as status) follow the Floor of [Nutlope/hallmark](https://github.com/Nutlope/hallmark).
 
 ## License
 

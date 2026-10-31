@@ -5,3 +5,5 @@ node_modules/
 .ref/
 *.tgz
 .dsh-pad-update-backup/
+.dsh-pad-update.json
+.dsh-pad-update.json.prepare-*

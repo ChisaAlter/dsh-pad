@@ -15,6 +15,7 @@ import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
 import { dirname } from 'node:path'
 import type { Json, PanelRecord, ReadingPoint, SourceReading } from '../shared/types.ts'
 import { sourcesFingerprint } from './store.ts'
+import { assertSourceJson } from './source-json.ts'
 
 /** One cached ring plus the fingerprint of the source that produced it. */
 interface CacheEntry {
@@ -42,7 +43,11 @@ function toReading(raw: unknown): SourceReading | undefined {
   const record = raw as Record<string, unknown>
   const { ok, value, error, at, durationMs } = record
   if (ok !== true || typeof at !== 'string' || Number.isNaN(Date.parse(at))) return undefined
-  if (value === undefined) return undefined
+  try {
+    assertSourceJson(value)
+  } catch {
+    return undefined
+  }
   return {
     ok: true,
     value: value as Json,
@@ -142,6 +147,11 @@ export class ReadingCache {
   /** Cache one successful reading; failed and oversized readings are ignored. */
   remember(panelId: string, sourceId: string, key: string, reading: SourceReading): void {
     if (this.disposed || !reading.ok || reading.value === undefined) return
+    try {
+      assertSourceJson(reading.value)
+    } catch {
+      return
+    }
     if (valueSize(reading.value) > MAX_CACHED_VALUE_CHARS) return
     let sources = this.panels.get(panelId)
     if (sources === undefined) {

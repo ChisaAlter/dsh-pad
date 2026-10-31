@@ -5,7 +5,7 @@
  */
 import type { PanelAction, PanelData, PanelDefinition, PanelModelCatalog, PanelRunResult, PanelSource, PanelView, PadUpdateInfo, ReadingPoint, StreamEvent } from '../shared/types.ts'
 import { ROUTES } from '../shared/types.ts'
-import { type LayoutNode, legacyRowsToTree, parseTree } from './layout.ts'
+import { type LayoutNode, legacyRowsToTree, normalizeTree, parseTree } from './layout.ts'
 import type { BallEdge } from './ball-position.ts'
 
 export const HISTORY_LIMIT = 120
@@ -59,6 +59,16 @@ export interface PadSnapshot {
   readonly layout: DockLayout
   /** Id of a panel created while this page was open, for a short highlight. */
   readonly fresh: string | undefined
+}
+
+/** Reject malformed readings before they can poison the rendered snapshot. */
+function isPanelData(raw: unknown): raw is PanelData {
+  if (typeof raw !== 'object' || raw === null) return false
+  const { sources, agent } = raw as Record<string, unknown>
+  if (typeof sources !== 'object' || sources === null || Array.isArray(sources)) return false
+  if (!Object.values(sources).every(reading => typeof reading === 'object' && reading !== null
+    && typeof reading.ok === 'boolean' && typeof reading.at === 'string')) return false
+  return agent === null || (typeof agent === 'object' && agent !== null && typeof (agent as Record<string, unknown>)['at'] === 'string')
 }
 
 const LAYOUT_KEY = 'dsh-pad:layout'
@@ -292,6 +302,8 @@ export class PadClient {
   private readonly listeners = new Set<() => void>()
   private readonly history = new Map<string, Map<string, HistoryPoint[]>>()
   private readonly sourceKeys = new Map<string, Map<string, string>>()
+  /** Ephemeral visible frames (e.g. a folded card opened in the focus dialog). */
+  private readonly visiblePanels = new Map<string, number>()
   private source: EventSource | undefined
   private watchKey = ''
   private known: Set<string> | undefined
@@ -343,9 +355,26 @@ export class PadClient {
     this.reconnect()
   }
 
-  /** Store the nested card tree (order, splits and widths). */
-  setTree(tree: LayoutNode | null): void {
-    this.setLayout({ tree })
+  /** Commit against the current panel set, even when a gesture began before an SSE edit. */
+  setTree(tree: LayoutNode | null): LayoutNode | null {
+    const current = normalizeTree(tree, this.snapshot.panels.map(panel => panel.id))
+    this.setLayout({ tree: current })
+    return this.snapshot.layout.tree
+  }
+
+  /** Keep a focused frame polling without changing the card's persisted folded state. */
+  watchPanel(panelId: string): () => void {
+    this.visiblePanels.set(panelId, (this.visiblePanels.get(panelId) ?? 0) + 1)
+    this.reconnect()
+    let released = false
+    return () => {
+      if (released) return
+      released = true
+      const remaining = (this.visiblePanels.get(panelId) ?? 1) - 1
+      if (remaining > 0) this.visiblePanels.set(panelId, remaining)
+      else this.visiblePanels.delete(panelId)
+      this.reconnect()
+    }
   }
 
   /** Remember one panel's iframe height, or clear it with `undefined` (auto). */
@@ -451,7 +480,7 @@ export class PadClient {
   /** Panels the Host should poll: everything visible in an expanded dock. */
   private watchIds(): string[] {
     if (!this.snapshot.layout.expanded || (typeof document !== 'undefined' && document.visibilityState === 'hidden')) return []
-    return this.snapshot.panels.filter(p => !p.collapsed && !p.needsApproval).map(p => p.id)
+    return this.snapshot.panels.filter(p => !p.collapsed || this.visiblePanels.has(p.id)).map(p => p.id)
   }
 
   /** (Re)open the stream when the watched set changed. */
@@ -511,6 +540,7 @@ export class PadClient {
 
   private receive(event: StreamEvent): void {
     if (event.type === 'panels') {
+      if (!event.panels.every(panel => isPanelData(panel.data))) return
       for (const panel of event.panels) {
         const keys = new Map(panel.definition.sources.map(source => [source.id, sourceKey(source)]))
         const previous = this.sourceKeys.get(panel.id)
@@ -532,6 +562,7 @@ export class PadClient {
       this.reconnect()
       return
     }
+    if (event.type !== 'data' || !isPanelData(event.data)) return
     this.record(event.panelId, event.data)
     this.update({
       panels: this.snapshot.panels.map(p => (p.id === event.panelId ? { ...p, data: event.data } : p)),

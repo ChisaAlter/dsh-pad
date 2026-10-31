@@ -10,10 +10,10 @@ import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-agent'
 import type {} from '@deepseek-ai/dsh-agent-default-model'
 import type {} from '@deepseek-ai/dsh-agent-preset-registry'
-import { createUserMessage } from '@deepseek-ai/dsh-llm'
+import { createUserMessage, ReasoningEffortId } from '@deepseek-ai/dsh-llm'
 import type { SessionId } from '@deepseek-ai/dsh-session'
 import { defineTool } from '@deepseek-ai/dsh-tools'
-import type { Json, PanelRecord } from '../shared/types.ts'
+import type { AgentRunState, Json, PanelRecord } from '../shared/types.ts'
 import type { PanelStore } from './store.ts'
 
 declare module '@deepseek-ai/dsh-llm' {
@@ -39,13 +39,33 @@ export interface AgentRefreshOptions {
 
 const CHECK_EVERY_MS = 30_000
 const MAX_DATA_BYTES = 256 * 1024
+const STATE_RETRY_MS = 250
+const MAX_STATE_RETRY_MS = 5000
+
+type CancelReason = 'stopped' | 'changed' | 'timeout'
+
+interface RefreshRun {
+  readonly panelId: string
+  readonly generation: number
+  cancel(reason: CancelReason): void
+}
+
+interface PendingState {
+  readonly run: RefreshRun
+  readonly owner: AgentRunState
+  readonly reconcile: (current: PanelRecord) => { state: AgentRunState, notify: boolean }
+  delayMs: number
+  timer: ReturnType<typeof setTimeout> | undefined
+  unsubscribe: (() => void) | undefined
+}
 
 export class AgentRefresher {
   private readonly queue: string[] = []
-  /** Panel id → generation of the run that owns it. */
-  private readonly running = new Map<string, number>()
-  /** In-flight agent handles, so stop() can cancel real work. */
-  private readonly active = new Map<string, { readonly generation: number, readonly cancel: () => void }>()
+  private readonly running = new Map<string, RefreshRun>()
+  /** Includes timed-out creation/cleanup until the real resource has drained. */
+  private readonly resources = new Set<RefreshRun>()
+  /** Failed terminal writes retry without retaining an agent or a busy slot. */
+  private readonly pendingStates = new Map<string, PendingState>()
   private timer: ReturnType<typeof setInterval> | undefined
   private generation = 0
   private stopped = true
@@ -61,10 +81,14 @@ export class AgentRefresher {
     if (this.timer !== undefined) return
     this.stopped = false
     this.generation += 1
-    // A refresh that was running when the Host stopped never finished.
+    // Recovery must not overwrite a new run queued before this write executes.
     for (const panel of this.store.list()) {
       if (panel.agentRun?.status === 'running') {
-        void this.store.setAgentRun(panel.id, { ...panel.agentRun, status: 'failed', error: '上次刷新被中断' }).catch(() => {})
+        const run: RefreshRun = { panelId: panel.id, generation: this.generation, cancel: () => {} }
+        void this.writeTerminalState(run, panel.agentRun, current => ({
+          state: { ...current.agentRun, status: 'failed', error: '上次刷新被中断' },
+          notify: false,
+        }))
       }
     }
     this.timer = setInterval(() => this.scan(), CHECK_EVERY_MS)
@@ -79,16 +103,10 @@ export class AgentRefresher {
       this.timer = undefined
     }
     this.queue.length = 0
-    const active = [...this.active.values()]
-    this.active.clear()
+    for (const pending of this.pendingStates.values()) this.clearPendingState(pending)
     this.running.clear()
-    for (const entry of active) {
-      try {
-        entry.cancel()
-      } catch {
-        // A handle that has already gone away is fine.
-      }
-    }
+    // Do not forget lingering resources: restarting cannot bypass their cap.
+    for (const run of this.resources) run.cancel('stopped')
   }
 
   /** Ask for a refresh now (user pressed refresh, or the model called pad_refresh). */
@@ -108,81 +126,91 @@ export class AgentRefresher {
     const now = Date.now()
     for (const panel of this.store.list()) {
       const next = panel.agentRun?.nextRunAt
+      if (this.pendingStates.has(panel.id)) continue
       if (panel.definition.agent && next !== undefined && Date.parse(next) <= now) this.request(panel.id)
     }
   }
 
   private pump(): void {
     if (this.stopped) return
-    const generation = this.generation
+    // Allow at most one extra batch of lingering resources. Healthy panels can
+    // proceed after one timeout, but repeated stuck providers cannot grow unbounded.
     while (this.running.size < this.options.concurrency && this.queue.length > 0) {
       const panelId = this.queue.shift()!
       if (this.running.has(panelId)) continue
       const panel = this.store.find(panelId)
       if (panel?.definition.agent == null) continue
-      this.running.set(panelId, generation)
-      void this.run(panel, generation).catch(() => {
-        // run() reports failures as data; this is only a last-resort guard so
-        // a rejected store write cannot become an unhandled rejection.
+      if (this.resources.size >= this.options.concurrency * 2
+        || [...this.resources].some(run => run.panelId === panelId)) {
+        const generation = this.generation
+        void this.store.setAgentRun(panelId, current => ({
+          status: 'failed',
+          nextRunAt: new Date(Date.now() + Math.min(current.definition.agent!.everyMinutes, this.options.retryMinutes) * 60_000).toISOString(),
+          ...(current.agentRun?.lastRunAt === undefined ? {} : { lastRunAt: current.agentRun.lastRunAt }),
+          error: '上次刷新资源尚未退出，请稍后重试',
+        }), current => !this.stopped && generation === this.generation && !this.running.has(panelId)
+          && current.definition === panel.definition).catch(() => {})
+        continue
+      }
+      const run: RefreshRun = { panelId, generation: this.generation, cancel: () => {} }
+      this.running.set(panelId, run)
+      this.resources.add(run)
+      void this.run(panel, run).catch(() => {
+        // Store failures must not become unhandled rejections.
       }).finally(() => {
-        if (this.running.get(panelId) === generation) this.running.delete(panelId)
-        if (!this.stopped && this.generation === generation) this.pump()
+        if (this.running.get(panelId) === run) this.running.delete(panelId)
+        this.pump()
       })
     }
   }
 
-  private async run(panel: PanelRecord, generation: number): Promise<void> {
-    if (this.stopped || generation !== this.generation) return
-    if (panel.definition.agent == null) return
+  private async run(panel: PanelRecord, run: RefreshRun): Promise<void> {
+    const store = this.store
+    const panelId = panel.id
     const startedAt = new Date().toISOString()
-    try {
-      await this.store.setAgentRun(panel.id, { ...panel.agentRun, status: 'running', lastRunAt: startedAt })
-    } catch {
-      return
-    }
-    if (this.stopped || generation !== this.generation) return
-
+    const state = { ...panel.agentRun, status: 'running' as const, lastRunAt: startedAt }
+    const controller = new AbortController()
     let outcome: { ok: true } | { ok: false, reason: string } | undefined
+    let reason: CancelReason | undefined
     let accepting = true
     let submitted = false
     let handle: Awaited<ReturnType<Context['agents']['create']>> | undefined
-    let timer: ReturnType<typeof setTimeout> | undefined
+    let handleCancelled = false
     let releaseWait: () => void = () => {}
     const cancelled = new Promise<void>(resolve => { releaseWait = resolve })
-    const cancelRun = (reason: string): void => {
-      accepting = false
-      releaseWait()
+    const sameDefinition = (current = store.find(panelId)): boolean => current !== undefined
+      && current.version === panel.version
+      && JSON.stringify(current.definition.model) === JSON.stringify(panel.definition.model)
+      && current.definition.agent != null
+    const currentRun = (): boolean => accepting && !this.stopped
+      && run.generation === this.generation && sameDefinition()
+    const cancelHandle = (): void => {
+      if (handle === undefined || handleCancelled) return
+      handleCancelled = true
       try {
-        handle?.agent.cancel({ kind: 'hook', reason })
+        handle.agent.cancel({ kind: 'hook', reason: `dsh-pad refresh ${reason ?? 'ended'}` })
       } catch {
-        // An agent that already stopped still loses permission to submit.
+        // A handle that already stopped still loses permission to submit.
       }
     }
-    const panelId = panel.id
-    const store = this.store
-    const sameDefinition = (): boolean => {
-      const current = store.find(panelId)
-      return current !== undefined && current.version === panel.version
-        && JSON.stringify(current.definition.model) === JSON.stringify(panel.definition.model)
-        && current.definition.agent != null
+    run.cancel = (nextReason): void => {
+      if (reason !== undefined) return
+      reason = nextReason
+      accepting = false
+      controller.abort()
+      releaseWait()
+      cancelHandle()
     }
-    const currentRun = (): boolean => accepting && !this.stopped && generation === this.generation && sameDefinition()
+    // Install every lifecycle guard before the initial store write can yield.
     const unsubscribe = store.onChange(() => {
-      if (!accepting || sameDefinition()) return
-      cancelRun('dsh-pad refresh definition changed')
-      const current = store.find(panelId)
-      // Source/UI/model edits can leave the old run's status behind. Agent
-      // instruction/interval edits already install their own new schedule.
-      if (current?.definition.agent && current.agentRun?.status === 'running') {
-        void store.setAgentRun(panelId, {
-          status: 'idle',
-          nextRunAt: new Date(Date.now() + current.definition.agent.everyMinutes * 60_000).toISOString(),
-          ...(current.agentRun.lastRunAt === undefined ? {} : { lastRunAt: current.agentRun.lastRunAt }),
-        }).catch(() => {})
-      }
+      if (reason === undefined && !sameDefinition()) run.cancel('changed')
     })
-    const assertSubmission = (): void => {
+    const timer = setTimeout(() => run.cancel('timeout'), this.options.timeoutMs)
+    const assertCurrent = (): void => {
       if (!currentRun()) throw new Error('刷新已停止、结束或定义已变更')
+    }
+    const assertSubmission = (): void => {
+      assertCurrent()
       if (submitted) throw new Error('这一轮已经提交过结果')
     }
     const submit = defineTool({
@@ -198,7 +226,9 @@ export class AgentRefresher {
         if (Buffer.byteLength(JSON.stringify(data), 'utf8') > MAX_DATA_BYTES) throw new Error(`数据超过 ${MAX_DATA_BYTES / 1024}KB，只保留面板要显示的字段`)
         submitted = true
         try {
-          await store.setAgentData(panelId, data)
+          const committed = await store.setAgentData(panelId, data, current => currentRun()
+            && sameDefinition(current) && current.agentRun === state)
+          if (!committed) throw new Error('刷新已停止、结束或定义已变更')
         } catch (error) {
           submitted = false
           throw error
@@ -220,93 +250,172 @@ export class AgentRefresher {
       },
     })
 
-    try {
-      const agents = this.ctx.get('agents')
-      if (agents === undefined) throw new Error('这个 dsh 组合没有 agent 服务')
-      await mkdir(this.options.workDir, { recursive: true })
-      // A panel may name its own model; otherwise use the deployment default
-      // like every other bare agent entry point.
-      const explicit = panel.definition.model
-      const fallback = this.ctx.get('agentDefaultModel')?.currentSelection()
-      const selection = explicit ?? fallback
-      const modelOptions = selection === undefined
-        ? {}
-        : {
+    // This promise owns the actual resource lifetime. Logical timeout/stop can
+    // return before it drains, but its reservation remains until dispose settles.
+    const work = (async () => {
+      try {
+        const claimed = await store.setAgentRun(panelId, state, current => currentRun() && sameDefinition(current))
+        if (!claimed) return
+        assertCurrent()
+        const agents = this.ctx.get('agents')
+        if (agents === undefined) throw new Error('这个 dsh 组合没有 agent 服务')
+        await mkdir(this.options.workDir, { recursive: true })
+        assertCurrent()
+        const selection = panel.definition.model ?? this.ctx.get('agentDefaultModel')?.currentSelection()
+        const presets = this.ctx.get('agentPresets')
+        const preset = presets === undefined ? undefined : await presets.resolve()
+        assertCurrent()
+        handle = await agents.create({
+          sessionId: `dsh-pad-${panel.id}-${randomUUID().slice(0, 8)}` as SessionId,
+          signal: controller.signal,
+          meta: { cwd: this.options.workDir, ...(preset === undefined ? {} : { agentPreset: preset.id }) },
+          ...(selection === undefined ? {} : { agentOptions: {
             provider: selection.provider,
             model: selection.model,
-            ...(selection.reasoningEffort === undefined ? {} : { reasoningEffort: selection.reasoningEffort }),
-          }
-      // The product tools (web fetch/search, shell, files) come with the agent preset.
-      const presets = this.ctx.get('agentPresets')
-      const preset = presets === undefined ? undefined : await presets.resolve()
-      if (!currentRun()) return
-      handle = await agents.create({
-        sessionId: `dsh-pad-${panel.id}-${randomUUID().slice(0, 8)}` as SessionId,
-        meta: { cwd: this.options.workDir, ...(preset === undefined ? {} : { agentPreset: preset.id }) },
-        ...(selection === undefined
-          ? {}
-          : { agentOptions: modelOptions }),
-        setup: async (agentCtx) => {
-          if (presets !== undefined && preset !== undefined) await presets.mount(agentCtx, preset.id)
-          agentCtx.tools.register(submit)
-          agentCtx.tools.register(fail)
-        },
-      })
-      if (!currentRun()) return
-      this.active.set(panel.id, {
-        generation,
-        cancel: () => cancelRun('dsh-pad refresh stopped'),
-      })
-      const agent = handle.agent
-      agent.followup(createUserMessage({
-        content: [{ type: 'text', text: refreshPrompt(panel) }],
-        source: { kind: 'dsh-pad', panelId: panel.id },
-      }))
-      const timedOut = await Promise.race([
-        agent.whenIdle().then(() => false),
-        cancelled.then(() => false),
-        new Promise<boolean>(resolve => { timer = setTimeout(() => resolve(true), this.options.timeoutMs) }),
-      ])
-      clearTimeout(timer)
-      if (timedOut) {
-        cancelRun('dsh-pad refresh timeout')
-        outcome ??= { ok: false, reason: `刷新超时（${Math.round(this.options.timeoutMs / 1000)} 秒）` }
+            ...(selection.reasoningEffort === undefined ? {} : { reasoningEffort: ReasoningEffortId(selection.reasoningEffort) }),
+          } }),
+          setup: async (agentCtx) => {
+            assertCurrent()
+            if (presets !== undefined && preset !== undefined) await presets.mount(agentCtx, preset.id)
+            assertCurrent()
+            agentCtx.tools.register(submit)
+            agentCtx.tools.register(fail)
+          },
+        })
+        // A provider may resolve creation after its signal was aborted.
+        if (!currentRun()) cancelHandle()
+        assertCurrent()
+        handle.agent.followup(createUserMessage({
+          content: [{ type: 'text', text: refreshPrompt(panel) }],
+          source: { kind: 'dsh-pad', panelId: panel.id },
+        }))
+        await Promise.race([handle.agent.whenIdle(), cancelled])
+      } catch (error) {
+        outcome ??= { ok: false, reason: `刷新出错：${error instanceof Error ? error.message : String(error)}` }
+      } finally {
+        accepting = false
+        try {
+          await handle?.dispose()
+        } catch {
+          // Disposed or failed cleanup must not hide the turn's outcome.
+        }
       }
-    } catch (error) {
-      outcome ??= { ok: false, reason: `刷新出错：${error instanceof Error ? error.message : String(error)}` }
+    })()
+    const released = (): void => {
+      this.resources.delete(run)
+      this.pump()
+    }
+    void work.then(released, released)
+    try {
+      await Promise.race([work, cancelled])
     } finally {
       accepting = false
       clearTimeout(timer)
       unsubscribe()
-      if (this.active.get(panel.id)?.generation === generation) this.active.delete(panel.id)
-      await handle?.dispose().catch(() => {})
-    }
-
-    if (this.stopped || generation !== this.generation || !sameDefinition()) return
-    const finished = Date.now()
-    const current = this.store.find(panel.id)
-    const currentAgent = current?.definition.agent
-    if (current === undefined || currentAgent == null) return
-    const every = currentAgent.everyMinutes * 60_000
-    try {
-      if (outcome?.ok) {
-        await this.store.setAgentRun(panel.id, { status: 'idle', lastRunAt: startedAt, nextRunAt: new Date(finished + every).toISOString() })
-        try {
-          this.dataChanged(panel.id)
-        } catch {
-          // A failing observer must not turn a finished refresh into a failure.
+      // Every exit reconciles only the state claimed by this exact run. It must
+      // never overwrite a new schedule, a restart, or another run's completion.
+      await this.writeTerminalState(run, state, current => {
+        // A queued model/UI edit may commit after this run unsubscribes. Decide
+        // the schedule from the record the transaction will actually replace.
+        const changed = reason === 'changed' || !sameDefinition(current)
+        const error = reason === 'timeout'
+          ? `刷新超时（${Math.round(this.options.timeoutMs / 1000)} 秒）`
+          : reason === 'stopped' ? '刷新已停止' : outcome?.ok ? undefined : outcome?.reason ?? '这一轮没有提交数据'
+        const every = current.definition.agent!.everyMinutes * 60_000
+        return {
+          state: {
+            status: changed ? 'idle' : error === undefined ? 'idle' : 'failed',
+            lastRunAt: startedAt,
+            nextRunAt: new Date(Date.now() + (changed || error === undefined
+              ? every : Math.min(every, this.options.retryMinutes * 60_000))).toISOString(),
+            ...(changed || error === undefined ? {} : { error }),
+          },
+          notify: !changed && error === undefined,
         }
-      } else {
-        const retry = Math.min(every, this.options.retryMinutes * 60_000)
-        await this.store.setAgentRun(panel.id, {
-          status: 'failed',
-          lastRunAt: startedAt,
-          nextRunAt: new Date(finished + retry).toISOString(),
-          error: outcome?.reason ?? '这一轮没有提交数据',
-        })
-      }
+      })
+    }
+  }
+
+  private async writeTerminalState(
+    run: RefreshRun,
+    owner: AgentRunState,
+    reconcile: PendingState['reconcile'],
+  ): Promise<void> {
+    try {
+      let notify = false
+      const committed = await this.store.setAgentRun(run.panelId, current => {
+        const result = reconcile(current)
+        notify = result.notify
+        return result.state
+      }, current => current.definition.agent != null && current.agentRun === owner)
+      if (committed && notify) this.notifyDataChanged(run.panelId)
     } catch {
-      // The run itself finished; a failed state write is retried by scan/start.
+      // A transient final rename failure must not strand a finished turn in
+      // running until its hour-long interval. Retain only the small state CAS.
+      if (this.stopped || run.generation !== this.generation) return
+      const previous = this.pendingStates.get(run.panelId)
+      if (previous !== undefined) this.clearPendingState(previous)
+      const pending: PendingState = {
+        run, owner, reconcile, delayMs: STATE_RETRY_MS, timer: undefined, unsubscribe: undefined,
+      }
+      this.pendingStates.set(run.panelId, pending)
+      pending.unsubscribe = this.store.onChange(() => {
+        if (!this.ownsPendingState(pending)) this.clearPendingState(pending)
+      })
+      this.scheduleStateRetry(pending)
+    }
+  }
+
+  private ownsPendingState(pending: PendingState): boolean {
+    const current = this.store.find(pending.run.panelId)
+    return this.pendingStates.get(pending.run.panelId) === pending
+      && !this.stopped && pending.run.generation === this.generation
+      && current?.definition.agent != null && current.agentRun === pending.owner
+  }
+
+  private scheduleStateRetry(pending: PendingState): void {
+    if (!this.ownsPendingState(pending)) {
+      this.clearPendingState(pending)
+      return
+    }
+    pending.timer = setTimeout(() => {
+      pending.timer = undefined
+      void this.retryTerminalState(pending)
+    }, pending.delayMs)
+    pending.timer.unref?.()
+  }
+
+  private async retryTerminalState(pending: PendingState): Promise<void> {
+    if (!this.ownsPendingState(pending)) {
+      this.clearPendingState(pending)
+      return
+    }
+    try {
+      let notify = false
+      const committed = await this.store.setAgentRun(pending.run.panelId, current => {
+        const result = pending.reconcile(current)
+        notify = result.notify
+        return result.state
+      }, () => this.ownsPendingState(pending))
+      this.clearPendingState(pending)
+      if (committed && notify) this.notifyDataChanged(pending.run.panelId)
+    } catch {
+      pending.delayMs = Math.min(pending.delayMs * 2, MAX_STATE_RETRY_MS)
+      this.scheduleStateRetry(pending)
+    }
+  }
+
+  private clearPendingState(pending: PendingState): void {
+    clearTimeout(pending.timer)
+    pending.unsubscribe?.()
+    if (this.pendingStates.get(pending.run.panelId) === pending) this.pendingStates.delete(pending.run.panelId)
+  }
+
+  private notifyDataChanged(panelId: string): void {
+    try {
+      this.dataChanged(panelId)
+    } catch {
+      // A failing observer must not turn a finished refresh into a failure.
     }
   }
 }

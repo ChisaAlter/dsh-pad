@@ -6,6 +6,7 @@ import {
 import { PadClient } from '../src/client/pad-client.ts'
 import type { HistoryPoint } from '../src/client/pad-client.ts'
 import type { HttpSource, PanelData, PanelDefinition, PanelSource, PanelView, StreamEvent } from '../src/shared/types.ts'
+import { dropOnLeaf, leafIds, type LayoutNode } from '../src/client/layout.ts'
 
 const source = (id: string): HttpSource => ({ id, kind: 'http', url: 'https://example.com', parse: 'json', intervalSec: 30 })
 
@@ -68,8 +69,6 @@ const view = (history: PanelView['history']): PanelView => ({
   updatedAt: '2026-10-23T00:00:00.000Z',
   definition: definition([source('metric')]),
   canUndo: false,
-  needsApproval: false,
-  fingerprint: '',
   agentRun: null,
   data: data(),
   history,
@@ -456,6 +455,18 @@ describe('stream terminal-error recovery', () => {
     expect(client.getSnapshot()).toBe(snapshot)
   })
 
+  it('retains the last valid snapshot when a malformed reading arrives, then accepts valid data', () => {
+    emitPanels(view({}))
+    const snapshot = client.getSnapshot()
+    const bad = { sources: { unexpected: null }, agent: null }
+    latestStream().onmessage?.({ data: JSON.stringify({ type: 'data', panelId: 'p_1', data: bad }) })
+    expect(client.getSnapshot()).toBe(snapshot)
+    latestStream().onmessage?.({ data: JSON.stringify({ type: 'panels', panels: [{ ...view({}), data: bad }] }) })
+    expect(client.getSnapshot()).toBe(snapshot)
+    emitReading(42, '2026-10-31T12:00:00.000Z')
+    expect(client.getSnapshot().panels[0]?.data.sources['metric']?.value).toBe(42)
+  })
+
   it('cancels a pending retry when a layout change already opens a replacement', async () => {
     const stream = latestStream()
     stream.readyState = 2
@@ -497,6 +508,108 @@ describe('visibility-aware source subscriptions', () => {
       target.dispatchEvent(new Event('visibilitychange'))
       expect(streams).toHaveLength(count)
     } finally { client.stop(); vi.unstubAllGlobals() }
+  })
+})
+
+describe('focused frame source subscriptions', () => {
+  let client: PadClient
+  let documentStub: { visibilityState: string, addEventListener: EventTarget['addEventListener'], removeEventListener: EventTarget['removeEventListener'] }
+  let visibility: EventTarget
+  const watched = (): string[] => new URL(latestStream().url, 'https://test.invalid/').searchParams.get('watch')!.split(',').filter(Boolean)
+
+  beforeEach(() => {
+    FakeEventSource.instances = []
+    vi.stubGlobal('EventSource', FakeEventSource)
+    visibility = new EventTarget()
+    documentStub = { visibilityState: 'visible', addEventListener: visibility.addEventListener.bind(visibility), removeEventListener: visibility.removeEventListener.bind(visibility) }
+    vi.stubGlobal('document', documentStub)
+    client = new PadClient()
+    client.setLayout({ expanded: true })
+    client.start()
+    emitPanels({ ...view({}), collapsed: true })
+  })
+  afterEach(() => { client.stop(); vi.unstubAllGlobals() })
+
+  it('polls a folded panel while focused and releases it without changing its fold preference', () => {
+    expect(watched()).toEqual([])
+    const release = client.watchPanel('p_1')
+    expect(watched()).toEqual(['p_1'])
+    expect(client.getSnapshot().panels[0]?.collapsed).toBe(true)
+    release()
+    expect(watched()).toEqual([])
+    const count = FakeEventSource.instances.length
+    release()
+    expect(FakeEventSource.instances).toHaveLength(count)
+  })
+
+  it('retains another focus owner and never duplicates the same watched id', () => {
+    const a = client.watchPanel('p_1'), b = client.watchPanel('p_1')
+    expect(watched()).toEqual(['p_1'])
+    a()
+    expect(watched()).toEqual(['p_1'])
+    b()
+    expect(watched()).toEqual([])
+  })
+
+  it('pauses a focused panel when the page or dock hides and restores it only while still owned', () => {
+    const release = client.watchPanel('p_1')
+    documentStub.visibilityState = 'hidden'
+    visibility.dispatchEvent(new Event('visibilitychange'))
+    expect(watched()).toEqual([])
+    documentStub.visibilityState = 'visible'
+    visibility.dispatchEvent(new Event('visibilitychange'))
+    expect(watched()).toEqual(['p_1'])
+    client.setLayout({ expanded: false })
+    expect(watched()).toEqual([])
+    release()
+    client.setLayout({ expanded: true })
+    expect(watched()).toEqual([])
+  })
+
+  it('does not watch deleted or unknown panels and stops reconnecting after shutdown', () => {
+    const releaseUnknown = client.watchPanel('p_missing')
+    expect(watched()).toEqual([])
+    const release = client.watchPanel('p_1')
+    emitPanels()
+    expect(watched()).toEqual([])
+    client.stop()
+    const count = FakeEventSource.instances.length
+    release(); releaseUnknown()
+    expect(FakeEventSource.instances).toHaveLength(count)
+  })
+})
+
+describe('layout commits use the latest panel set', () => {
+  let client: PadClient
+  const panel = (id: string): PanelView => ({ ...view({}), id })
+  const initial: LayoutNode = { kind: 'split', dir: 'row', children: [{ kind: 'leaf', id: 'a' }, { kind: 'leaf', id: 'b' }], weights: [1, 1] }
+  beforeEach(() => {
+    FakeEventSource.instances = []
+    vi.stubGlobal('EventSource', FakeEventSource)
+    client = new PadClient(); client.start()
+    emitPanels(panel('a'), panel('b'))
+    client.setTree(initial)
+  })
+  afterEach(() => { client.stop(); vi.unstubAllGlobals() })
+
+  it('keeps a panel created after a splitter captured its base tree', () => {
+    emitPanels(panel('a'), panel('b'), panel('c'))
+    const result = client.setTree(initial)
+    expect(leafIds(result)).toEqual(['a', 'b', 'c'])
+    expect(client.getSnapshot().layout.tree).toBe(result)
+  })
+
+  it('drops panels removed during a gesture and appends new ones exactly once on a card drop', () => {
+    const pending = dropOnLeaf(initial, 'b', 'a', 'right')
+    emitPanels(panel('a'), panel('c'))
+    const result = client.setTree(pending)
+    expect(leafIds(result)).toEqual(['a', 'c'])
+  })
+
+  it('clears the tree when all panels disappear while a gesture is held', () => {
+    emitPanels()
+    expect(client.setTree(initial)).toBeNull()
+    expect(client.getSnapshot().layout.tree).toBeNull()
   })
 })
 

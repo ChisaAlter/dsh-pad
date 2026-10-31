@@ -7,21 +7,14 @@
  * to this component, which accepts a fixed set of requests from exactly this
  * frame carrying this frame's token.
  */
-import { type PointerEvent as ReactPointerEvent, useEffect, useMemo, useRef, useState } from 'react'
-import type { PanelData, PanelRunResult, PanelView } from '../shared/types.ts'
-import { FRAME_RUNTIME } from './frame-runtime.ts'
+import { type PointerEvent as ReactPointerEvent, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import type { PanelRunResult, PanelView } from '../shared/types.ts'
 import { HistorySync } from './history-sync.ts'
 import { clampPanelHeight, type HistoryPoint } from './pad-client.ts'
+import { frameDocument } from './panel-document.ts'
 import type { ThemeSnapshot } from './theme.ts'
+import { PointerGestures } from './gesture.ts'
 
-const CSP = "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src data:; font-src data:; media-src data:"
-const BASE_CSS = `*,*::before,*::after{box-sizing:border-box}
-html,body{margin:0;padding:0;background:transparent;color:var(--pad-fg);font:13px/1.45 var(--pad-font);-webkit-font-smoothing:antialiased}
-html[data-height=auto]{overflow-x:hidden;overflow-y:auto}
-body{padding:2px 0 4px}
-a{color:var(--pad-accent);text-decoration:none}
-a:hover{text-decoration:underline dotted;text-underline-offset:3px}
-::-webkit-scrollbar{width:6px;height:6px}::-webkit-scrollbar-thumb{background:var(--pad-border);border-radius:3px}`
 export const MIN_AUTO_HEIGHT = 32
 export const MAX_AUTO_HEIGHT = 640
 const STATE_PREFIX = 'dsh-pad:state:'
@@ -50,40 +43,6 @@ function randomToken(): string {
   const bytes = new Uint8Array(16)
   crypto.getRandomValues(bytes)
   return Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('')
-}
-
-interface FrameDocInput {
-  readonly view: PanelView
-  readonly token: string
-  readonly theme: ThemeSnapshot
-  readonly data: PanelData
-  readonly histories: Record<string, readonly HistoryPoint[]>
-  readonly lang: string
-  readonly viewHeight?: number
-}
-
-function frameDocument({ view, token, theme, data, histories, lang, viewHeight }: FrameDocInput): string {
-  const { definition } = view
-  const init = JSON.stringify({ data, histories, state: readState(view.id), lang }).replace(/</g, '\\u003c')
-  const css = definition.css.replace(/<\/style/gi, '<\\/style')
-  const script = definition.script.replace(/<\/script/gi, '<\\/script')
-  return `<!doctype html>
-<html data-token="${token}" data-mode="${theme.mode}" data-height="${definition.height === 'auto' && viewHeight === undefined ? 'auto' : 'fixed'}" lang="${lang}">
-<head>
-<meta charset="utf-8">
-<meta http-equiv="Content-Security-Policy" content="${CSP}">
-<style id="pad-theme">${theme.css}</style>
-<style>${BASE_CSS}</style>
-<style>${css}</style>
-<script type="application/json" id="pad-init">${init}</script>
-</head>
-<body>
-${definition.html}
-<script>${FRAME_RUNTIME}</script>
-<script>${script}
-//# sourceURL=dsh-pad/${view.id}.js</script>
-</body>
-</html>`
 }
 
 export interface PanelFrameProps {
@@ -122,6 +81,11 @@ export function PanelFrame({ view, histories, theme, lang, onRefresh, onAsk, onR
   const readyRef = useRef(false)
   const latest = useRef({ data: view.data, theme, onRefresh, onAsk, onRun, onScriptError, histories, height })
   const [dragHeight, setDragHeight] = useState<number>()
+  const gestures = useRef(new PointerGestures()).current
+  useLayoutEffect(() => {
+    if (!resizable) gestures.cancel()
+    return () => gestures.cancel()
+  }, [gestures, resizable, view.id, view.version])
   const fixedHeight = view.definition.height === 'auto' ? undefined : view.definition.height
   latest.current = { data: view.data, theme, onRefresh, onAsk, onRun, onScriptError, histories, height }
   const [autoHeight, setAutoHeight] = useState(MIN_AUTO_HEIGHT * 2)
@@ -136,7 +100,7 @@ export function PanelFrame({ view, histories, theme, lang, onRefresh, onAsk, onR
     const histories = readHistories()
     const historySync = new HistorySync()
     historySync.reset(histories)
-    return { token, initialData: data, historySync, doc: frameDocument({ view, token, theme: currentTheme, data, histories, lang, viewHeight: latest.current.height }) }
+    return { token, initialData: data, historySync, doc: frameDocument({ view, token, theme: currentTheme, data, histories, state: readState(view.id), lang, viewHeight: latest.current.height }) }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [view.id, view.version, lang])
 
@@ -235,26 +199,15 @@ export function PanelFrame({ view, histories, theme, lang, onRefresh, onAsk, onR
     event.preventDefault()
     const startY = event.clientY
     const startHeight = frameRef.current?.getBoundingClientRect().height ?? renderedHeight
-    const target = event.currentTarget
-    target.setPointerCapture(event.pointerId)
     const heightAt = (y: number): number => clampPanelHeight(startHeight + (y - startY))
-    const move = (e: PointerEvent): void => setDragHeight(heightAt(e.clientY))
-    const cleanup = (): void => {
-      target.removeEventListener('pointermove', move)
-      target.removeEventListener('pointerup', up)
-      target.removeEventListener('pointercancel', cancel)
-      target.removeEventListener('lostpointercapture', cancel)
-      setDragHeight(undefined)
-    }
-    const up = (e: PointerEvent): void => {
-      cleanup()
-      onHeightChange?.(heightAt(e.clientY))
-    }
-    const cancel = (): void => { cleanup() }
-    target.addEventListener('pointermove', move)
-    target.addEventListener('pointerup', up)
-    target.addEventListener('pointercancel', cancel)
-    target.addEventListener('lostpointercapture', cancel)
+    gestures.start(event, {
+      move: pointer => setDragHeight(heightAt(pointer.clientY)),
+      end: pointer => {
+        setDragHeight(undefined)
+        onHeightChange?.(heightAt(pointer.clientY))
+      },
+      cancel: () => setDragHeight(undefined),
+    })
   }
 
   return (
@@ -266,6 +219,9 @@ export function PanelFrame({ view, histories, theme, lang, onRefresh, onAsk, onR
         sandbox="allow-scripts"
         referrerPolicy="no-referrer"
         srcDoc={doc}
+        // The element's own colour scheme keeps the frame's canvas opaque. A
+        // fully transparent iframe inside the dock's composited layer can come
+        // up completely blank in Electron, even though its document laid out.
         style={{ height: renderedHeight, colorScheme: theme.mode }}
       />
       {resizable

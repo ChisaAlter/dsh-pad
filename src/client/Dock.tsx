@@ -51,6 +51,8 @@ import type { PadUpdateInfo } from '../shared/types.ts'
 import { PanelCard, type Translate, needsAttention } from './PanelCard.tsx'
 import type { PadKey } from './locales.ts'
 import { PanelFrame } from './PanelFrame.tsx'
+import { RenderBoundary } from './RenderBoundary.tsx'
+import { PointerGestures } from './gesture.ts'
 import { type ThemeSnapshot, readTheme, watchTheme } from './theme.ts'
 
 const DRAG_THRESHOLD = 4
@@ -176,9 +178,10 @@ export function createDock(client: PadClient) {
     const [updateError, setUpdateError] = useState<string>()
     const closeTimer = useRef<ReturnType<typeof setTimeout>>()
     const transitionTimer = useRef<ReturnType<typeof setTimeout>>()
-    const holdTimer = useRef<ReturnType<typeof setTimeout>>()
+    const clickTimer = useRef<ReturnType<typeof setTimeout>>()
+    const clickCleanup = useRef<() => void>()
+    const gestures = useRef(new PointerGestures()).current
     const suppressCollapseClick = useRef(false)
-    const collapsePressToken = useRef(0)
     const panelsById = useMemo(() => new Map(snap.panels.map(panel => [panel.id, panel])), [snap.panels])
     const focusedView = focusedId === undefined ? undefined : panelsById.get(focusedId)
     const pageVisible = usePageVisible()
@@ -224,24 +227,25 @@ export function createDock(client: PadClient) {
         ? previous : next)
     }), [])
 
-    useEffect(() => () => {
+    const clearSuppressedClick = (): void => {
+      if (clickTimer.current !== undefined) clearTimeout(clickTimer.current)
+      clickTimer.current = undefined
+      clickCleanup.current?.()
+      clickCleanup.current = undefined
+      suppressCollapseClick.current = false
+    }
+    useLayoutEffect(() => () => {
+      gestures.cancel()
+      clearSuppressedClick()
       if (closeTimer.current !== undefined) clearTimeout(closeTimer.current)
       if (transitionTimer.current !== undefined) clearTimeout(transitionTimer.current)
-      if (holdTimer.current !== undefined) clearTimeout(holdTimer.current)
-    }, [])
+    }, [gestures])
 
-    // The star button disappears when the dock collapses; never let a pending
-    // long-press fire against the now-hidden window.
-    useEffect(() => {
-      if (snap.layout.expanded) return
-      // Invalidate any pointer press that belonged to the hidden star button.
-      collapsePressToken.current += 1
-      if (holdTimer.current !== undefined) {
-        clearTimeout(holdTimer.current)
-        holdTimer.current = undefined
-      }
-      suppressCollapseClick.current = false
-    }, [snap.layout.expanded])
+    // Ball/window transitions and hidden pages retire any unfinished gesture.
+    useLayoutEffect(() => {
+      gestures.cancel()
+      clearSuppressedClick()
+    }, [gestures, snap.layout.expanded, pageVisible])
 
     useEffect(() => {
       if (focusedId === undefined) return
@@ -256,6 +260,10 @@ export function createDock(client: PadClient) {
       // The panel was deleted (or the list reloaded) while zoomed.
       if (focusedId !== undefined && focusedView === undefined) setFocusedId(undefined)
     }, [focusedId, focusedView])
+
+    useEffect(() => {
+      if (snap.layout.expanded && focusedId !== undefined) return client.watchPanel(focusedId)
+    }, [snap.layout.expanded, focusedId])
 
     useEffect(() => {
       const updateTheme = (): void => {
@@ -422,11 +430,12 @@ export function createDock(client: PadClient) {
      * Persist a layout edit and normalize it against the current panels, so a
      * split can never lose or duplicate a card.
      */
-    const commitTree = (next: LayoutNode): void => {
-      const normalized = normalizeTree(next, snap.panels.map(panel => panel.id))
-      if (normalized === null) return
-      setTree(normalized)
-      client.setTree(normalized)
+    const commitTree = (next: LayoutNode | null): void => {
+      setTree(client.setTree(next))
+    }
+    const currentTree = (): LayoutNode | null => {
+      const latest = client.getSnapshot()
+      return normalizeTree(latest.layout.tree, latest.panels.map(panel => panel.id))
     }
 
     /** The card under a client point, with its box for a drop-zone check. */
@@ -448,20 +457,10 @@ export function createDock(client: PadClient) {
       if (event.button !== 0) return
       const startX = event.clientX
       const startY = event.clientY
-      const pointerId = event.pointerId
-      const capture = event.currentTarget
       let moved = false
       const move = (pointer: PointerEvent): void => {
         if (!moved && Math.hypot(pointer.clientX - startX, pointer.clientY - startY) <= DRAG_THRESHOLD) return
-        if (!moved) {
-          // Keep receiving pointer events when the cursor crosses a panel iframe.
-          try {
-            capture.setPointerCapture(pointerId)
-          } catch {
-            // A synthetic or already-released pointer cannot be captured.
-          }
-          pointer.preventDefault()
-        }
+        if (!moved) pointer.preventDefault()
         moved = true
         const under = cardAt(pointer.clientX, pointer.clientY)
         const target = under !== undefined && under.id !== sourceId ? under.id : undefined
@@ -484,42 +483,28 @@ export function createDock(client: PadClient) {
       }
       const finish = (pointer: PointerEvent): void => {
         const under = cardAt(pointer.clientX, pointer.clientY)
-        cleanup()
         setDrag(undefined)
         if (!moved) return
         // A dragged pointer must not also fold or expand the card on the click.
+        clearSuppressedClick()
         document.addEventListener('click', suppressClick, { capture: true, once: true })
-        setTimeout(() => document.removeEventListener('click', suppressClick, true), 160)
-        if (tree === null) return
+        clickCleanup.current = () => document.removeEventListener('click', suppressClick, true)
+        clickTimer.current = setTimeout(clearSuppressedClick, 160)
+        const latestTree = currentTree()
+        if (latestTree === null) return
         if (under === undefined) {
-          commitTree(moveToRoot(tree, sourceId))
+          commitTree(moveToRoot(latestTree, sourceId))
         } else if (under.id !== sourceId) {
-          commitTree(dropOnLeaf(tree, sourceId, under.id, dropZoneFor(under.rect, pointer.clientX, pointer.clientY)))
+          commitTree(dropOnLeaf(latestTree, sourceId, under.id, dropZoneFor(under.rect, pointer.clientX, pointer.clientY)))
         }
       }
-      const cancel = (): void => {
-        cleanup()
-        setDrag(undefined)
-      }
-      const cleanup = (): void => {
-        document.removeEventListener('pointermove', move)
-        document.removeEventListener('pointerup', finish)
-        document.removeEventListener('pointercancel', cancel)
-      }
-      document.addEventListener('pointermove', move)
-      document.addEventListener('pointerup', finish)
-      document.addEventListener('pointercancel', cancel)
+      gestures.start(event, { move, end: finish, cancel: () => setDrag(undefined) })
     }
 
     const startSplit = (path: readonly number[], boundary: number, event: ReactPointerEvent<HTMLDivElement>): void => {
       if (event.button !== 0) return
       event.preventDefault()
       event.stopPropagation()
-      try {
-        event.currentTarget.setPointerCapture(event.pointerId)
-      } catch {
-        // Synthetic pointers cannot be captured; document listeners still work.
-      }
       if (tree === null) return
       const baseTree = tree
       const split = nodeAtPath(baseTree, path)
@@ -538,6 +523,8 @@ export function createDock(client: PadClient) {
       const maxLeft = Math.max(minLeft, pairPx - MIN_PANE)
       const startX = event.clientX
       let final = baseTree
+      // Retire a previous preview before exposing this gesture's shield.
+      gestures.cancel()
       // Keep events in the parent document while crossing sandboxed iframes.
       setSplitDragging(true)
       const move = (pointer: PointerEvent): void => {
@@ -549,27 +536,25 @@ export function createDock(client: PadClient) {
             ? pairWeight - leftWeight
             : weight)
         final = withWeightsAtPath(baseTree, path, weights)
-        setTree(final)
+        setTree(normalizeTree(final, client.getSnapshot().panels.map(panel => panel.id)))
       }
-      const up = (): void => {
-        cleanup()
-        setSplitDragging(false)
-        setTree(final)
-        client.setTree(final)
-      }
-      const cleanup = (): void => {
-        document.removeEventListener('pointermove', move)
-        document.removeEventListener('pointerup', up)
-        document.removeEventListener('pointercancel', up)
-      }
-      document.addEventListener('pointermove', move)
-      document.addEventListener('pointerup', up)
-      document.addEventListener('pointercancel', up)
+      gestures.start(event, {
+        move,
+        end: () => {
+          setSplitDragging(false)
+          commitTree(final)
+        },
+        cancel: () => {
+          setSplitDragging(false)
+          setTree(currentTree())
+        },
+      })
     }
 
     // Replace the collapse control in place with the ball or edge tab.
     const collapse = (): void => {
       if (closing) return
+      gestures.cancel()
       const buttonRect = rootRef.current?.querySelector<HTMLElement>('.dshpad-collapse')?.getBoundingClientRect()
       const center = buttonRect === undefined
         ? { x: dockPoint.x + dockWidth - COLLAPSE_CENTER_FROM_RIGHT, y: dockPoint.y + COLLAPSE_CENTER_Y }
@@ -611,11 +596,6 @@ export function createDock(client: PadClient) {
     const onBallPointerDown = (event: ReactPointerEvent<HTMLDivElement>): void => {
       if (event.button !== 0) return
       event.preventDefault()
-      try {
-        event.currentTarget.setPointerCapture(event.pointerId)
-      } catch {
-        // Synthetic pointers cannot be captured; document listeners still work.
-      }
       const startX = event.clientX
       const startY = event.clientY
       const start = ballPoint
@@ -628,7 +608,6 @@ export function createDock(client: PadClient) {
         setBallDrag(final)
       }
       const up = (): void => {
-        cleanup()
         if (!moved) {
           setBallDrag(undefined)
           openFromBall(start)
@@ -641,18 +620,7 @@ export function createDock(client: PadClient) {
         // position so the next open puts the collapse button under the ball.
         client.setLayout({ ball: snapped, ballEdge: edge, dock: null, dockControl: null })
       }
-      const cancel = (): void => {
-        cleanup()
-        setBallDrag(undefined)
-      }
-      const cleanup = (): void => {
-        document.removeEventListener('pointermove', move)
-        document.removeEventListener('pointerup', up)
-        document.removeEventListener('pointercancel', cancel)
-      }
-      document.addEventListener('pointermove', move)
-      document.addEventListener('pointerup', up)
-      document.addEventListener('pointercancel', cancel)
+      gestures.start(event, { move, end: up, cancel: () => setBallDrag(undefined) })
     }
 
     const onBallKey = (event: ReactKeyboardEvent<HTMLDivElement>): void => {
@@ -664,7 +632,7 @@ export function createDock(client: PadClient) {
 
     // Move the whole window from a pointer that started at (startX, startY).
     // Shared by the header and the long-press gesture on the star button.
-    const startDockMove = (startX: number, startY: number, onFirstMove?: () => void): void => {
+    const dockMove = (startX: number, startY: number) => {
       const start = dockPoint
       const width = dockWidth
       const boxHeight = asideRef.current?.getBoundingClientRect().height ?? MIN_DOCK_HEIGHT
@@ -675,32 +643,29 @@ export function createDock(client: PadClient) {
         if (!moved && Math.hypot(pointer.clientX - startX, pointer.clientY - startY) < DRAG_THRESHOLD) return
         if (!moved) {
           moved = true
-          onFirstMove?.()
-          if (control !== undefined && controlEdge != null) client.setLayout({ dockControl: { edge: controlEdge, point: control } })
           setDragHeight(height)
           // Detaching a top-edge dock must keep the width that fitted beside
           // the window buttons, rather than restoring the wider saved request.
           setDragWidth(width)
+          if (control !== undefined && controlEdge != null) setDragControl({ edge: controlEdge, point: control })
         }
         final = clampDock({ x: start.x + pointer.clientX - startX, y: start.y + pointer.clientY - startY }, width, viewport, height, dockMargin)
         setDockDrag(final)
       }
-      const up = (): void => {
-        cleanup()
-        if (!moved) return
+      const cancel = (): void => {
         setDockDrag(undefined)
         setDragHeight(undefined)
         setDragWidth(undefined)
-        client.setLayout({ dock: final, dockHeight: height, width })
+        setDragControl(undefined)
       }
-      const cleanup = (): void => {
-        document.removeEventListener('pointermove', move)
-        document.removeEventListener('pointerup', up)
-        document.removeEventListener('pointercancel', up)
+      const end = (): void => {
+        cancel()
+        if (!moved) return
+        client.setLayout({ dock: final, dockHeight: height, width,
+          ...(control === undefined || controlEdge == null ? {} : { dockControl: { edge: controlEdge, point: control } }),
+        })
       }
-      document.addEventListener('pointermove', move)
-      document.addEventListener('pointerup', up)
-      document.addEventListener('pointercancel', up)
+      return { move, end, cancel }
     }
 
     // Header drag: move the window anywhere in the viewport, and freeze its
@@ -709,12 +674,7 @@ export function createDock(client: PadClient) {
       if (event.button !== 0) return
       if ((event.target as HTMLElement).closest('button') !== null) return
       event.preventDefault()
-      try {
-        event.currentTarget.setPointerCapture(event.pointerId)
-      } catch {
-        // Synthetic pointers cannot be captured; document listeners still work.
-      }
-      startDockMove(event.clientX, event.clientY)
+      gestures.start(event, dockMove(event.clientX, event.clientY))
     }
 
     // A short press on the star collapses; holding it and moving drags the
@@ -722,58 +682,36 @@ export function createDock(client: PadClient) {
     const onCollapsePointerDown = (event: ReactPointerEvent<HTMLButtonElement>): void => {
       if (event.button !== 0) return
       event.stopPropagation()
-      suppressCollapseClick.current = false
-      const token = collapsePressToken.current + 1
-      collapsePressToken.current = token
-      if (holdTimer.current !== undefined) {
-        clearTimeout(holdTimer.current)
-        holdTimer.current = undefined
-      }
-      try {
-        event.currentTarget.setPointerCapture(event.pointerId)
-      } catch {
-        // Synthetic pointers cannot be captured; document listeners still work.
-      }
+      gestures.cancel()
+      clearSuppressedClick()
       const startX = event.clientX
       const startY = event.clientY
+      const movement = dockMove(startX, startY)
+      let held = false
       let moved = false
-      let dragged = false
-      let dragStarted = false
-      const clearTimer = (): void => {
-        if (holdTimer.current !== undefined) {
-          clearTimeout(holdTimer.current)
-          holdTimer.current = undefined
-        }
-      }
-      const beginDrag = (): void => {
-        if (dragStarted || token !== collapsePressToken.current) return
-        dragStarted = true
-        clearTimer()
-        startDockMove(startX, startY, () => { dragged = true })
-      }
-      const onMove = (pointer: PointerEvent): void => {
-        if (Math.hypot(pointer.clientX - startX, pointer.clientY - startY) > 8) {
+      const holdTimer = setTimeout(() => { held = true }, 260)
+      gestures.start(event, {
+        move: pointer => {
+          const distance = Math.hypot(pointer.clientX - startX, pointer.clientY - startY)
+          if (!moved && distance < (held ? DRAG_THRESHOLD : 8)) return
           moved = true
-          beginDrag()
-        }
-      }
-      const onUp = (): void => {
-        clearTimer()
-        document.removeEventListener('pointermove', onMove)
-        document.removeEventListener('pointerup', onUp)
-        document.removeEventListener('pointercancel', onUp)
-        if (!dragStarted && !moved) return
-        // A long hold that never actually moved is still a click: let the
-        // button's own onClick collapse instead of swallowing it.
-        if (!dragged && !moved) return
-        // The browser may still emit a click after a hold/drag; swallow it.
-        suppressCollapseClick.current = true
-        setTimeout(() => { suppressCollapseClick.current = false }, 500)
-      }
-      holdTimer.current = setTimeout(beginDrag, 260)
-      document.addEventListener('pointermove', onMove)
-      document.addEventListener('pointerup', onUp)
-      document.addEventListener('pointercancel', onUp)
+          movement.move(pointer)
+        },
+        end: () => {
+          clearTimeout(holdTimer)
+          movement.end()
+          if (!moved) return // A stationary long hold remains an ordinary click.
+          suppressCollapseClick.current = true
+          clickTimer.current = setTimeout(clearSuppressedClick, 500)
+        },
+        cancel: () => {
+          clearTimeout(holdTimer)
+          movement.cancel()
+          // A lost capture must not turn an abandoned drag into a collapse click.
+          suppressCollapseClick.current = true
+          clickTimer.current = setTimeout(clearSuppressedClick, 500)
+        },
+      })
     }
     const onCollapseClick = (): void => {
       if (suppressCollapseClick.current) {
@@ -788,18 +726,12 @@ export function createDock(client: PadClient) {
       if (event.button !== 0) return
       event.preventDefault()
       event.stopPropagation()
-      try {
-        event.currentTarget.setPointerCapture(event.pointerId)
-      } catch {
-        // Synthetic pointers cannot be captured; document listeners still work.
-      }
       const startX = event.clientX
       const startWidth = dockWidth
       const right = dockPoint.x + startWidth
       const maxWidth = Math.max(BALL_SIZE, Math.min(MAX_WIDTH, right - dockMargin))
       const minWidth = Math.min(MIN_WIDTH, maxWidth)
       const startControl = control === undefined || controlEdge == null ? undefined : { edge: controlEdge, point: control }
-      if (startControl !== undefined) client.setLayout({ dockControl: startControl })
       let finalControl = startControl
       let finalWidth = startWidth
       let finalPoint = dockPoint
@@ -813,41 +745,32 @@ export function createDock(client: PadClient) {
         setDragWidth(finalWidth)
         setDockDrag(finalPoint)
       }
-      const up = (): void => {
-        cleanup()
+      const cancel = (): void => {
         setDragWidth(undefined)
         setDockDrag(undefined)
         setDragControl(undefined)
-        client.setLayout({ width: finalWidth, dock: finalPoint, ...(finalControl === undefined ? {} : { dockControl: finalControl }) })
       }
-      const cleanup = (): void => {
-        document.removeEventListener('pointermove', move)
-        document.removeEventListener('pointerup', up)
-        document.removeEventListener('pointercancel', up)
-      }
-      document.addEventListener('pointermove', move)
-      document.addEventListener('pointerup', up)
-      document.addEventListener('pointercancel', up)
+      gestures.start(event, {
+        move,
+        end: () => {
+          cancel()
+          client.setLayout({ width: finalWidth, dock: finalPoint, ...(finalControl === undefined ? {} : { dockControl: finalControl }) })
+        },
+        cancel,
+      })
     }
 
     // Top edge: change height from above while the bottom edge stays put.
     const onTopEdgePointerDown = (event: ReactPointerEvent<HTMLDivElement>): void => {
       if (event.button !== 0) return
       event.preventDefault()
-      try {
-        event.currentTarget.setPointerCapture(event.pointerId)
-      } catch {
-        // Synthetic pointers cannot be captured; document listeners still work.
-      }
       const startY = event.clientY
       const boxHeight = asideRef.current?.getBoundingClientRect().height ?? savedHeight ?? MIN_DOCK_HEIGHT
       const bottom = Math.min(dockPoint.y + boxHeight, viewport.height - dockMargin)
       const startTop = dockPoint.y
       const minTop = dockSafeTop(dockPoint.x, dockWidth, viewport, dockMargin)
       const maxTop = Math.max(minTop, bottom - Math.min(MIN_DOCK_HEIGHT, boxHeight))
-      setDragWidth(dockWidth)
       const startControl = control === undefined || controlEdge == null ? undefined : { edge: controlEdge, point: control }
-      if (startControl !== undefined) client.setLayout({ dockControl: startControl })
       let finalControl = startControl
       let finalHeight = bottom - startTop
       let finalPoint = dockPoint
@@ -859,64 +782,59 @@ export function createDock(client: PadClient) {
           finalControl = resizedDockControl(startControl, dockPoint, finalPoint, dockWidth, finalHeight)
           setDragControl(finalControl)
         }
+        setDragWidth(dockWidth)
         setDragHeight(finalHeight)
         setDockDrag(finalPoint)
       }
-      const up = (): void => {
-        cleanup()
+      const cancel = (): void => {
         setDragHeight(undefined)
         setDragWidth(undefined)
         setDockDrag(undefined)
         setDragControl(undefined)
-        client.setLayout({ dockHeight: finalHeight, dock: finalPoint, width: dockWidth, ...(finalControl === undefined ? {} : { dockControl: finalControl }) })
       }
-      const cleanup = (): void => {
-        document.removeEventListener('pointermove', move)
-        document.removeEventListener('pointerup', up)
-        document.removeEventListener('pointercancel', up)
-      }
-      document.addEventListener('pointermove', move)
-      document.addEventListener('pointerup', up)
-      document.addEventListener('pointercancel', up)
+      gestures.start(event, {
+        move,
+        end: () => {
+          cancel()
+          client.setLayout({ dockHeight: finalHeight, dock: finalPoint, width: dockWidth, ...(finalControl === undefined ? {} : { dockControl: finalControl }) })
+        },
+        cancel,
+      })
     }
 
     // Bottom edge: grow or shrink the window downwards from a fixed top.
     const onBottomEdgePointerDown = (event: ReactPointerEvent<HTMLDivElement>): void => {
       if (event.button !== 0) return
       event.preventDefault()
-      try {
-        event.currentTarget.setPointerCapture(event.pointerId)
-      } catch {
-        // Synthetic pointers cannot be captured; document listeners still work.
-      }
       const startY = event.clientY
       const startHeight = asideRef.current?.getBoundingClientRect().height ?? savedHeight ?? MIN_DOCK_HEIGHT
       const maxHeight = Math.max(BALL_SIZE, viewport.height - dockPoint.y - dockMargin)
-      setDragWidth(dockWidth)
-      if (control !== undefined && controlEdge != null) client.setLayout({ dockControl: { edge: controlEdge, point: control } })
       let finalHeight = startHeight
       let finalPoint = dockPoint
       const move = (pointer: PointerEvent): void => {
         finalHeight = Math.round(clamp(startHeight + pointer.clientY - startY, Math.min(MIN_DOCK_HEIGHT, maxHeight), maxHeight))
         finalPoint = clampDock(dockPoint, dockWidth, viewport, finalHeight, dockMargin)
+        setDragWidth(dockWidth)
+        if (control !== undefined && controlEdge != null) setDragControl({ edge: controlEdge, point: control })
         setDragHeight(finalHeight)
         setDockDrag(finalPoint)
       }
-      const up = (): void => {
-        cleanup()
+      const cancel = (): void => {
         setDragHeight(undefined)
         setDragWidth(undefined)
         setDockDrag(undefined)
-        client.setLayout({ dockHeight: finalHeight, dock: finalPoint, width: dockWidth })
+        setDragControl(undefined)
       }
-      const cleanup = (): void => {
-        document.removeEventListener('pointermove', move)
-        document.removeEventListener('pointerup', up)
-        document.removeEventListener('pointercancel', up)
-      }
-      document.addEventListener('pointermove', move)
-      document.addEventListener('pointerup', up)
-      document.addEventListener('pointercancel', up)
+      gestures.start(event, {
+        move,
+        end: () => {
+          cancel()
+          client.setLayout({ dockHeight: finalHeight, dock: finalPoint, width: dockWidth,
+            ...(control === undefined || controlEdge == null ? {} : { dockControl: { edge: controlEdge, point: control } }),
+          })
+        },
+        cancel,
+      })
     }
 
     const renderNode = (node: LayoutNode, path: readonly number[]): ReactNode => {
@@ -924,8 +842,8 @@ export function createDock(client: PadClient) {
         const view = panelsById.get(node.id)
         if (view === undefined) return null
         return (
+          <RenderBoundary key={node.id} resetKey={view.version} title={view.definition.title} t={t}>
           <PanelCard
-            key={node.id}
             view={view}
             client={client}
             theme={theme}
@@ -940,6 +858,7 @@ export function createDock(client: PadClient) {
             onExpand={() => setFocusedId(view.id)}
             onDragStart={event => startCardDrag(view.id, event)}
           />
+          </RenderBoundary>
         )
       }
       const pathKey = path.join('.') || 'root'
@@ -973,7 +892,7 @@ export function createDock(client: PadClient) {
 
     if (!snap.layout.expanded) {
       return (
-        <div className="dshpad-root" ref={rootRef}>
+        <div className="dshpad-root" data-mode={theme.mode} ref={rootRef}>
           <div
             id="dshpad-ball"
             className={`dshpad-ball${ballDrag !== undefined ? ' is-dragging' : ''}${ballEdge === null ? '' : ` is-edge is-${ballEdge}`}`}
@@ -1015,7 +934,7 @@ export function createDock(client: PadClient) {
           ? t(DROP_LABEL.root)
           : t(DROP_LABEL.hint)
     return (
-      <div className="dshpad-root" ref={rootRef}>
+      <div className="dshpad-root" data-mode={theme.mode} ref={rootRef}>
         <aside ref={asideRef} className={`dshpad-dock${control === undefined ? '' : ` is-attached is-attached-${controlEdge}`}${controlGutter ? ' has-control-gutter' : ''}${dockWidth < 160 ? ' is-narrow' : ''}${dockDrag !== undefined ? ' is-moving' : ''}${closing ? ' is-closing' : ''}`}
           style={dockStyle} aria-label={t('dock.title')}>
           <div className="dshpad-dock-edge is-top" role="separator" aria-orientation="horizontal" title={t('dock.resizeHeight')} onPointerDown={onTopEdgePointerDown}
@@ -1161,6 +1080,7 @@ export function createDock(client: PadClient) {
                     {Icon.close}
                   </button>
                 </header>
+                <RenderBoundary resetKey={focusedView.version} title={focusedView.definition.title} t={t}>
                 {awaitingFirstData(focusedView.definition, focusedView.data)
                   ? <p className="dshpad-card-note">{t('card.firstData')}</p>
                   : (
@@ -1177,6 +1097,7 @@ export function createDock(client: PadClient) {
                       resizable={false}
                     />
                     )}
+                </RenderBoundary>
               </div>
             </div>
             )

@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest'
 import { parseOutput, runSource, secretNames } from '../src/host/sources.ts'
+import { MAX_SOURCE_JSON_DEPTH, MAX_SOURCE_JSON_NODES } from '../src/host/source-json.ts'
 import type { HttpSource } from '../src/shared/types.ts'
 
 const noSecrets = async (): Promise<string | undefined> => undefined
@@ -18,6 +19,19 @@ describe('parseOutput', () => {
 
   it('explains invalid json', () => {
     expect(() => parseOutput('nope', 'json')).toThrow(/不是合法 JSON/)
+  })
+
+  it('rejects small deeply nested JSON before it can enter the hub', () => {
+    const atLimit = '['.repeat(MAX_SOURCE_JSON_DEPTH) + '0' + ']'.repeat(MAX_SOURCE_JSON_DEPTH)
+    expect(() => JSON.stringify({ data: parseOutput(atLimit, 'json') })).not.toThrow()
+    const tooDeep = '['.repeat(10_000) + '0' + ']'.repeat(10_000)
+    expect(() => parseOutput(tooDeep, 'json')).toThrow(/JSON 嵌套超过/)
+    expect(() => parseOutput(tooDeep, 'json', new Set(['fixture-secret']))).toThrow(/JSON 嵌套超过/)
+  })
+
+  it('bounds broad JSON structures separately from their byte size', () => {
+    const broad = '[' + '0,'.repeat(MAX_SOURCE_JSON_NODES) + '0]'
+    expect(() => parseOutput(broad, 'json')).toThrow(/JSON 节点超过/)
   })
 })
 
@@ -66,6 +80,10 @@ describe('http sources', () => {
   beforeAll(async () => {
     server = createServer((req, res) => {
       seen.push({ auth: req.headers.authorization, url: req.url })
+      if (req.url?.startsWith('/deep')) {
+        res.end('['.repeat(10_000) + '1' + ']'.repeat(10_000))
+        return
+      }
       if (req.url?.startsWith('/fail')) {
         res.writeHead(401, { 'content-type': 'application/json' })
         res.end(`{"error":"bad key ${req.headers.authorization}"}`)
@@ -92,6 +110,12 @@ describe('http sources', () => {
 
   it('lists secret references', () => {
     expect(secretNames(source('/ok'))).toEqual(['TOKEN'])
+  })
+
+  it('reports excessive JSON nesting as a failed reading', async () => {
+    const reading = await runSource({ ...source('/deep'), url: `${base}/deep`, headers: {} }, noSecrets)
+    expect(reading).toMatchObject({ ok: false, error: expect.stringMatching(/JSON 嵌套超过/) })
+    expect(() => JSON.stringify({ panels: [{ data: reading }] })).not.toThrow()
   })
 
   it('fills secrets on the Host', async () => {
@@ -139,5 +163,86 @@ describe('http sources', () => {
     const reading = await runSource(source('/ok'), noSecrets)
     expect(reading).toMatchObject({ ok: false })
     expect(reading.error).toMatch(/密钥 TOKEN 没有配置/)
+  })
+})
+
+describe('HTTP redirect credential boundaries', () => {
+  let server: Server
+  let origin: string
+  let target: string
+  const received: Array<{ method: string, body: string, token?: string, url: string }> = []
+
+  beforeAll(async () => {
+    server = createServer(async (req, res) => {
+      if (req.url?.startsWith('/jump')) {
+        res.writeHead(302, { location: '/cross' })
+        res.end()
+        return
+      }
+      if (req.url?.startsWith('/cross')) {
+        res.writeHead(req.method === 'POST' ? 307 : 302, { location: target })
+        res.end()
+        return
+      }
+      if (req.url?.startsWith('/same')) {
+        res.writeHead(Number(new URL(req.url, origin).searchParams.get('status') ?? 302), { location: '/destination' })
+        res.end()
+        return
+      }
+      if (req.url?.startsWith('/loop')) {
+        res.writeHead(302, { location: '/loop' })
+        res.end()
+        return
+      }
+      const parts: Buffer[] = []
+      for await (const part of req) parts.push(part as Buffer)
+      received.push({ method: req.method!, body: Buffer.concat(parts).toString('utf8'), token: req.headers['x-api-key'] as string | undefined, url: req.url! })
+      res.end('{"ok":true}')
+    })
+    await new Promise<void>(resolve => server.listen(0, resolve))
+    const port = (server.address() as AddressInfo).port
+    origin = `http://127.0.0.1:${port}`
+    target = `http://localhost:${port}/destination`
+  })
+  afterAll(() => new Promise<void>(resolve => { server.closeAllConnections(); server.close(() => resolve()) }))
+
+  const http = (path: string, extra: Partial<HttpSource> = {}): HttpSource => ({
+    id: 'fixture', kind: 'http', url: origin + path, parse: 'json', intervalSec: 60, timeoutMs: 1000, ...extra,
+  })
+
+  it('blocks a custom credential header before a different hostname is contacted', async () => {
+    const count = received.length
+    const reading = await runSource(http('/cross', { headers: { 'x-api-key': '{{env:TOKEN}}' } }), async () => 'fixture-token')
+    expect(reading).toMatchObject({ ok: false, error: expect.stringMatching(/不能跨 origin/) })
+    expect(reading.error).not.toContain('fixture-token')
+    expect(received).toHaveLength(count)
+  })
+
+  it('checks later hops and literal custom headers too', async () => {
+    const count = received.length
+    const reading = await runSource(http('/jump', { headers: { 'x-api-key': 'fixture-literal' } }), noSecrets)
+    expect(reading).toMatchObject({ ok: false, error: expect.stringMatching(/不能跨 origin/) })
+    expect(received).toHaveLength(count)
+  })
+
+  it('does not resend credential-bearing POST bodies on cross-origin 307', async () => {
+    const count = received.length
+    const reading = await runSource(http('/cross', { method: 'POST', body: '{"token":"{{env:TOKEN}}"}', headers: { 'content-type': 'application/json' } }), async () => 'fixture-post-token')
+    expect(reading).toMatchObject({ ok: false, error: expect.stringMatching(/不能跨 origin/) })
+    expect(received).toHaveLength(count)
+  })
+
+  it('keeps same-origin credentials on 307 and applies POST-to-GET on 303', async () => {
+    const extra: Partial<HttpSource> = { method: 'POST', body: 'token={{env:TOKEN}}', headers: { 'x-api-key': '{{env:TOKEN}}' } }
+    expect((await runSource(http('/same?status=307', extra), async () => 'fixture-post')).ok).toBe(true)
+    expect(received.at(-1)).toMatchObject({ method: 'POST', body: 'token=fixture-post', token: 'fixture-post' })
+    expect((await runSource(http('/same?status=303', extra), async () => 'fixture-post')).ok).toBe(true)
+    expect(received.at(-1)).toMatchObject({ method: 'GET', body: '', token: 'fixture-post' })
+  })
+
+  it('allows public cross-origin GETs and bounds redirect loops', async () => {
+    expect((await runSource(http('/cross'), noSecrets)).ok).toBe(true)
+    expect(received.at(-1)).toMatchObject({ method: 'GET', body: '', url: '/destination' })
+    expect(await runSource(http('/loop'), noSecrets)).toMatchObject({ ok: false, error: expect.stringMatching(/重定向超过/) })
   })
 })

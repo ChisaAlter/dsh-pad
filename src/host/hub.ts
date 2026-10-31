@@ -16,6 +16,8 @@ export interface Subscriber {
   /** Watched panel ids; polling runs for the union of all subscribers. */
   watch: ReadonlySet<string>
   send(event: StreamEvent): void
+  /** Release the transport if delivery fails. */
+  close?(): void
 }
 
 export interface DataHubOptions {
@@ -90,9 +92,8 @@ export class DataHub {
       for (const [sourceId, entry] of readings) if (current.get(sourceId) !== entry.key) readings.delete(sourceId)
       if (readings.size === 0) this.readings.delete(panelId)
     }
-    const approved = new Set(panels.filter(panel => this.store.approved(panel)).map(panel => panel.id))
     for (const [panelId, runs] of this.inFlight) {
-      const current = approved.has(panelId) ? keys.get(panelId) : undefined
+      const current = keys.get(panelId)
       for (const [sourceId, run] of runs) {
         if (current?.get(sourceId) === run.key) continue
         runs.delete(sourceId)
@@ -109,7 +110,7 @@ export class DataHub {
     this.subscribers.add(subscriber)
     // The first frame of a page also carries the cached trend; later broadcasts
     // skip it, since live readings keep the page's history up to date.
-    subscriber.send({ type: 'panels', panels: this.views(true) })
+    this.deliver(subscriber, { type: 'panels', panels: this.views(true) })
     this.reconcile()
     return () => {
       this.subscribers.delete(subscriber)
@@ -131,8 +132,9 @@ export class DataHub {
     if (this.disposed) return
     const panel = this.store.get(panelId)
     if (panel.definition.agent) this.onAgentRefresh(panelId)
-    if (!this.store.approved(panel)) return
-    for (const source of panel.definition.sources) void this.runNow(panel, source.id)
+    for (const source of panel.definition.sources) {
+      void this.runNow(panel, source.id).catch(() => {})
+    }
   }
 
   /** Send fresh data for one panel (after agent data changed). */
@@ -168,8 +170,6 @@ export class DataHub {
       updatedAt: panel.updatedAt,
       definition: panel.definition,
       canUndo: panel.previous !== undefined,
-      needsApproval: !this.store.approved(panel),
-      fingerprint: sourcesFingerprint(panel.definition.sources),
       agentRun: panel.agentRun ?? null,
       data: this.data(panel),
       history: withHistory ? this.history(panel) : {},
@@ -203,13 +203,13 @@ export class DataHub {
     return ids
   }
 
-  /** Start timers for watched, approved sources; stop everything else. */
+  /** Start timers for watched sources; stop everything else. */
   private reconcile(): void {
     if (this.disposed) return
     const watched = this.watched()
     const live = new Map<string, Set<string>>()
     for (const panel of this.store.list()) {
-      if (!watched.has(panel.id) || !this.store.approved(panel)) continue
+      if (!watched.has(panel.id)) continue
       const keep = new Set<string>()
       live.set(panel.id, keep)
       let timers = this.timers.get(panel.id)
@@ -229,7 +229,7 @@ export class DataHub {
         const last = existing === undefined ? this.readings.get(panel.id)?.get(source.id) : undefined
         const age = last?.key === key ? Date.now() - Date.parse(last.reading.at) : Infinity
         const wait = Math.max(0, source.intervalSec * 1000 - age)
-        entry.timer = setTimeout(() => void this.tick(panel.id, source.id), wait)
+        entry.timer = setTimeout(() => { void this.tick(panel.id, source.id).catch(() => {}) }, wait)
       }
     }
     for (const [panelId, timers] of this.timers) {
@@ -248,10 +248,14 @@ export class DataHub {
     const panel = this.store.find(panelId)
     const source = panel?.definition.sources.find(s => s.id === sourceId)
     if (entry === undefined || panel === undefined || source === undefined) return
-    await this.runNow(panel, sourceId)
-    // Re-arm only if this timer is still the live one for the source.
-    if (this.timers.get(panelId)?.get(sourceId) === entry && !this.disposed) {
-      entry.timer = setTimeout(() => void this.tick(panelId, sourceId), source.intervalSec * 1000)
+    try {
+      await this.runNow(panel, sourceId)
+    } finally {
+      // A failing source/observer must not permanently stop polling. Re-arm
+      // only if this timer still belongs to the current source and watcher.
+      if (this.timers.get(panelId)?.get(sourceId) === entry && !this.disposed) {
+        entry.timer = setTimeout(() => { void this.tick(panelId, sourceId).catch(() => {}) }, source.intervalSec * 1000)
+      }
     }
   }
 
@@ -278,9 +282,6 @@ export class DataHub {
     if (latest === undefined || latestSource === undefined || this.sourceKey(latestSource) !== key) {
       return { ok: false, error: '数据源已经变更', at: new Date().toISOString() }
     }
-    if (!this.store.approved(latest)) {
-      return { ok: false, error: '数据源还没被允许运行', at: new Date().toISOString() }
-    }
     let runs = this.inFlight.get(panel.id)
     if (runs === undefined) {
       runs = new Map()
@@ -295,7 +296,7 @@ export class DataHub {
       const current = this.store.find(panel.id)
       // A superseded run must not replace a new reading or erase its cache.
       const still = current?.definition.sources.find(s => s.id === sourceId)
-      if (this.disposed || controller.signal.aborted || current === undefined || !this.store.approved(current) || still === undefined || this.sourceKey(still) !== key) return reading
+      if (this.disposed || controller.signal.aborted || current === undefined || still === undefined || this.sourceKey(still) !== key) return reading
       let readings = this.readings.get(panel.id)
       if (readings === undefined) {
         readings = new Map()
@@ -329,12 +330,27 @@ export class DataHub {
     return key
   }
 
+  /** One broken transport must not reject a source run or block other pages. */
+  private deliver(subscriber: Subscriber, event: StreamEvent): void {
+    try {
+      subscriber.send(event)
+    } catch {
+      this.subscribers.delete(subscriber)
+      try {
+        subscriber.close?.()
+      } catch {
+        // Removing the failed subscriber is enough to stop its polling lease.
+      }
+      this.reconcile()
+    }
+  }
+
   private broadcastData(panel: PanelRecord): void {
     const event: StreamEvent = { type: 'data', panelId: panel.id, data: this.data(panel) }
-    for (const subscriber of this.subscribers) if (subscriber.watch.has(panel.id)) subscriber.send(event)
+    for (const subscriber of this.subscribers) if (subscriber.watch.has(panel.id)) this.deliver(subscriber, event)
   }
 
   private broadcast(event: StreamEvent): void {
-    for (const subscriber of this.subscribers) subscriber.send(event)
+    for (const subscriber of this.subscribers) this.deliver(subscriber, event)
   }
 }

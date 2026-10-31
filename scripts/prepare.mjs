@@ -13,6 +13,16 @@ import { existsSync } from 'node:fs'
 
 const root = new URL('../', import.meta.url)
 const built = existsSync(new URL('lib/index.js', root)) && existsSync(new URL('lib/client.js', root))
+const source = existsSync(new URL('src/index.ts', root))
+
+// Packed releases contain ready-to-load bundles without a source toolchain.
+// A consumer may happen to provide esbuild; that must not trigger a missing-src
+// rebuild or invalidate an otherwise complete installation.
+if (!source) {
+  if (built) process.exit(0)
+  console.error('dsh-pad: 发行包缺少 lib/，且不含可构建的源码，请重新安装完整发行包。')
+  process.exit(1)
+}
 
 let esbuild
 try {

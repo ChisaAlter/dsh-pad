@@ -23,7 +23,7 @@ const platform = (id: string): unknown => {
 function moduleExports(source: string, globals: Record<string, unknown> = {}): Record<string, any> {
   let registration: { factory: (require: (id: string) => unknown) => Record<string, any> } | undefined
   runInNewContext(source, {
-    console, setTimeout, clearTimeout, URL, ...globals,
+    console, setTimeout, clearTimeout, URL, queueMicrotask, ...globals,
     window: { innerWidth: 1440, innerHeight: 900, __ModuleLoader__: { load: (value: typeof registration) => { registration = value } } },
   })
   if (registration === undefined) throw new Error('No client module registration')
@@ -41,7 +41,7 @@ beforeAll(async () => {
 })
 afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks() })
 
-async function environment() {
+async function environment(declared = true) {
   const ctx = new Context()
   const styles: unknown[] = []
   const document = {
@@ -62,7 +62,7 @@ async function environment() {
     'shell.overlay': { kind: 'list', scope: 'root' },
     'conversation.input.overlay': { kind: 'list', scope: 'root' },
   } }, () => null)
-  const disposeDeclaration = declare()
+  const disposeDeclaration = declared ? declare() : () => {}
   return { ctx, document, styles, locale, registry, declare, disposeDeclaration, dictionaries: () => dictionaryCount }
 }
 
@@ -143,6 +143,121 @@ describe('dock activation and recovery', () => {
       await fiber.await()
       expect(env.registry.entries('shell.overlay')).toHaveLength(1)
       expect(env.registry.entries('conversation.input.overlay')).toHaveLength(1)
+    } finally { await env.ctx.fiber.dispose() }
+  })
+
+  it('retries a delayed registration failure after its declaration is already live', async () => {
+    vi.useFakeTimers()
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+    const env = await environment(false)
+    const plugin = moduleExports(source, { document: env.document, EventSource: class { close() {} } })
+    const register = env.registry._register.bind(env.registry)
+    let blocked = true
+    vi.spyOn(env.registry, '_register').mockImplementation((options: any, component: unknown) => {
+      if (options.id === 'dsh-pad' && blocked) throw new Error('temporary registration failure')
+      return register(options, component)
+    })
+    const fiber = env.ctx.plugin(plugin as any).ctx.fiber
+    try {
+      await fiber.await()
+      env.declare()
+      await tick()
+      expect(env.registry.entriesOfSlot('shell.overlay')).toHaveLength(0)
+      blocked = false
+      await vi.advanceTimersByTimeAsync(3000)
+      expect(env.registry.entriesOfSlot('shell.overlay')).toHaveLength(1)
+      expect(env.registry.entriesOfSlot('conversation.input.overlay')).toHaveLength(1)
+      expect(fiber.state).toBe(2)
+    } finally { await env.ctx.fiber.dispose() }
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
+  it('restores an entrance retired by the renderer without duplicating its registration', async () => {
+    vi.useFakeTimers()
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+    const env = await environment()
+    const plugin = moduleExports(source, { document: env.document, EventSource: class { close() {} } })
+    const fiber = env.ctx.plugin(plugin as any).ctx.fiber
+    try {
+      await fiber.await()
+      const entry = env.registry.entries('shell.overlay')[0]
+      env.registry._core.reportEntryError('shell.overlay', entry, new Error('temporary slot render failure'), { abdicate: true })
+      expect(env.registry.entries('shell.overlay')).toHaveLength(1)
+      expect(env.registry.entriesOfSlot('shell.overlay')).toHaveLength(0)
+      await vi.advanceTimersByTimeAsync(3000)
+      expect(env.registry.entriesOfSlot('shell.overlay')).toHaveLength(1)
+      expect(env.registry.entries('shell.overlay')).toHaveLength(1)
+      expect(env.registry.entriesOfSlot('shell.overlay')[0]).not.toBe(entry)
+      expect(env.registry.entriesOfSlot('conversation.input.overlay')).toHaveLength(1)
+      expect(env.styles).toHaveLength(1)
+    } finally { await env.ctx.fiber.dispose() }
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
+  it('backs off repeated renderer failures without stacking retries or registrations', async () => {
+    vi.useFakeTimers()
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+    const env = await environment()
+    const plugin = moduleExports(source, { document: env.document, EventSource: class { close() {} } })
+    const fiber = env.ctx.plugin(plugin as any).ctx.fiber
+    try {
+      await fiber.await()
+      for (const delay of [3000, 6000, 12000]) {
+        const entry = env.registry.entries('shell.overlay')[0]
+        env.registry._core.reportEntryError('shell.overlay', entry, new Error('persistent render failure'), { abdicate: true })
+        expect(vi.getTimerCount()).toBe(1)
+        await vi.advanceTimersByTimeAsync(delay - 1)
+        expect(env.registry.entriesOfSlot('shell.overlay')).toHaveLength(0)
+        await vi.advanceTimersByTimeAsync(1)
+        expect(env.registry.entriesOfSlot('shell.overlay')).toHaveLength(1)
+        expect(env.registry.entries('shell.overlay')).toHaveLength(1)
+        expect(vi.getTimerCount()).toBe(0)
+      }
+    } finally { await env.ctx.fiber.dispose() }
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
+  it('cancels a pending recovery when a declaration disappears and registers once when it returns', async () => {
+    vi.useFakeTimers()
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+    const env = await environment()
+    const plugin = moduleExports(source, { document: env.document, EventSource: class { close() {} } })
+    const fiber = env.ctx.plugin(plugin as any).ctx.fiber
+    try {
+      await fiber.await()
+      const entry = env.registry.entries('shell.overlay')[0]
+      env.registry._core.reportEntryError('shell.overlay', entry, new Error('temporary render failure'), { abdicate: true })
+      expect(vi.getTimerCount()).toBe(1)
+      env.disposeDeclaration()
+      expect(vi.getTimerCount()).toBe(0)
+      await vi.advanceTimersByTimeAsync(5000)
+      expect(env.registry.entries('shell.overlay')).toHaveLength(0)
+      env.declare()
+      expect(env.registry.entriesOfSlot('shell.overlay')).toHaveLength(1)
+      expect(env.registry.entriesOfSlot('conversation.input.overlay')).toHaveLength(1)
+      expect(vi.getTimerCount()).toBe(0)
+    } finally { await env.ctx.fiber.dispose() }
+  })
+
+  it('does not reinstall a retired entrance after the plugin unloads', async () => {
+    vi.useFakeTimers()
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+    const env = await environment()
+    const close = vi.fn()
+    const plugin = moduleExports(source, { document: env.document, EventSource: class { close = close } })
+    const fiber = env.ctx.plugin(plugin as any).ctx.fiber
+    try {
+      await fiber.await()
+      const entry = env.registry.entries('shell.overlay')[0]
+      env.registry._core.reportEntryError('shell.overlay', entry, new Error('slot render failure'), { abdicate: true })
+      await fiber.dispose()
+      await vi.advanceTimersByTimeAsync(10000)
+      expect(env.registry.entriesOfSlot('shell.overlay')).toHaveLength(0)
+      expect(env.registry.entries('shell.overlay')).toHaveLength(0)
+      expect(env.styles).toHaveLength(0)
+      expect(env.dictionaries()).toBe(0)
+      expect(close).toHaveBeenCalledOnce()
+      expect(vi.getTimerCount()).toBe(0)
     } finally { await env.ctx.fiber.dispose() }
   })
 

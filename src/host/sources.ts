@@ -5,6 +5,7 @@
  */
 import { spawn, type ChildProcess } from 'node:child_process'
 import type { HttpSource, Json, PanelSource, SourceParse, SourceReading } from '../shared/types.ts'
+import { assertSourceJson } from './source-json.ts'
 
 /** Resolves a secret reference name to its value, or undefined when unset. */
 export type SecretResolver = (name: string) => Promise<string | undefined>
@@ -12,6 +13,10 @@ export type SecretResolver = (name: string) => Promise<string | undefined>
 export const MAX_OUTPUT_BYTES = 512 * 1024
 const DEFAULT_TIMEOUT_MS = 10_000
 const SECRET_REF = /\{\{\s*env:([A-Za-z_][A-Za-z0-9_]*)\s*\}\}/g
+const MAX_HTTP_REDIRECTS = 10
+const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308])
+// Custom headers and request bodies may hold credentials even without env refs.
+const PUBLIC_REDIRECT_HEADERS = new Set(['accept', 'accept-language', 'content-type', 'user-agent'])
 
 /**
  * Turn raw output into the value the panel script receives.
@@ -22,11 +27,14 @@ const SECRET_REF = /\{\{\s*env:([A-Za-z_][A-Za-z0-9_]*)\s*\}\}/g
  */
 export function parseOutput(raw: string, parse: SourceParse, secrets: ReadonlySet<string> = new Set()): Json {
   if (parse === 'json') {
+    let value: unknown
     try {
-      return redactValue(JSON.parse(raw) as Json, secrets)
+      value = JSON.parse(raw)
     } catch {
       throw new Error(`输出不是合法 JSON（开头：${redact(raw, secrets).slice(0, 120)}）`)
     }
+    assertSourceJson(value)
+    return redactValue(value, secrets)
   }
   const safe = redact(raw, secrets)
   if (parse === 'lines') return safe.split(/\r?\n/).filter(line => line.trim() !== '')
@@ -193,19 +201,40 @@ function runCommand(command: string, timeoutMs: number, signal?: AbortSignal): P
 }
 
 async function runHttp(source: HttpSource, timeoutMs: number, resolve: SecretResolver, used: Set<string>, signal?: AbortSignal): Promise<string> {
-  const url = await fillSecrets(source.url, resolve, used)
-  const headers: Record<string, string> = {}
-  for (const [key, value] of Object.entries(source.headers ?? {})) headers[key] = await fillSecrets(value, resolve, used)
-  const body = source.body === undefined ? undefined : await fillSecrets(source.body, resolve, used)
+  let url = new URL(await fillSecrets(source.url, resolve, used))
+  const headers = new Headers({ 'user-agent': 'dsh-pad' })
+  for (const [key, value] of Object.entries(source.headers ?? {})) headers.set(key, await fillSecrets(value, resolve, used))
+  let body = source.body === undefined ? undefined : await fillSecrets(source.body, resolve, used)
+  let method = source.method ?? 'GET'
+  const carriesCredentials = used.size > 0 || body !== undefined
+    || [...headers.keys()].some(key => !PUBLIC_REDIRECT_HEADERS.has(key))
   if (signal?.aborted) throw new Error('已取消')
   const timeout = AbortSignal.timeout(timeoutMs)
-  const response = await fetch(url, {
-    method: source.method ?? 'GET',
-    headers: { 'user-agent': 'dsh-pad', ...headers },
-    ...(body === undefined ? {} : { body }),
-    redirect: 'follow',
-    signal: signal ? AbortSignal.any([signal, timeout]) : timeout,
-  })
+  const requestSignal = signal ? AbortSignal.any([signal, timeout]) : timeout
+  let response: Response
+  for (let redirects = 0; ; redirects += 1) {
+    response = await fetch(url, {
+      method,
+      headers,
+      ...(body === undefined ? {} : { body }),
+      redirect: 'manual',
+      signal: requestSignal,
+    })
+    const location = response.headers.get('location')
+    if (!REDIRECT_STATUSES.has(response.status) || location === null) break
+    // Intermediate bodies must not retain sockets while we reject or follow.
+    await response.body?.cancel()
+    if (redirects >= MAX_HTTP_REDIRECTS) throw new Error(`HTTP 重定向超过 ${MAX_HTTP_REDIRECTS} 次`)
+    const target = new URL(location, url)
+    if (target.protocol !== 'http:' && target.protocol !== 'https:') throw new Error('HTTP 重定向目标必须是 http(s) 网址')
+    if (carriesCredentials && target.origin !== url.origin) throw new Error('含凭据的 HTTP 请求不能跨 origin 重定向，请直接配置可信目标网址')
+    if ((response.status === 303 && method !== 'GET') || ((response.status === 301 || response.status === 302) && method === 'POST')) {
+      method = 'GET'
+      body = undefined
+      for (const key of ['content-type', 'content-length', 'content-encoding', 'content-language', 'content-location']) headers.delete(key)
+    }
+    url = target
+  }
   const reader = response.body?.getReader()
   const chunks: Uint8Array[] = []
   let size = 0
