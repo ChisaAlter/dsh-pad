@@ -81,7 +81,9 @@ export interface PanelCardProps {
   readonly dropZone?: DropZone
   readonly onAsk: (text: string, submit: boolean) => void
   readonly onExpand: () => void
-  readonly onDragStart: (event: ReactPointerEvent<HTMLElement>) => void
+  readonly onDragStart?: (event: ReactPointerEvent<HTMLElement>) => void
+  /** Presentation actions for the Whale sidebar, not panel deletion. */
+  readonly sidebarActions?: readonly { label: string; disabled?: boolean; run: () => void }[]
 }
 
 function CardStatus({ t, updated, refreshing, attention, active }: {
@@ -93,7 +95,7 @@ function CardStatus({ t, updated, refreshing, attention, active }: {
   return <span className={`dshpad-card-meta${attention ? ' is-alert' : ''}`}>{meta}</span>
 }
 
-export function PanelCard({ view, client, theme, lang, t, clockActive, fresh, dragging, dropTarget, dropZone, onAsk, onExpand, onDragStart }: PanelCardProps) {
+export function PanelCard({ view, client, theme, lang, t, clockActive, fresh, dragging, dropTarget, dropZone, onAsk, onExpand, onDragStart, sidebarActions }: PanelCardProps) {
   const [menuOpen, setMenuOpen] = useState(false)
   const [confirmDelete, setConfirmDelete] = useState(false)
   const [modelOpen, setModelOpen] = useState(false)
@@ -213,16 +215,16 @@ export function PanelCard({ view, client, theme, lang, t, clockActive, fresh, dr
     if (target.closest('button') !== null) return
     if (target.closest('.dshpad-card-actions') !== null) return
     if (target.closest('.dshpad-expand') !== null) return
-    onDragStart(event)
+    onDragStart?.(event)
   }
 
   return (
     <article className={`dshpad-card${fresh ? ' is-fresh' : ''}${folded ? ' is-folded' : ''}${dragging ? ' is-dragging' : ''}${dropTarget ? ' is-drop-target' : ''}${dropZone === undefined ? '' : ` is-drop-${dropZone}`}`}
       aria-label={definition.title} data-panel-id={view.id}>
       <header className="dshpad-card-head" onPointerDown={startHeaderDrag}>
-        <span className="dshpad-card-grip" title={t('card.drag')} aria-label={t('card.drag')} role="button" tabIndex={-1}>
+        {onDragStart && <span className="dshpad-card-grip" title={t('card.drag')} aria-label={t('card.drag')} role="button" tabIndex={-1}>
           {Icon.grip}
-        </span>
+        </span>}
         <div className="dshpad-card-actions" ref={menuRef}>
           <button type="button" className="dshpad-more" title={t('card.more')} aria-label={t('card.more')}
             aria-haspopup="menu" aria-expanded={menuOpen}
@@ -249,12 +251,15 @@ export function PanelCard({ view, client, theme, lang, t, clockActive, fresh, dr
                   <span className="dshpad-menu-value">{modelLabel}</span>
                 </button>
                 <hr />
-                <button type="button" role="menuitem" className="is-danger" onClick={() => {
+                {sidebarActions ? sidebarActions.map(action => (
+                  <button key={action.label} type="button" role="menuitem" disabled={action.disabled}
+                    onClick={() => { setMenuOpen(false); action.run() }}>{action.label}</button>
+                )) : <button type="button" role="menuitem" className="is-danger" onClick={() => {
                   setMenuOpen(false)
                   setConfirmDelete(true)
                 }}>
                   <span className="dshpad-mi">{MenuIcon.trash}</span>{t('card.delete')}
-                </button>
+                </button>}
               </div>
               )
             : null}

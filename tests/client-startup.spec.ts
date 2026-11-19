@@ -17,6 +17,7 @@ const platform = (id: string): unknown => {
   if (id === 'react') return { Component: class {}, createContext: () => ({}) }
   if (id === 'react/jsx-runtime') return { jsx: (type: unknown, props: unknown) => ({ type, props }), jsxs: (type: unknown, props: unknown) => ({ type, props }) }
   if (id === 'react-dom' || id === 'react-dom/client') return {}
+  if (id === '@deepseek-ai/dsh-client-ui-primitives') return {}
   return require(id)
 }
 
@@ -69,6 +70,26 @@ async function environment(declared = true) {
 const tick = async (): Promise<void> => { for (let n = 0; n < 12; n++) await Promise.resolve() }
 
 describe('dock activation and recovery', () => {
+  it('adds the same Pad to a Whale sidebar declared after startup, and releases it on disable', async () => {
+    const env = await environment()
+    const plugin = moduleExports(source, { document: env.document, EventSource: class { close() {} } })
+    const fiber = env.ctx.plugin(plugin as any).ctx.fiber
+    try {
+      await fiber.await()
+      expect(env.registry.entries('shell.overlay')).toHaveLength(1)
+      expect(env.registry.spec('whale.panels')).toBeUndefined()
+      const removeWhale = env.registry.register({ name: 'shell.overlay', id: 'whale', children: {
+        'whale.panels': { kind: 'single', scope: 'root' },
+      } }, () => null)
+      await tick()
+      expect(env.registry.entries('whale.panels')).toHaveLength(1)
+      await fiber.dispose()
+      expect(env.registry.entries('whale.panels')).toHaveLength(0)
+      removeWhale()
+      expect(env.registry.spec('whale.panels')).toBeUndefined()
+    } finally { await env.ctx.fiber.dispose() }
+  })
+
   it('keeps its entrance when the first stream construction fails, then reconnects', async () => {
     vi.useFakeTimers()
     const env = await environment()

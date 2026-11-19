@@ -566,6 +566,20 @@ describe('focused frame source subscriptions', () => {
     expect(watched()).toEqual([])
   })
 
+  it('retains an embedded panel watch while the floating dock is collapsed', () => {
+    client.setLayout({ expanded: false })
+    const release = client.watchPanel('p_1', 'embedded')
+    expect(watched()).toEqual(['p_1'])
+    documentStub.visibilityState = 'hidden'
+    visibility.dispatchEvent(new Event('visibilitychange'))
+    expect(watched()).toEqual([])
+    documentStub.visibilityState = 'visible'
+    visibility.dispatchEvent(new Event('visibilitychange'))
+    expect(watched()).toEqual(['p_1'])
+    release()
+    expect(watched()).toEqual([])
+  })
+
   it('does not watch deleted or unknown panels and stops reconnecting after shutdown', () => {
     const releaseUnknown = client.watchPanel('p_missing')
     expect(watched()).toEqual([])
