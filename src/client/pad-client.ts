@@ -302,8 +302,8 @@ export class PadClient {
   private readonly listeners = new Set<() => void>()
   private readonly history = new Map<string, Map<string, HistoryPoint[]>>()
   private readonly sourceKeys = new Map<string, Map<string, string>>()
-  /** Ephemeral visible frames (e.g. a folded card opened in the focus dialog). */
-  private readonly visiblePanels = new Map<string, number>()
+  private readonly focusedPanels = new Map<string, number>()
+  private readonly embeddedPanels = new Map<string, number>()
   private source: EventSource | undefined
   private watchKey = ''
   private known: Set<string> | undefined
@@ -362,17 +362,18 @@ export class PadClient {
     return this.snapshot.layout.tree
   }
 
-  /** Keep a focused frame polling without changing the card's persisted folded state. */
-  watchPanel(panelId: string): () => void {
-    this.visiblePanels.set(panelId, (this.visiblePanels.get(panelId) ?? 0) + 1)
+  /** Keep a focused or embedded frame polling while its surface is visible. */
+  watchPanel(panelId: string, surface: 'dock' | 'embedded' = 'dock'): () => void {
+    const panels = surface === 'embedded' ? this.embeddedPanels : this.focusedPanels
+    panels.set(panelId, (panels.get(panelId) ?? 0) + 1)
     this.reconnect()
     let released = false
     return () => {
       if (released) return
       released = true
-      const remaining = (this.visiblePanels.get(panelId) ?? 1) - 1
-      if (remaining > 0) this.visiblePanels.set(panelId, remaining)
-      else this.visiblePanels.delete(panelId)
+      const remaining = (panels.get(panelId) ?? 1) - 1
+      if (remaining > 0) panels.set(panelId, remaining)
+      else panels.delete(panelId)
       this.reconnect()
     }
   }
@@ -477,10 +478,11 @@ export class PadClient {
     }
   }
 
-  /** Panels the Host should poll: everything visible in an expanded dock. */
+  /** Panels the Host should poll across the open dock and embedded views. */
   private watchIds(): string[] {
-    if (!this.snapshot.layout.expanded || (typeof document !== 'undefined' && document.visibilityState === 'hidden')) return []
-    return this.snapshot.panels.filter(p => !p.collapsed || this.visiblePanels.has(p.id)).map(p => p.id)
+    if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return []
+    return this.snapshot.panels.filter(p => this.embeddedPanels.has(p.id)
+      || (this.snapshot.layout.expanded && (!p.collapsed || this.focusedPanels.has(p.id)))).map(p => p.id)
   }
 
   /** (Re)open the stream when the watched set changed. */
