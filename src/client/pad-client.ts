@@ -7,6 +7,7 @@ import type { PanelAction, PanelData, PanelDefinition, PanelModelCatalog, PanelR
 import { ROUTES } from '../shared/types.ts'
 import { type LayoutNode, legacyRowsToTree, normalizeTree, parseTree } from './layout.ts'
 import type { BallEdge } from './ball-position.ts'
+import { STATE_PREFIX } from './panel-state.ts'
 
 export const HISTORY_LIMIT = 120
 
@@ -25,24 +26,17 @@ export interface Point {
   readonly y: number
 }
 
-export interface DockControl {
-  readonly edge: BallEdge
-  readonly point: Point
-}
-
 export interface DockLayout {
   readonly expanded: boolean
   readonly width: number
   /** Nested card layout; null when there are no panels yet. */
   readonly tree: LayoutNode | null
-  /** Floating ball's top-left corner. */
-  readonly ball: Point
+  /** Floating ball's top-left corner; null defers default placement until a non-zero viewport. */
+  readonly ball: Point | null
   /** Attached edge; null is a free ball, absent migrates a legacy position. */
   readonly ballEdge?: BallEdge | null
   /** Where the user last put the expanded window; null opens next to the ball. */
   readonly dock: Point | null
-  /** Edge and position along it retained when moving or resizing an attached window. */
-  readonly dockControl?: DockControl | null
   /** Per-panel iframe height in px, set by dragging a panel's bottom edge. */
   readonly heights: Readonly<Record<string, number>>
   /** Dock height in px, set by dragging the dock's top or bottom edge. */
@@ -59,6 +53,8 @@ export interface PadSnapshot {
   readonly layout: DockLayout
   /** Id of a panel created while this page was open, for a short highlight. */
   readonly fresh: string | undefined
+  /** Whether an embedded Big Fish surface owns the active sidebar view. */
+  readonly embeddedMode: boolean
 }
 
 /** Reject malformed readings before they can poison the rendered snapshot. */
@@ -94,11 +90,11 @@ function viewportSize(): { width: number, height: number } {
 }
 
 /** Default floating-ball spot: just inside the right edge, a little above centre. */
-function defaultBall(): Point {
-  const { width, height } = viewportSize()
+export function defaultBall(width?: number, height?: number): Point {
+  const size = width !== undefined && height !== undefined ? { width, height } : viewportSize()
   return {
-    x: Math.max(BALL_MARGIN, Math.round(width - BALL_SIZE - BALL_SNAP_INSET)),
-    y: Math.max(BALL_MARGIN, Math.round(height * 0.42 - BALL_SIZE / 2)),
+    x: Math.max(BALL_MARGIN, Math.round(size.width - BALL_SIZE - BALL_SNAP_INSET)),
+    y: Math.max(BALL_MARGIN, Math.round(size.height * 0.42 - BALL_SIZE / 2)),
   }
 }
 
@@ -106,7 +102,7 @@ const DEFAULT_LAYOUT: DockLayout = {
   expanded: false,
   width: DEFAULT_WIDTH,
   tree: null,
-  ball: defaultBall(),
+  ball: null,
   dock: null,
   heights: {},
 }
@@ -203,25 +199,32 @@ function readPoint(raw: unknown): Point | null {
 }
 
 /**
- * Read the ball position, migrating the old `capsuleY` fraction. The ball is
- * kept fully inside the current viewport so it can always be clicked again.
+ * Read the ball position, migrating the old `capsuleY` fraction. On a real
+ * viewport the ball is kept fully inside it; on a 0x0 desktop boot view we
+ * avoid clamping to `(1, 1)` and defer default placement until reveal.
  */
-function readBall(raw: unknown, legacy: Record<string, unknown>): Point {
+function readBall(raw: unknown, legacy: Record<string, unknown>, rawEdge: unknown): Point | null {
+  const { width, height } = viewportSize()
+  const hasViewport = width > 0 && height > 0
   const point = readPoint(raw)
   if (point !== null) {
-    const { width, height } = viewportSize()
+    // A bare (1, 1) without an attached edge is the corner left behind by
+    // earlier 0x0 boot clamps; fall back to the default position once revealed.
+    if (point.x === BALL_MARGIN && point.y === BALL_MARGIN && rawEdge === undefined) {
+      return hasViewport ? defaultBall(width, height) : null
+    }
+    if (!hasViewport) return point
     return {
       x: Math.round(Math.min(Math.max(BALL_MARGIN, point.x), Math.max(BALL_MARGIN, width - BALL_SIZE - BALL_MARGIN))),
       y: Math.round(Math.min(Math.max(BALL_MARGIN, point.y), Math.max(BALL_MARGIN, height - BALL_SIZE - BALL_MARGIN))),
     }
   }
   const fraction = legacy['capsuleY']
-  if (typeof fraction === 'number' && Number.isFinite(fraction)) {
-    const { width, height } = viewportSize()
+  if (typeof fraction === 'number' && Number.isFinite(fraction) && hasViewport) {
     const y = Math.min(0.94, Math.max(0.06, fraction))
     return { x: width - BALL_SIZE - BALL_SNAP_INSET, y: Math.round(height * y - BALL_SIZE / 2) }
   }
-  return defaultBall()
+  return hasViewport ? defaultBall(width, height) : null
 }
 
 function normalizeDockHeight(value: unknown): number | undefined {
@@ -255,22 +258,16 @@ function readRows(raw: unknown): PanelRowLayout[] {
  * Exported for tests; the client always calls it through `readLayout`.
  */
 export function normalizeDockLayout(raw: unknown): DockLayout {
+  const { width: vw, height: vh } = viewportSize()
   if (typeof raw !== 'object' || raw === null) {
-    return { ...DEFAULT_LAYOUT, ball: defaultBall() }
+    return { ...DEFAULT_LAYOUT, ball: vw > 0 && vh > 0 ? defaultBall(vw, vh) : null }
   }
   const record = raw as Record<string, unknown>
   const rows = readRows(record['rows'])
   const tree = parseTree(record['tree']) ?? (rows.length > 0 ? legacyRowsToTree(rows) : null)
   const dockHeight = normalizeDockHeight(record['dockHeight'])
-  const rawControl = record['dockControl'] as { edge?: unknown, point?: unknown } | null | undefined
-  const controlPoint = readPoint(rawControl?.point)
-  const controlEdge = rawControl?.edge
-  const dockControl: DockControl | undefined = controlPoint !== null && (controlEdge === 'left' || controlEdge === 'right' || controlEdge === 'top' || controlEdge === 'bottom')
-    ? { edge: controlEdge, point: controlPoint } : undefined
-  // Edge-attached windows may be narrower than the normal resize minimum
-  // beside desktop controls. Retain that effective width after detaching.
   const width = typeof record['width'] === 'number' && Number.isFinite(record['width'])
-    ? Math.min(MAX_WIDTH, Math.max(dockControl === undefined ? MIN_WIDTH : BALL_SIZE, record['width']))
+    ? Math.min(MAX_WIDTH, Math.max(MIN_WIDTH, record['width']))
     : DEFAULT_LAYOUT.width
   const rawEdge = record['ballEdge']
   const ballEdge = rawEdge === null || rawEdge === 'left' || rawEdge === 'right' || rawEdge === 'top' || rawEdge === 'bottom'
@@ -280,10 +277,9 @@ export function normalizeDockLayout(raw: unknown): DockLayout {
     expanded: record['expanded'] === true,
     width,
     tree,
-    ball: readBall(record['ball'], record),
+    ball: readBall(record['ball'], record, rawEdge),
     ...(ballEdge === undefined ? {} : { ballEdge }),
     dock: readPoint(record['dock']),
-    ...(dockControl === undefined ? {} : { dockControl }),
     heights: readHeights(record['heights']),
     ...(dockHeight === undefined ? {} : { dockHeight }),
   }
@@ -293,17 +289,17 @@ function readLayout(): DockLayout {
   try {
     return normalizeDockLayout(JSON.parse(localStorage.getItem(LAYOUT_KEY) ?? 'null') as unknown)
   } catch {
-    return { ...DEFAULT_LAYOUT, ball: defaultBall() }
+    return normalizeDockLayout(null)
   }
 }
 
 export class PadClient {
-  private snapshot: PadSnapshot = { panels: [], connected: false, loaded: false, layout: readLayout(), fresh: undefined }
+  private snapshot: PadSnapshot = { panels: [], connected: false, loaded: false, layout: readLayout(), fresh: undefined, embeddedMode: false }
   private readonly listeners = new Set<() => void>()
   private readonly history = new Map<string, Map<string, HistoryPoint[]>>()
   private readonly sourceKeys = new Map<string, Map<string, string>>()
-  /** Ephemeral visible frames (e.g. a folded card opened in the focus dialog). */
-  private readonly visiblePanels = new Map<string, number>()
+  private readonly focusedPanels = new Map<string, number>()
+  private readonly embeddedPanels = new Map<string, number>()
   private source: EventSource | undefined
   private watchKey = ''
   private known: Set<string> | undefined
@@ -311,6 +307,7 @@ export class PadClient {
   private reconnectTimer: ReturnType<typeof setTimeout> | undefined
   private modelCatalog: PanelModelCatalog | undefined
   private started = false
+  private watchReconnectQueued = false
 
   private readonly onVisibilityChange = (): void => { this.reconnect() }
 
@@ -362,19 +359,36 @@ export class PadClient {
     return this.snapshot.layout.tree
   }
 
-  /** Keep a focused frame polling without changing the card's persisted folded state. */
-  watchPanel(panelId: string): () => void {
-    this.visiblePanels.set(panelId, (this.visiblePanels.get(panelId) ?? 0) + 1)
-    this.reconnect()
+  setEmbeddedMode(active: boolean): void {
+    if (this.snapshot.embeddedMode === active) return
+    this.update({ embeddedMode: active })
+    this.scheduleWatchReconnect()
+  }
+
+  /** Keep a focused or embedded frame polling while its surface is visible. */
+  watchPanel(panelId: string, surface: 'dock' | 'embedded' = 'dock'): () => void {
+    const panels = surface === 'embedded' ? this.embeddedPanels : this.focusedPanels
+    panels.set(panelId, (panels.get(panelId) ?? 0) + 1)
+    this.scheduleWatchReconnect()
     let released = false
     return () => {
       if (released) return
       released = true
-      const remaining = (this.visiblePanels.get(panelId) ?? 1) - 1
-      if (remaining > 0) this.visiblePanels.set(panelId, remaining)
-      else this.visiblePanels.delete(panelId)
-      this.reconnect()
+      const remaining = (panels.get(panelId) ?? 1) - 1
+      if (remaining > 0) panels.set(panelId, remaining)
+      else panels.delete(panelId)
+      this.scheduleWatchReconnect()
     }
+  }
+
+  private scheduleWatchReconnect(): void {
+    if (!this.started || this.watchReconnectQueued) return
+    this.watchReconnectQueued = true
+    queueMicrotask(() => {
+      this.watchReconnectQueued = false
+      if (!this.started) return
+      this.reconnect()
+    })
   }
 
   /** Remember one panel's iframe height, or clear it with `undefined` (auto). */
@@ -430,13 +444,14 @@ export class PadClient {
   }
 
   /** One `dsh.run` call from this panel's frame. */
-  async run(panelId: string, prompt: string, system?: string): Promise<PanelRunResult> {
+  async run(panelId: string, prompt: string, system?: string, signal?: AbortSignal): Promise<PanelRunResult> {
     try {
       const response = await fetch(routeUrl(ROUTES.run), {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ panelId, prompt, ...(system === undefined ? {} : { system }) }),
         credentials: 'same-origin',
+        ...(signal === undefined ? {} : { signal }),
       })
       const body = await response.json().catch(() => ({})) as Partial<PanelRunResult>
       if (!response.ok && typeof body.error !== 'string') return { ok: false, error: `HTTP ${response.status}` }
@@ -477,10 +492,11 @@ export class PadClient {
     }
   }
 
-  /** Panels the Host should poll: everything visible in an expanded dock. */
+  /** Panels the Host should poll across the open dock and embedded views. */
   private watchIds(): string[] {
-    if (!this.snapshot.layout.expanded || (typeof document !== 'undefined' && document.visibilityState === 'hidden')) return []
-    return this.snapshot.panels.filter(p => !p.collapsed || this.visiblePanels.has(p.id)).map(p => p.id)
+    if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return []
+    return this.snapshot.panels.filter(p => this.embeddedPanels.has(p.id)
+      || (!this.snapshot.embeddedMode && this.snapshot.layout.expanded && (!p.collapsed || this.focusedPanels.has(p.id)))).map(p => p.id)
   }
 
   /** (Re)open the stream when the watched set changed. */
@@ -555,6 +571,15 @@ export class PadClient {
       const ids = new Set(event.panels.map(p => p.id))
       for (const id of this.history.keys()) if (!ids.has(id)) this.history.delete(id)
       for (const id of this.sourceKeys.keys()) if (!ids.has(id)) this.sourceKeys.delete(id)
+      this.pruneOrphanState(ids)
+      const staleHeights = Object.keys(this.snapshot.layout.heights).filter(id => !ids.has(id))
+      if (staleHeights.length > 0) {
+        const heights: Record<string, number> = {}
+        for (const [id, value] of Object.entries(this.snapshot.layout.heights)) {
+          if (ids.has(id)) heights[id] = value
+        }
+        this.persistLayout({ heights })
+      }
       const created = this.known === undefined ? undefined : event.panels.find(p => !this.known!.has(p.id))
       this.known = ids
       this.update({ panels: event.panels, loaded: true, connected: true, connectionError: undefined })
@@ -572,7 +597,7 @@ export class PadClient {
   /** A panel appeared while the page was open: open the dock and highlight it. */
   private announce(panelId: string): void {
     clearTimeout(this.freshTimer)
-    if (!this.snapshot.layout.expanded) this.setLayout({ expanded: true })
+    if (!this.snapshot.embeddedMode && !this.snapshot.layout.expanded) this.setLayout({ expanded: true })
     this.update({ fresh: panelId })
     this.freshTimer = setTimeout(() => this.update({ fresh: undefined }), 2400)
   }
@@ -590,6 +615,22 @@ export class PadClient {
       const points = panelHistory.get(sourceId) ?? []
       const clean = mergeHistory([...points, { value: reading.value, at: reading.at }], points.length > 0 ? Date.parse(points[0]!.at) : -Infinity)
       if (clean.length > 0) panelHistory.set(sourceId, clean)
+    }
+  }
+
+  private pruneOrphanState(activeIds: ReadonlySet<string>): void {
+    try {
+      if (typeof localStorage === 'undefined' || typeof localStorage.key !== 'function' || typeof localStorage.removeItem !== 'function') return
+      const staleKeys: string[] = []
+      for (let i = 0; i < localStorage.length; i++) {
+        const key = localStorage.key(i)
+        if (key !== null && key.startsWith(STATE_PREFIX) && !activeIds.has(key.slice(STATE_PREFIX.length))) {
+          staleKeys.push(key)
+        }
+      }
+      for (const key of staleKeys) localStorage.removeItem(key)
+    } catch {
+      // Storage unavailable: skip orphan state cleanup.
     }
   }
 

@@ -103,7 +103,7 @@ export function detectMode(element: Element): 'light' | 'dark' {
   const roots = [doc?.documentElement, doc?.body]
   for (const root of roots) {
     if (root === null || root === undefined) continue
-    const marker = `${root.getAttribute('data-color-scheme') ?? ''} ${root.getAttribute('data-theme') ?? ''} ${typeof root.className === 'string' ? root.className : ''}`
+    const marker = `${root.getAttribute('data-color-scheme') ?? ''} ${root.getAttribute('data-theme') ?? ''} ${root.getAttribute('data-ds-dark-theme') ?? ''} ${typeof root.className === 'string' ? root.className : ''}`
     const named = markerMode(marker)
     if (named !== undefined) return named
   }
@@ -173,7 +173,7 @@ export function watchTheme(onChange: () => void): () => void {
     frame = requestAnimationFrame(onChange)
   }
   const observer = new MutationObserver(schedule)
-  const options = { attributes: true, attributeFilter: ['class', 'style', 'data-theme', 'data-color-scheme'] }
+  const options = { attributes: true, attributeFilter: ['class', 'style', 'data-theme', 'data-color-scheme', 'data-ds-dark-theme', 'data-dsh-skin'] }
   observer.observe(document.documentElement, options)
   if (document.body) observer.observe(document.body, options)
   const media = matchMedia('(prefers-color-scheme: dark)')

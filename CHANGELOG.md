@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.4.6 — 2026-11-24
+
+- **交互与布局**：收起键固定回顶栏右上角并移除展开态右侧 28px 整列 gutter；修复贴边悬浮球展开后直接收起必脱边跳位问题；恢复 0×0 启动视口悬浮球保护，补充 `data-ds-dark-theme`/`data-dsh-skin` 监听；边缘拖拽补 `DRAG_THRESHOLD` 门槛，弹窗补齐 `Escape`/焦点与错误展示；清理死代码 `dock-position.ts` 与已删面板 `localStorage` 孤儿状态。
+- **前端沙箱与嵌入模式**：修复 `PanelFrame` 导航恢复耗尽后未卸载 `<iframe>` 导致的桥接权限重获漏洞，读取后立即移除 `data-token`；修复 `dsh.chart.*` XSS、桥接调用节流与 `dsh.run` 取消；修复 `PanelFrame` 热更新 key 与 `useMemo` 副作用、合并 `PadClient` 同步 SSE 重连风暴；修复 `WhalePanels` 0×0 样式坍缩并支持 `embeddedMode`、`createPortal` 聚焦弹窗与侧栏菜单图标。
+- **Host 安全与稳定性**：恢复鲸屿桌面端 `POST /desktop/confirm`（`code` / `destructive`）与独立端 `approval` 门禁，`resolveSecret` 硬拦截 `DSH_`/`DSHD_` 环境变量并移除命令源敏感变量；含 `{{env:...}}` HTTP 源阻断一切 3xx 重定向，所有 HTTP 源启用 DNS/IP SSRF 校验；隔离后台刷新 Agent 全局 `pad_*` 工具权限并转义防注入；补齐面板数/`data` 体积/SSE 连接数上限、加载校验、随机后缀原子写盘、Windows `taskkill` 幂等保护、`dsh.run` 配额与线性化 lint。
+- **自更新与构建**：`bundle-integrity` 联合锚定文件尾标记并限制 `host-entry.ts` 最多重载 1 次；Atom Feed 严格校验白名单 URL 并跳过 prerelease，下载校验响应体积上限与 4 文件结构完整性；加固 Windows `renameSync` 重试、非硬链接卷回退与备份裁剪；修复 `scripts/build.mjs` `absWorkingDir` 与 `doctor.mjs` 完整性检查。
+
 ## 0.4.5 — 2026-10-31
 
 - 修复全面审查确认的 15 项问题，并为异常路径、并发更新与中断恢复补充回归测试。

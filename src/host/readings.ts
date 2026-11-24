@@ -11,10 +11,9 @@
  * an entry is only used again while the source it belongs to is unchanged — its
  * fingerprint is stored with the reading.
  */
-import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
-import { dirname } from 'node:path'
+import { readFile } from 'node:fs/promises'
 import type { Json, PanelRecord, ReadingPoint, SourceReading } from '../shared/types.ts'
-import { sourcesFingerprint } from './store.ts'
+import { atomicWriteFile, sourcesFingerprint } from './store.ts'
 import { assertSourceJson } from './source-json.ts'
 
 /** One cached ring plus the fingerprint of the source that produced it. */
@@ -37,6 +36,8 @@ export const HISTORY_POINTS = 20
 export const MAX_CACHED_HISTORY_CHARS = 128 * 1024
 /** Default coalescing window for cache writes. */
 export const DEFAULT_FLUSH_MS = 10_000
+const DEFAULT_RETRY_MS = 1_000
+const MAX_RETRY_MS = 60_000
 
 function toReading(raw: unknown): SourceReading | undefined {
   if (typeof raw !== 'object' || raw === null) return undefined
@@ -82,14 +83,23 @@ export class ReadingCache {
   private panels = new Map<string, Map<string, CacheEntry>>()
   private timer: ReturnType<typeof setTimeout> | undefined
   private dirty = false
+  private revision = 0
+  private retryDelayMs: number
   private disposed = false
   private writing: Promise<void> = Promise.resolve()
 
   /**
    * @param file - cache file path, usually next to `panels.json`.
    * @param flushMs - coalescing window for writes.
+   * @param retryMs - initial backoff delay after a failed flush.
    */
-  constructor(private readonly file: string, private readonly flushMs = DEFAULT_FLUSH_MS) {}
+  constructor(
+    private readonly file: string,
+    private readonly flushMs = DEFAULT_FLUSH_MS,
+    private readonly retryMs = DEFAULT_RETRY_MS,
+  ) {
+    this.retryDelayMs = retryMs
+  }
 
   /**
    * Read the cache back for the panels that are still declared.
@@ -215,13 +225,24 @@ export class ReadingCache {
   /** Write now if anything changed; concurrent calls share one write. */
   async flush(): Promise<void> {
     if (!this.dirty) return await this.writing
+    if (this.timer !== undefined) {
+      clearTimeout(this.timer)
+      this.timer = undefined
+    }
+    const revision = this.revision
     this.dirty = false
     const snapshot = JSON.stringify(this.serializable())
     const write = this.writing.then(async () => {
-      await mkdir(dirname(this.file), { recursive: true })
-      const temp = `${this.file}.${process.pid}.tmp`
-      await writeFile(temp, `${snapshot}\n`, 'utf8')
-      await rename(temp, this.file)
+      try {
+        await atomicWriteFile(this.file, `${snapshot}\n`)
+        this.retryDelayMs = this.retryMs
+      } catch (error) {
+        if (!this.disposed && this.revision === revision) {
+          this.dirty = true
+          this.scheduleRetry()
+        }
+        throw error
+      }
     })
     this.writing = write.catch(() => {})
     await write
@@ -248,6 +269,7 @@ export class ReadingCache {
   }
 
   private schedule(): void {
+    this.revision += 1
     this.dirty = true
     if (this.timer !== undefined || this.disposed) return
     this.timer = setTimeout(() => {
@@ -255,6 +277,17 @@ export class ReadingCache {
       void this.flush().catch(() => {})
     }, this.flushMs)
     // The cache is best effort: it must not keep dsh alive at shutdown.
+    ;(this.timer as { unref?: () => void }).unref?.()
+  }
+
+  private scheduleRetry(): void {
+    if (this.timer !== undefined || this.disposed) return
+    const delay = this.retryDelayMs
+    this.retryDelayMs = Math.min(this.retryDelayMs * 2, MAX_RETRY_MS)
+    this.timer = setTimeout(() => {
+      this.timer = undefined
+      void this.flush().catch(() => {})
+    }, delay)
     ;(this.timer as { unref?: () => void }).unref?.()
   }
 }

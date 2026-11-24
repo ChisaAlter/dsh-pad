@@ -1,11 +1,16 @@
-import { mkdtemp, readFile, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
-import { describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it } from 'vitest'
 import { DataHub } from '../src/host/hub.ts'
 import { HISTORY_POINTS, MAX_CACHED_VALUE_CHARS, ReadingCache } from '../src/host/readings.ts'
 import { PanelStore, sourcesFingerprint } from '../src/host/store.ts'
 import type { PanelDefinition, PanelRecord, PanelSource, SourceReading } from '../src/shared/types.ts'
+
+const tempDirs: string[] = []
+afterEach(async () => {
+  for (const dir of tempDirs.splice(0)) await rm(dir, { recursive: true, force: true })
+})
 
 const httpSource = (id: string, url = 'https://example.com/api'): PanelSource => ({ id, kind: 'http', url, parse: 'json', intervalSec: 30 })
 
@@ -23,7 +28,9 @@ const panel = (id: string, sources: PanelSource[]): PanelRecord => ({
 const reading = (value: unknown, at = '2026-10-23T08:00:00.000Z'): SourceReading => ({ ok: true, value: value as never, at })
 
 async function cachePath(): Promise<string> {
-  return join(await mkdtemp(join(tmpdir(), 'dsh-pad-cache-')), 'readings.json')
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-pad-cache-'))
+  tempDirs.push(dir)
+  return join(dir, 'readings.json')
 }
 
 describe('ReadingCache', () => {
@@ -191,6 +198,35 @@ describe('ReadingCache', () => {
     const cache = new ReadingCache(file)
     await cache.flush()
     await expect(readFile(file, 'utf8')).rejects.toThrow()
+  })
+
+  it('restores dirty flag, cleans up temp files and retries after a failed flush', async () => {
+    const file = await cachePath()
+    const dir = dirname(file)
+    const source = httpSource('balance')
+    const cache = new ReadingCache(file, 60_000, 30)
+    try {
+      await mkdir(file) // force rename failure
+      cache.remember('p_1', 'balance', sourcesFingerprint([source]), reading(99))
+      await expect(cache.flush()).rejects.toThrow()
+      expect((await readdir(dir)).filter(name => name.endsWith('.tmp'))).toEqual([])
+      await rm(file, { recursive: true, force: true })
+      // Backoff retry should flush the preserved dirty reading automatically.
+      const started = Date.now()
+      while (Date.now() - started < 3000) {
+        try {
+          const text = await readFile(file, 'utf8')
+          if (text.includes('99')) break
+        } catch {
+          // Wait for retry timer.
+        }
+        await new Promise(resolve => setTimeout(resolve, 25))
+      }
+      const restored = await new ReadingCache(file).load([panel('p_1', [source])])
+      expect(restored.get('p_1')?.get('balance')?.value).toBe(99)
+    } finally {
+      cache.dispose()
+    }
   })
 })
 

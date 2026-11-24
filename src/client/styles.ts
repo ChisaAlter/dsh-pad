@@ -66,10 +66,9 @@ export const DOCK_CSS = `
 .dshpad-root .dshpad-ball-transition{position:fixed;display:grid;place-items:center;width:28px;height:28px;pointer-events:none;z-index:2}
 .dshpad-root .dshpad-ball-transition.is-opening{animation:dshpad-ball-out .2s var(--dshpad-ease) forwards}
 
-.dshpad-collapse{position:absolute!important;top:2px!important;right:9px!important;display:grid;place-items:center;width:28px!important;height:28px!important;min-width:0!important;min-height:0!important;padding:0!important;border:0!important;border-radius:9px!important;box-sizing:border-box!important;cursor:pointer;touch-action:none;user-select:none;pointer-events:auto!important;
+.dshpad-collapse{position:absolute!important;top:2px!important;right:9px!important;display:grid;place-items:center;width:28px!important;height:28px!important;min-width:0!important;min-height:0!important;padding:0!important;border:0!important;border-radius:9px!important;box-sizing:border-box!important;cursor:pointer;touch-action:none;user-select:none;pointer-events:auto!important;-webkit-app-region:no-drag;
   background:transparent!important;color:var(--dshpad-fg-2)!important;transition:background-color .18s}
-.dshpad-collapse.is-attached{left:var(--dshpad-control-x)!important;top:var(--dshpad-control-y)!important;right:auto!important;z-index:4;-webkit-app-region:no-drag}
-.dshpad-collapse.is-attached:disabled{pointer-events:none!important}
+.dshpad-collapse:disabled{pointer-events:none!important}
 .dshpad-collapse:hover{background:var(--dshpad-hover)!important}
 .dshpad-collapse svg{display:block;width:28px!important;height:28px!important}
 .dshpad-collapse-star{visibility:hidden}
@@ -78,21 +77,11 @@ export const DOCK_CSS = `
   background:color-mix(in srgb, var(--dshpad-surface) 88%, transparent);border:0;border-radius:var(--dsw-radius-xl,16px);box-shadow:var(--dsw-elevation-panel,0 8px 28px rgba(0,0,0,.14));
   -webkit-backdrop-filter:blur(26px) saturate(1.45);backdrop-filter:blur(26px) saturate(1.45);
   font-size:13px;line-height:18px;animation:dshpad-dock-in .18s var(--dshpad-ease)}
-.dshpad-dock.is-attached{border-radius:12px;max-height:calc(100vh - 2px)}
-.dshpad-dock.is-attached .dshpad-dock-head{padding-left:var(--dshpad-head-left);padding-right:var(--dshpad-head-right)}
-.dshpad-dock.is-attached-left.has-control-gutter .dshpad-list{margin-left:28px}
-.dshpad-dock.is-attached-right.has-control-gutter .dshpad-list{margin-right:28px}
-.dshpad-dock.is-attached-left.has-control-gutter>.dshpad-update,.dshpad-dock.is-attached-left.has-control-gutter>.dshpad-banner{margin-left:34px}
-.dshpad-dock.is-attached-right.has-control-gutter>.dshpad-update,.dshpad-dock.is-attached-right.has-control-gutter>.dshpad-banner{margin-right:34px}
-.dshpad-dock.is-attached-top .dshpad-dock-head{flex:none;margin-top:28px}
-.dshpad-dock.is-attached-bottom .dshpad-dock-foot{height:32px}
-.dshpad-dock.is-attached-bottom .dshpad-dock-foot::after{display:none}
 /* Corner-constrained docks can be narrower than a normal panel. Wrap their
    actions inside the safe area rather than overflowing into window buttons. */
 .dshpad-dock.is-narrow{overflow:clip}
 .dshpad-dock.is-narrow .dshpad-dock-head{height:auto;min-height:32px;flex-wrap:wrap;justify-content:flex-end}
 .dshpad-dock.is-narrow .dshpad-grip,.dshpad-dock.is-narrow .dshpad-spacer{display:none}
-.dshpad-dock.is-narrow.is-attached-top .dshpad-dock-head,.dshpad-dock.is-narrow.is-attached-bottom .dshpad-dock-head{padding:2px}
 .dshpad-dock.is-closing{animation:dshpad-dock-out .16s var(--dshpad-ease) forwards;pointer-events:none}
 .dshpad-dock.is-closing .dshpad-collapse{pointer-events:none!important}
 .dshpad-resize{position:absolute;left:-3px;top:16px;bottom:16px;width:7px;cursor:ew-resize;touch-action:none;z-index:2}
@@ -222,6 +211,7 @@ export const DOCK_CSS = `
    content layer, so the panel came up blank while its document had loaded. */
 .dshpad-frame{display:block;width:100%;border:0;background:var(--dshpad-surface);transform:translateZ(0);transition:height .2s var(--dshpad-ease)}
 .dshpad-frame.is-resizing{transition:none}
+.dshpad-frame-stopped{padding:10px;border-radius:8px;background:var(--dsw-alias-state-error-tertiary,rgba(229,72,77,.1));color:var(--dshpad-danger);font-size:12px;line-height:1.45;overflow-wrap:anywhere}
 .dshpad-frame-handle{height:10px;margin-top:2px;display:flex;align-items:center;justify-content:center;cursor:ns-resize;touch-action:none}
 .dshpad-frame-handle::after{content:"";width:28px;height:3px;border-radius:2px;background:var(--dshpad-border);opacity:.7;transition:opacity .15s,background-color .15s}
 .dshpad-frame-handle:hover::after{opacity:1;background:var(--dshpad-fg-3)}
@@ -273,6 +263,12 @@ export const DOCK_CSS = `
 @keyframes dshpad-pop{from{opacity:0;scale:.96}to{opacity:1;scale:1}}
 @keyframes dshpad-fade{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:none}}
 @keyframes dshpad-flash{0%,30%{box-shadow:inset 0 0 0 1.5px var(--dshpad-accent)}100%{box-shadow:inset 0 0 0 .5px var(--dsw-alias-settings-card-stroke,var(--dshpad-border))}}
+.dshpad-root.dshpad-whale-panels{position:static;top:auto;right:auto;width:100%;height:auto;z-index:auto;display:flex;flex-direction:column;gap:8px}
+.dshpad-whale-panels .dshpad-card-head{cursor:default}
+.dshpad-whale-notice{margin:0;padding:6px 8px;border-radius:8px;background:var(--dsw-alias-state-warn-tertiary,rgba(217,119,6,.1));color:var(--dsw-alias-state-warn-label,var(--dshpad-fg,var(--dsw-alias-label-primary,#1f2329)));font-size:12px;line-height:1.4}
+.dshpad-whale-empty{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;padding:18px 12px;border-radius:12px;background:var(--dshpad-surface);box-shadow:inset 0 0 0 .5px var(--dshpad-border);color:var(--dshpad-fg-2);font-size:12px;text-align:center}
+.dshpad-whale-add{display:flex;flex-direction:column;gap:10px;padding:4px 0}
+
 @media (prefers-reduced-motion:reduce){
   .dshpad-root *{animation-duration:1ms!important;transition-duration:1ms!important}
 }

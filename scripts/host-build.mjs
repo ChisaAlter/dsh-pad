@@ -29,7 +29,7 @@ export async function buildHost(options = {}) {
   const entry = result.outputFiles.find(file => file.path.endsWith('index.js'))
   if (entry === undefined) throw new Error('Missing host entry output')
   const bodyId = createHash('sha256').update(bodySource).digest('hex')
-  const entrySource = entry.text + `\n// dsh-pad-body:${bodyId}\n`
+  const entrySource = entry.text + `\n// dsh-pad-body:${bodyId}`
   const id = createHash('sha256').update(entrySource).digest('hex')
   const marker = `\n// dsh-pad-build:${id}\n`
   entry.contents = Buffer.from(entrySource + marker)

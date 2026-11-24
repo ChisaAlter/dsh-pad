@@ -2,13 +2,13 @@ import { spawn } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { existsSync, realpathSync } from 'node:fs'
 import { createServer } from 'node:net'
-import { mkdtemp, mkdir, open, readFile, readdir, rm, writeFile } from 'node:fs/promises'
+import { chmod, mkdtemp, mkdir, open, readFile, readdir, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { build } from 'esbuild'
 import { setTimeout as delay } from 'node:timers/promises'
 import { afterEach, beforeAll, describe, expect, it } from 'vitest'
-import { recoverUpdate, replaceUpdateFiles, updateLockEndpoint, UPDATE_FILES, UPDATE_JOURNAL } from '../src/host/update-transaction.ts'
+import { recoverUpdate, replaceUpdateFiles, updateLockEndpoint, UPDATE_FILES, UPDATE_JOURNAL, withRecoveredUpdate } from '../src/host/update-transaction.ts'
 
 const roots: string[] = []
 let helper: string
@@ -334,5 +334,130 @@ result.catch(error => { console.error(error); process.exitCode = 1; });
     expect(await readFile(join(root, UPDATE_JOURNAL), 'utf8')).toBe(pending)
     expect(await snapshot(root)).toEqual(mixed)
     expect(await recoverUpdate(root)).toBe(true)
+  })
+
+  it('uses a lock-free fast path in withRecoveredUpdate when no journal exists', async () => {
+    const root = await fixture()
+    const occupied = createServer(socket => { socket.destroy() })
+    await new Promise<void>((resolve, reject) => {
+      occupied.once('error', reject)
+      occupied.listen(updateLockEndpoint(root), resolve)
+    })
+    const started = Date.now()
+    try {
+      const value = await withRecoveredUpdate(root, recovered => ({ recovered, ok: true }))
+      expect(value).toEqual({ recovered: false, ok: true })
+      expect(Date.now() - started).toBeLessThan(1000)
+    } finally {
+      await new Promise<void>((resolve, reject) => { occupied.close(error => { if (error) reject(error); else resolve() }) })
+    }
+  })
+
+  it('uses a hashed tmpdir Unix domain socket on macOS/BSD instead of an ephemeral TCP port', async () => {
+    const root = await fixture()
+    const darwin = updateLockEndpoint(root, 'darwin')
+    expect(darwin.port).toBeUndefined()
+    expect(typeof darwin.path).toBe('string')
+    expect(darwin.path!.endsWith('.sock')).toBe(true)
+    expect(Buffer.byteLength(darwin.path!, 'utf8')).toBeLessThan(100)
+  })
+
+  it('falls back to exclusive wx journal write on non-hardlink volumes and cleans prepare files', async () => {
+    const root = await fixture()
+    const w = await worker(root, 'non-hardlink', `
+const fs = require('node:fs');
+fs.linkSync = function() {
+  const err = new Error('hard links unsupported');
+  err.code = 'ENOTSUP';
+  throw err;
+};
+require('./update-helper.cjs').replaceUpdateFiles(__dirname, new Map(${JSON.stringify([...release])}))
+  .catch(error => { console.error(error); process.exitCode = 1; });
+`)
+    expect(await w.done()).toBe(0)
+    expect(await snapshot(root)).toEqual([...release.values()])
+    expect(existsSync(join(root, UPDATE_JOURNAL))).toBe(false)
+    const rootEntries = await readdir(root)
+    expect(rootEntries.filter(name => name.startsWith(`${UPDATE_JOURNAL}.prepare-`))).toEqual([])
+  })
+
+  it('replaces read-only targets, retries transient Windows rename locks, and cleans temp files on failure', async () => {
+    const root = await fixture()
+    await chmod(join(root, 'lib', 'index.js'), 0o444)
+    const retryWorker = await worker(root, 'retry-rename', `
+const fs = require('node:fs');
+const path = require('node:path');
+const origRename = fs.renameSync;
+let attempts = 0;
+fs.renameSync = function(from, to) {
+  if (process.platform === 'win32' && to === path.join(__dirname, 'lib/index.js') && attempts < 2) {
+    attempts += 1;
+    const err = new Error('transient lock');
+    err.code = attempts === 1 ? 'EBUSY' : 'EPERM';
+    throw err;
+  }
+  return origRename(from, to);
+};
+require('./update-helper.cjs').replaceUpdateFiles(__dirname, new Map(${JSON.stringify([...release])}))
+  .catch(error => { console.error(error); process.exitCode = 1; });
+`)
+    expect(await retryWorker.done()).toBe(0)
+    expect(await snapshot(root)).toEqual([...release.values()])
+
+    // Permanent rename failure must still clean up the .update-<pid> temporary file.
+    const root2 = await fixture()
+    const failWorker = await worker(root2, 'fail-rename', `
+const fs = require('node:fs');
+const path = require('node:path');
+const origRename = fs.renameSync;
+fs.renameSync = function(from, to) {
+  if (to === path.join(__dirname, 'lib/client.js')) {
+    const err = new Error('disk fault');
+    err.code = 'EIO';
+    throw err;
+  }
+  return origRename(from, to);
+};
+require('./update-helper.cjs').replaceUpdateFiles(__dirname, new Map(${JSON.stringify([...release])}))
+  .then(() => { process.exitCode = 2; })
+  .catch(() => { process.exitCode = 0; });
+`)
+    expect(await failWorker.done()).toBe(0)
+    const libEntries = await readdir(join(root2, 'lib'))
+    expect(libEntries.filter(name => name.includes('.update-'))).toEqual([])
+  })
+
+  it('prunes old backups to keep the latest 2, cleans stale artifacts, and deletes stale source maps', async () => {
+    const root = await fixture()
+    await writeFile(join(root, 'lib', 'index.js.map'), '{"version":3}')
+    await writeFile(join(root, 'lib', 'client.js.map'), '{"version":3}')
+    await writeFile(join(root, 'lib', 'index.js.update-99999'), 'stale')
+    await writeFile(join(root, 'package.json.update-99999'), 'stale')
+    await writeFile(join(root, `${UPDATE_JOURNAL}.prepare-old`), 'stale')
+
+    for (const version of ['0.2.0', '0.3.0', '0.4.0']) {
+      const next = new Map<string, string>([
+        ['lib/index.js', `export const version = "${version}";`],
+        ['lib/client.js', `// client ${version}`],
+        ['package.json', JSON.stringify({ name: 'dsh-pad', version, type: 'module' })],
+        ['cordis.patch.yml', `- insert: [${version}]`],
+      ])
+      await replaceUpdateFiles(root, next)
+      await delay(15)
+    }
+
+    expect(existsSync(join(root, 'lib', 'index.js.map'))).toBe(false)
+    expect(existsSync(join(root, 'lib', 'client.js.map'))).toBe(false)
+    expect(existsSync(join(root, 'lib', 'index.js.update-99999'))).toBe(false)
+    expect(existsSync(join(root, 'package.json.update-99999'))).toBe(false)
+    expect(existsSync(join(root, `${UPDATE_JOURNAL}.prepare-old`))).toBe(false)
+
+    const backups = await readdir(join(root, '.dsh-pad-update-backup'))
+    expect(backups).toHaveLength(2)
+    // Latest backup original should hold 0.3.0 (the version before 0.4.0).
+    const versions = await Promise.all(backups.map(async id =>
+      JSON.parse(await readFile(join(root, '.dsh-pad-update-backup', id, 'original', 'package.json'), 'utf8')).version
+    ))
+    expect(versions.sort()).toEqual(['0.2.0', '0.3.0'])
   })
 })

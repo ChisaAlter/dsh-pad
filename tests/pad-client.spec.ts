@@ -530,29 +530,58 @@ describe('focused frame source subscriptions', () => {
   })
   afterEach(() => { client.stop(); vi.unstubAllGlobals() })
 
-  it('polls a folded panel while focused and releases it without changing its fold preference', () => {
+  it('polls a folded panel while focused and releases it without changing its fold preference', async () => {
     expect(watched()).toEqual([])
     const release = client.watchPanel('p_1')
+    await Promise.resolve()
     expect(watched()).toEqual(['p_1'])
     expect(client.getSnapshot().panels[0]?.collapsed).toBe(true)
     release()
+    await Promise.resolve()
     expect(watched()).toEqual([])
     const count = FakeEventSource.instances.length
     release()
+    await Promise.resolve()
     expect(FakeEventSource.instances).toHaveLength(count)
   })
 
-  it('retains another focus owner and never duplicates the same watched id', () => {
+  it('retains another focus owner and never duplicates the same watched id', async () => {
     const a = client.watchPanel('p_1'), b = client.watchPanel('p_1')
+    await Promise.resolve()
     expect(watched()).toEqual(['p_1'])
     a()
+    await Promise.resolve()
     expect(watched()).toEqual(['p_1'])
     b()
+    await Promise.resolve()
     expect(watched()).toEqual([])
   })
 
-  it('pauses a focused panel when the page or dock hides and restores it only while still owned', () => {
+  it('coalesces multiple watchPanel and release changes in the same tick into one reconnect', async () => {
+    const second: PanelView = { ...view({}), id: 'p_2', collapsed: true }
+    emitPanels({ ...view({}), collapsed: true }, second)
+    const before = FakeEventSource.instances.length
+    const r1 = client.watchPanel('p_1', 'embedded')
+    const r2 = client.watchPanel('p_2', 'embedded')
+    expect(FakeEventSource.instances).toHaveLength(before)
+    await Promise.resolve()
+    expect(FakeEventSource.instances).toHaveLength(before + 1)
+    expect(watched()).toEqual(['p_1', 'p_2'])
+    // Add + immediately release in the same tick produces zero extra reconnects.
+    const afterAdd = FakeEventSource.instances.length
+    r1(); r2()
+    const r3 = client.watchPanel('p_1', 'embedded')
+    const r4 = client.watchPanel('p_2', 'embedded')
+    await Promise.resolve()
+    expect(FakeEventSource.instances).toHaveLength(afterAdd)
+    r3(); r4()
+    await Promise.resolve()
+    expect(watched()).toEqual([])
+  })
+
+  it('pauses a focused panel when the page or dock hides and restores it only while still owned', async () => {
     const release = client.watchPanel('p_1')
+    await Promise.resolve()
     documentStub.visibilityState = 'hidden'
     visibility.dispatchEvent(new Event('visibilitychange'))
     expect(watched()).toEqual([])
@@ -562,19 +591,43 @@ describe('focused frame source subscriptions', () => {
     client.setLayout({ expanded: false })
     expect(watched()).toEqual([])
     release()
+    await Promise.resolve()
     client.setLayout({ expanded: true })
     expect(watched()).toEqual([])
   })
 
-  it('does not watch deleted or unknown panels and stops reconnecting after shutdown', () => {
+  it('retains an embedded panel watch while the floating dock is collapsed', async () => {
+    client.setLayout({ expanded: false })
+    const release = client.watchPanel('p_1', 'embedded')
+    await Promise.resolve()
+    expect(watched()).toEqual(['p_1'])
+    documentStub.visibilityState = 'hidden'
+    visibility.dispatchEvent(new Event('visibilitychange'))
+    expect(watched()).toEqual([])
+    documentStub.visibilityState = 'visible'
+    visibility.dispatchEvent(new Event('visibilitychange'))
+    expect(watched()).toEqual(['p_1'])
+    release()
+    await Promise.resolve()
+    expect(watched()).toEqual([])
+  })
+
+  it('does not watch deleted or unknown panels and stops reconnecting after shutdown', async () => {
     const releaseUnknown = client.watchPanel('p_missing')
+    await Promise.resolve()
     expect(watched()).toEqual([])
     const release = client.watchPanel('p_1')
+    await Promise.resolve()
     emitPanels()
     expect(watched()).toEqual([])
+    // Synchronous stop closes the active stream immediately and prevents queued reconnects.
+    const activeStream = latestStream()
+    client.watchPanel('p_1')
     client.stop()
+    expect(activeStream.close).toHaveBeenCalled()
     const count = FakeEventSource.instances.length
     release(); releaseUnknown()
+    await Promise.resolve()
     expect(FakeEventSource.instances).toHaveLength(count)
   })
 })
@@ -664,20 +717,27 @@ describe('persisted dock layout', () => {
     expect(normalizeDockLayout({}).ballEdge).toBeUndefined()
   })
 
-  it('restores an edge control after its window is moved', () => {
-    const dockControl = { edge: 'left', point: { x: 0, y: 80 } }
-    expect(normalizeDockLayout({ dockControl }).dockControl).toEqual(dockControl)
-    expect(normalizeDockLayout({ dockControl: null }).dockControl).toBeUndefined()
-    expect(normalizeDockLayout({ dockControl: { edge: 'invalid', point: { x: 0, y: 80 } } }).dockControl).toBeUndefined()
-    expect(normalizeDockLayout({ dockControl: { edge: 'left', point: { x: NaN, y: 80 } } }).dockControl).toBeUndefined()
-  })
-
-  it('retains the constrained width of a moved edge dock across persistence', () => {
+  it('ignores legacy dockControl and clamps width uniformly to MIN_WIDTH', () => {
     const dockControl = { edge: 'top', point: { x: 251, y: 0 } }
     const layout = normalizeDockLayout({ width: 279, dock: { x: 1, y: 10 }, dockControl })
-    expect(layout.width).toBe(279)
-    expect(normalizeDockLayout(JSON.parse(JSON.stringify(layout))).width).toBe(279)
-    expect(normalizeDockLayout({ width: 1, dockControl }).width).toBe(BALL_SIZE)
+    expect('dockControl' in layout).toBe(false)
+    expect(layout.width).toBe(MIN_WIDTH)
+    expect(normalizeDockLayout({ width: 1, dockControl }).width).toBe(MIN_WIDTH)
+  })
+
+  it('preserves saved ball and defers default ball on a 0x0 desktop boot viewport', () => {
+    vi.stubGlobal('window', { innerWidth: 0, innerHeight: 0 })
+    try {
+      expect(normalizeDockLayout(null).ball).toBeNull()
+      expect(normalizeDockLayout({}).ball).toBeNull()
+      expect(normalizeDockLayout({ ball: { x: 17, y: 600 } }).ball).toEqual({ x: 17, y: 600 })
+      // Legacy bare (1, 1) without ballEdge falls back to null so reveal places the default ball.
+      expect(normalizeDockLayout({ ball: { x: 1, y: 1 }, expanded: false }).ball).toBeNull()
+      // An explicitly edge-attached (1, 1) is preserved.
+      expect(normalizeDockLayout({ ball: { x: 1, y: 1 }, ballEdge: 'left' }).ball).toEqual({ x: 1, y: 1 })
+    } finally {
+      vi.unstubAllGlobals()
+    }
   })
 
   it('clamps sizes and falls back to sane defaults', () => {
@@ -694,7 +754,54 @@ describe('persisted dock layout', () => {
 
   it('pulls a stale ball back inside the viewport', () => {
     const layout = normalizeDockLayout({ ball: { x: -500, y: 9999 }, heights: {} })
-    expect(layout.ball.x).toBe(BALL_MARGIN)
-    expect(layout.ball.y).toBe(900 - BALL_SIZE - BALL_MARGIN)
+    expect(layout.ball).toEqual({ x: BALL_MARGIN, y: 900 - BALL_SIZE - BALL_MARGIN })
+  })
+})
+
+describe('run cancellation and orphan storage cleanup', () => {
+  afterEach(() => { vi.unstubAllGlobals() })
+
+  it('forwards AbortSignal to fetch during PadClient.run', async () => {
+    const receivedSignals: Array<AbortSignal | undefined> = []
+    vi.stubGlobal('fetch', vi.fn(async (_url: string, init?: RequestInit) => {
+      receivedSignals.push(init?.signal ?? undefined)
+      return { ok: true, json: async () => ({ ok: true, text: 'done' }) }
+    }))
+    const client = new PadClient()
+    const controller = new AbortController()
+    const result = await client.run('p_1', 'hello', 'sys', controller.signal)
+    expect(result).toEqual({ ok: true, text: 'done' })
+    expect(receivedSignals).toEqual([controller.signal])
+  })
+
+  it('prunes orphan dsh-pad:state:<id> keys and stale layout.heights when panels disappear', () => {
+    const store = new Map<string, string>([
+      ['dsh-pad:state:p_1', '{"tab":"a"}'],
+      ['dsh-pad:state:p_deleted', '{"tab":"old"}'],
+      ['other-plugin:key', 'keep'],
+    ])
+    const localStorageStub = {
+      get length() { return store.size },
+      key: (index: number) => [...store.keys()][index] ?? null,
+      getItem: (key: string) => store.get(key) ?? null,
+      setItem: (key: string, value: string) => { store.set(key, String(value)) },
+      removeItem: (key: string) => { store.delete(key) },
+    }
+    vi.stubGlobal('localStorage', localStorageStub)
+    FakeEventSource.instances = []
+    vi.stubGlobal('EventSource', FakeEventSource)
+    const client = new PadClient()
+    client.setPanelHeight('p_1', 300)
+    client.setPanelHeight('p_deleted', 420)
+    client.start()
+    try {
+      emitPanels(view({}))
+      expect(store.has('dsh-pad:state:p_1')).toBe(true)
+      expect(store.has('dsh-pad:state:p_deleted')).toBe(false)
+      expect(store.get('other-plugin:key')).toBe('keep')
+      expect(client.getSnapshot().layout.heights).toEqual({ p_1: 300 })
+    } finally {
+      client.stop()
+    }
   })
 })

@@ -24,7 +24,11 @@ function bootFrame(data: unknown, heightMode = 'auto') {
   const handlers = new Map<string, (event: any) => void>()
   const parent = { postMessage: (message: Posted): void => { posted.push(message) } }
   const documentStub = {
-    documentElement: { getAttribute: (name: string): string | undefined => attributes.get(name), setAttribute: (name: string, value: string): void => { attributes.set(name, value) } },
+    documentElement: {
+      getAttribute: (name: string): string | undefined => attributes.get(name),
+      setAttribute: (name: string, value: string): void => { attributes.set(name, value) },
+      removeAttribute: (name: string): void => { attributes.delete(name) },
+    },
     getElementById: (id: string): { textContent: string } => ({
       textContent: id === 'pad-init' ? JSON.stringify({ data, histories: {}, state: {}, lang: 'zh' }) : '',
     }),
@@ -41,9 +45,13 @@ function bootFrame(data: unknown, heightMode = 'auto') {
 
   return {
     posted,
+    attributes,
     sizeReads: () => sizeReads,
     resize: () => resizeCallback(),
     dsh: (windowStub as { dsh: any }).dsh,
+    dispatchKeydown(event: { key: string, defaultPrevented?: boolean }) {
+      handlers.get('keydown')?.(event)
+    },
     sendData(next: unknown) {
       this.send({ kind: 'data', data: next })
     },
@@ -135,5 +143,47 @@ describe('frame runtime', () => {
     frame.posted.length = 0
     frame.sendData(data)
     expect(frame.posted).toEqual([])
+  })
+
+  it('removes data-token from the root element immediately on boot', () => {
+    const frame = bootFrame(data)
+    expect(frame.attributes.has('data-token')).toBe(false)
+    expect(frame.posted.find(message => message.kind === 'ready')?.token).toBe('test-token')
+  })
+
+  it('sanitizes chart color and numeric options against XSS injection', () => {
+    const frame = bootFrame(data)
+    const evilColor = 'red"><img src=x onerror=alert(1)>'
+    const evilNum = '44" onload="alert(1)'
+    const spark = frame.dsh.chart.sparkline([1, 2, 3], { width: evilNum, height: evilNum, color: evilColor })
+    const bar = frame.dsh.chart.bar(0.5, { height: evilNum, color: 'red;background:url(javascript:alert(1))' })
+    const ring = frame.dsh.chart.ring(0.75, { size: evilNum, stroke: -9, color: evilColor, label: '<b>x</b>' })
+    for (const html of [spark, bar, ring]) {
+      expect(html).not.toContain('<img')
+      expect(html).not.toContain('onerror')
+      expect(html).not.toContain('onload')
+      expect(html).not.toContain('javascript:')
+    }
+    expect(spark).toContain('width="120" height="28"')
+    expect(spark).toContain('stroke:var(--pad-accent)')
+    expect(bar).toContain('height:6px')
+    expect(ring).toContain('width="44" height="44"')
+    expect(ring).toContain('stroke-width="1"')
+    expect(ring).toContain('&lt;b&gt;x&lt;/b&gt;')
+
+    // Valid colors and finite dimensions remain supported.
+    expect(frame.dsh.chart.bar(0.5, { color: '#4d6bfe', height: 10 })).toContain('background:#4d6bfe')
+    expect(frame.dsh.chart.sparkline([1, 2], { color: 'rgba(77, 107, 254, 0.5)', width: 80, height: 20 }))
+      .toContain('stroke:rgba(77, 107, 254, 0.5)')
+    expect(frame.dsh.chart.ring(0.5, { color: 'ok', size: 60, stroke: 6 })).toContain('stroke:var(--pad-ok)')
+  })
+
+  it('notifies the parent when Escape is pressed inside the frame', () => {
+    const frame = bootFrame(data)
+    frame.posted.length = 0
+    frame.dispatchKeydown({ key: 'Escape', defaultPrevented: true })
+    expect(frame.posted).toEqual([])
+    frame.dispatchKeydown({ key: 'Escape', defaultPrevented: false })
+    expect(frame.posted).toEqual([{ kind: 'escape', token: 'test-token' }])
   })
 })

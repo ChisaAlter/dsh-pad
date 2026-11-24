@@ -84,6 +84,11 @@ describe('detectMode', () => {
     expect(detectMode(element)).toBe('light')
   })
 
+  it('reads a dark desktop theme attribute on the document root', () => {
+    const { element } = page({ attrs: { 'data-ds-dark-theme': 'dark' } }, {})
+    expect(detectMode(element)).toBe('dark')
+  })
+
   it('keeps the element colour as the last resort before the OS preference', () => {
     vi.stubGlobal('getComputedStyle', () => ({ color: 'rgb(233, 233, 236)', colorScheme: 'normal' }))
     expect(detectMode({} as Element)).toBe('dark')
@@ -128,5 +133,14 @@ describe('dock surfaces', () => {
     // Electron: the element needs an opaque background of its own.
     expect(DOCK_CSS).toMatch(/\.dshpad-frame\{[^}]*background:var\(--dshpad-surface\)/)
     expect(DOCK_CSS).not.toMatch(/\.dshpad-frame\{[^}]*background:transparent/)
+  })
+
+  it('resets Whale sidebar container layout and defines portal-safe modal styles', () => {
+    expect(DOCK_CSS).toMatch(/\.dshpad-root\.dshpad-whale-panels\{[^}]*position:static[^}]*width:100%[^}]*height:auto/)
+    expect(DOCK_CSS).toContain('.dshpad-whale-notice{')
+    expect(DOCK_CSS).toContain('.dshpad-whale-empty{')
+    expect(DOCK_CSS).toContain('.dshpad-whale-add{')
+    expect(DOCK_CSS).not.toContain('.dshpad-root .dshpad-whale-add')
+    expect(DOCK_CSS).toContain('.dshpad-frame-stopped{')
   })
 })

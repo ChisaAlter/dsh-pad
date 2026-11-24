@@ -12,7 +12,9 @@ export type Translate = (key: PadKey, params?: Record<string, string | number>) 
 
 export function relativeTime(t: Translate, iso: string | undefined, now: number): string {
   if (iso === undefined) return '—'
-  const seconds = Math.max(0, Math.round((now - Date.parse(iso)) / 1000))
+  const parsed = Date.parse(iso)
+  if (!Number.isFinite(parsed) || !Number.isFinite(now)) return '—'
+  const seconds = Math.max(0, Math.round((now - parsed) / 1000))
   if (seconds < 5) return t('time.justNow')
   if (seconds < 60) return t('time.seconds', { n: seconds })
   if (seconds < 3600) return t('time.minutes', { n: Math.floor(seconds / 60) })
@@ -26,9 +28,11 @@ function every(t: Translate, minutes: number): string {
   return t('every.minutes', { n: minutes })
 }
 
-function clock(iso: string | undefined): string {
+export function clock(iso: string | undefined): string {
   if (iso === undefined) return '—'
-  const d = new Date(iso)
+  const parsed = Date.parse(iso)
+  if (!Number.isFinite(parsed)) return '—'
+  const d = new Date(parsed)
   return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
 }
 
@@ -81,7 +85,12 @@ export interface PanelCardProps {
   readonly dropZone?: DropZone
   readonly onAsk: (text: string, submit: boolean) => void
   readonly onExpand: () => void
-  readonly onDragStart: (event: ReactPointerEvent<HTMLElement>) => void
+  readonly onDragStart?: (event: ReactPointerEvent<HTMLElement>) => void
+  /** Optional local height override (decouples embedded surfaces from the floating dock). */
+  readonly height?: number
+  readonly onHeightChange?: (height: number | undefined) => void
+  /** Presentation actions for the Whale sidebar, not panel deletion. */
+  readonly sidebarActions?: readonly { label: string; icon?: 'up' | 'down' | 'trash'; disabled?: boolean; run: () => void }[]
 }
 
 function CardStatus({ t, updated, refreshing, attention, active }: {
@@ -93,7 +102,7 @@ function CardStatus({ t, updated, refreshing, attention, active }: {
   return <span className={`dshpad-card-meta${attention ? ' is-alert' : ''}`}>{meta}</span>
 }
 
-export function PanelCard({ view, client, theme, lang, t, clockActive, fresh, dragging, dropTarget, dropZone, onAsk, onExpand, onDragStart }: PanelCardProps) {
+export function PanelCard({ view, client, theme, lang, t, clockActive, fresh, dragging, dropTarget, dropZone, onAsk, onExpand, onDragStart, height, onHeightChange, sidebarActions }: PanelCardProps) {
   const [menuOpen, setMenuOpen] = useState(false)
   const [confirmDelete, setConfirmDelete] = useState(false)
   const [modelOpen, setModelOpen] = useState(false)
@@ -118,24 +127,31 @@ export function PanelCard({ view, client, theme, lang, t, clockActive, fresh, dr
     if (!confirmDelete && !modelOpen) return
     const onKey = (event: KeyboardEvent): void => {
       if (event.key === 'Escape') {
+        event.stopPropagation()
         setConfirmDelete(false)
         setModelOpen(false)
       }
     }
-    document.addEventListener('keydown', onKey)
-    return () => document.removeEventListener('keydown', onKey)
+    document.addEventListener('keydown', onKey, { capture: true })
+    return () => document.removeEventListener('keydown', onKey, { capture: true })
   }, [confirmDelete, modelOpen])
 
   useEffect(() => {
     if (!menuOpen) return
-    const close = (event: Event): void => {
-      if (event instanceof KeyboardEvent ? event.key === 'Escape' : !menuRef.current?.contains(event.target as Node)) setMenuOpen(false)
+    const onPointerDown = (event: Event): void => {
+      if (!menuRef.current?.contains(event.target as Node)) setMenuOpen(false)
     }
-    document.addEventListener('pointerdown', close, true)
-    document.addEventListener('keydown', close, true)
+    const onKeyDown = (event: KeyboardEvent): void => {
+      if (event.key === 'Escape') {
+        event.stopPropagation()
+        setMenuOpen(false)
+      }
+    }
+    document.addEventListener('pointerdown', onPointerDown, { capture: true })
+    document.addEventListener('keydown', onKeyDown, { capture: true })
     return () => {
-      document.removeEventListener('pointerdown', close, true)
-      document.removeEventListener('keydown', close, true)
+      document.removeEventListener('pointerdown', onPointerDown, { capture: true })
+      document.removeEventListener('keydown', onKeyDown, { capture: true })
     }
   }, [menuOpen])
 
@@ -213,16 +229,16 @@ export function PanelCard({ view, client, theme, lang, t, clockActive, fresh, dr
     if (target.closest('button') !== null) return
     if (target.closest('.dshpad-card-actions') !== null) return
     if (target.closest('.dshpad-expand') !== null) return
-    onDragStart(event)
+    onDragStart?.(event)
   }
 
   return (
     <article className={`dshpad-card${fresh ? ' is-fresh' : ''}${folded ? ' is-folded' : ''}${dragging ? ' is-dragging' : ''}${dropTarget ? ' is-drop-target' : ''}${dropZone === undefined ? '' : ` is-drop-${dropZone}`}`}
       aria-label={definition.title} data-panel-id={view.id}>
       <header className="dshpad-card-head" onPointerDown={startHeaderDrag}>
-        <span className="dshpad-card-grip" title={t('card.drag')} aria-label={t('card.drag')} role="button" tabIndex={-1}>
+        {onDragStart && <span className="dshpad-card-grip" title={t('card.drag')} aria-label={t('card.drag')} role="button" tabIndex={-1}>
           {Icon.grip}
-        </span>
+        </span>}
         <div className="dshpad-card-actions" ref={menuRef}>
           <button type="button" className="dshpad-more" title={t('card.more')} aria-label={t('card.more')}
             aria-haspopup="menu" aria-expanded={menuOpen}
@@ -249,12 +265,21 @@ export function PanelCard({ view, client, theme, lang, t, clockActive, fresh, dr
                   <span className="dshpad-menu-value">{modelLabel}</span>
                 </button>
                 <hr />
-                <button type="button" role="menuitem" className="is-danger" onClick={() => {
+                {sidebarActions ? sidebarActions.map(action => (
+                  <button key={action.label} type="button" role="menuitem" disabled={action.disabled}
+                    onClick={() => { setMenuOpen(false); action.run() }}>
+                    {action.icon === 'up' ? <span className="dshpad-mi">{MenuIcon.up}</span>
+                      : action.icon === 'down' ? <span className="dshpad-mi">{MenuIcon.down}</span>
+                      : action.icon === 'trash' ? <span className="dshpad-mi">{MenuIcon.trash}</span>
+                      : null}
+                    {action.label}
+                  </button>
+                )) : <button type="button" role="menuitem" className="is-danger" onClick={() => {
                   setMenuOpen(false)
                   setConfirmDelete(true)
                 }}>
                   <span className="dshpad-mi">{MenuIcon.trash}</span>{t('card.delete')}
-                </button>
+                </button>}
               </div>
               )
             : null}
@@ -358,10 +383,10 @@ export function PanelCard({ view, client, theme, lang, t, clockActive, fresh, dr
                   lang={lang}
                   onRefresh={() => void client.act({ op: 'refresh', panelId: view.id })}
                   onAsk={text => onAsk(text, false)}
-                  onRun={(prompt, system) => client.run(view.id, prompt, system)}
+                  onRun={(prompt, system, signal) => client.run(view.id, prompt, system, signal)}
                   onScriptError={setScriptError}
-                  height={client.panelHeight(view.id)}
-                  onHeightChange={next => client.setPanelHeight(view.id, next)}
+                  height={onHeightChange === undefined ? client.panelHeight(view.id) : height}
+                  onHeightChange={onHeightChange ?? (next => client.setPanelHeight(view.id, next))}
                   resizeLabel={t('card.resize')}
                 />
                 )}

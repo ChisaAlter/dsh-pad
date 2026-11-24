@@ -38,9 +38,79 @@ const TRACKED_CAPS = 0.04
 const BLOCK_TAGS = 'address|article|aside|blockquote|br|dd|details|div|dl|dt|figcaption|figure|footer|form|h[1-6]|header|hr|li|main|nav|ol|p|pre|section|summary|table|tbody|td|tfoot|th|thead|tr|ul'
 
 const BLOCK_BREAK = new RegExp(`<\\/?(?:${BLOCK_TAGS})\\b[^>]*>`, 'gi')
-/** Comments and blocks whose body is never visible in the card. */
-const HIDDEN = /<!--[\s\S]*?-->|<(script|style|template)\b[\s\S]*?<\/\1\s*>/gi
 const INLINE_TAG = /<[^>]*>/g
+const HIDDEN_TAGS = ['script', 'style', 'template'] as const
+
+/** Linear-time removal of HTML comments and script/style/template blocks without regex backtracking. */
+function stripHidden(html: string): string {
+  const lower = html.toLowerCase()
+  const out: string[] = []
+  let cursor = 0
+  let noMoreComment = false
+  const noMoreClose: Record<typeof HIDDEN_TAGS[number], boolean> = {
+    script: false,
+    style: false,
+    template: false,
+  }
+  while (cursor < html.length) {
+    const lt = html.indexOf('<', cursor)
+    if (lt === -1) {
+      out.push(html.slice(cursor))
+      break
+    }
+    if (!noMoreComment && html.startsWith('<!--', lt)) {
+      const close = html.indexOf('-->', lt + 4)
+      if (close === -1) {
+        noMoreComment = true
+        out.push(html.slice(cursor, lt + 4))
+        cursor = lt + 4
+        continue
+      }
+      out.push(html.slice(cursor, lt), ' ')
+      cursor = close + 3
+      continue
+    }
+    let matchedTag: typeof HIDDEN_TAGS[number] | undefined
+    for (const tag of HIDDEN_TAGS) {
+      if (noMoreClose[tag]) continue
+      if (lower.startsWith(tag, lt + 1)) {
+        const boundary = lower[lt + 1 + tag.length]
+        if (boundary === undefined || boundary === '>' || boundary === '/' || /\s/.test(boundary)) {
+          matchedTag = tag
+          break
+        }
+      }
+    }
+    if (matchedTag !== undefined) {
+      const closePrefix = `</${matchedTag}`
+      let searchFrom = lt + 1 + matchedTag.length
+      let closeEnd = -1
+      while (searchFrom < lower.length) {
+        const closeStart = lower.indexOf(closePrefix, searchFrom)
+        if (closeStart === -1) break
+        let end = closeStart + closePrefix.length
+        while (end < lower.length && /\s/.test(lower[end]!)) end += 1
+        if (lower[end] === '>') {
+          closeEnd = end + 1
+          break
+        }
+        searchFrom = closeStart + closePrefix.length
+      }
+      if (closeEnd === -1) {
+        noMoreClose[matchedTag] = true
+        out.push(html.slice(cursor, lt + 1 + matchedTag.length))
+        cursor = lt + 1 + matchedTag.length
+        continue
+      }
+      out.push(html.slice(cursor, lt), ' ')
+      cursor = closeEnd
+      continue
+    }
+    out.push(html.slice(cursor, lt + 1))
+    cursor = lt + 1
+  }
+  return out.join('')
+}
 
 /** SVG, media and form elements that show something on their own. */
 const ANCHOR_MARKUP = /<(?:svg|canvas|table|ul|ol|meter|progress|input|button|img)(?=[\s/>])/
@@ -62,8 +132,7 @@ const FUNCTIONAL_COLOUR = /\b(?:rgba?|hsla?)\(/i
  * dropped, block tags break a run, inline tags vanish, whitespace collapses.
  */
 function splitTextRuns(html: string): string[] {
-  return html
-    .replace(HIDDEN, ' ')
+  return stripHidden(html)
     .replace(BLOCK_BREAK, '\u0000')
     .split('\u0000')
     .map((run) => run.replace(INLINE_TAG, '').replace(/\s+/g, ' ').trim())
@@ -91,15 +160,40 @@ function countClass(html: string, name: string): number {
   return html.match(new RegExp(`${name}(?![\\w-])`, 'g'))?.length ?? 0
 }
 
-/** CSS with every whole `var(…)` removed, so a token fallback is not a hardcoded colour. */
+/** CSS with every balanced `var(…)` removed in one linear pass, so a token fallback is not a hardcoded colour. */
 function stripVarFallbacks(css: string): string {
-  let bare = css
-  let previous: string
-  do {
-    previous = bare
-    bare = previous.replace(/var\([^()]*\)/gi, '')
-  } while (bare !== previous)
-  return bare
+  const lower = css.toLowerCase()
+  const out: string[] = []
+  let index = 0
+  while (index < css.length) {
+    const match = lower.indexOf('var(', index)
+    if (match === -1) {
+      out.push(css.slice(index))
+      break
+    }
+    if (match > 0 && /[\w-]/.test(css[match - 1]!)) {
+      out.push(css.slice(index, match + 4))
+      index = match + 4
+      continue
+    }
+    out.push(css.slice(index, match))
+    let depth = 1
+    let cursor = match + 4
+    while (cursor < css.length && depth > 0) {
+      const ch = css[cursor]
+      if (ch === '(') depth += 1
+      else if (ch === ')') depth -= 1
+      cursor += 1
+    }
+    if (depth === 0) {
+      index = cursor
+    } else {
+      // Unclosed `var(`: preserve literal remainder so colours cannot hide behind it.
+      out.push(css.slice(match))
+      break
+    }
+  }
+  return out.join('')
 }
 
 /** The first colour literal in `css`, or null when every colour is a token. */
@@ -138,10 +232,24 @@ function leadingEmoji(text: string): string | null {
 /** Whether the card carries a code block: a `pre`, or a `code` holding a payload. */
 function hasCodeBlock(html: string): boolean {
   if (/<pre(?=[\s/>])/i.test(html)) return true
-  for (const match of html.matchAll(/<code(?=[\s>])[^>]*>([\s\S]*?)<\/code>/gi)) {
-    const text = (match[1] ?? '').replace(/<[^>]*>/g, '')
+  const lower = html.toLowerCase()
+  let cursor = 0
+  while (cursor < lower.length) {
+    const open = lower.indexOf('<code', cursor)
+    if (open === -1) return false
+    const after = lower[open + 5]
+    if (after !== undefined && after !== '>' && !/\s/.test(after)) {
+      cursor = open + 5
+      continue
+    }
+    const tagEnd = html.indexOf('>', open + 5)
+    if (tagEnd === -1) return false
+    const close = lower.indexOf('</code>', tagEnd + 1)
+    if (close === -1) return false
+    const text = html.slice(tagEnd + 1, close).replace(INLINE_TAG, '')
     // A version number or a command name in an inline code is fine; a blob is not.
     if (text.length > 80 || text.includes('\n')) return true
+    cursor = close + 7
   }
   return false
 }

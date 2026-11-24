@@ -2,7 +2,8 @@
  * Validation of model-authored panel definitions. Every problem is reported
  * at once, in words the model can act on, so one retry can fix them all.
  */
-import type { AgentRefresh, PanelDefinition, PanelModelSelection, PanelSource, SourceParse } from './types.ts'
+import type { AgentRefresh, Json, PanelDefinition, PanelModelSelection, PanelSource, SourceParse } from './types.ts'
+import { assertSourceJson } from '../host/source-json.ts'
 
 export interface Limits {
   /** Shortest poll interval for direct sources. */
@@ -14,8 +15,29 @@ export interface Limits {
 export const MAX_SOURCES = 8
 export const MAX_CODE_BYTES = 200_000
 export const MAX_TITLE = 40
+export const MAX_HTTP_URL_CHARS = 4096
+export const MAX_HTTP_HEADERS = 20
+export const MAX_HTTP_HEADER_NAME_CHARS = 128
+export const MAX_HTTP_HEADER_VALUE_CHARS = 4096
+export const MAX_PANEL_DATA_BYTES = 256 * 1024
 const SOURCE_ID = /^[a-z][a-z0-9_]{0,31}$/
 const PARSES: readonly SourceParse[] = ['text', 'json', 'lines']
+const textEncoder = new TextEncoder()
+
+/**
+ * Validate agent-submitted panel data for JSON safety, nesting/node bounds and size.
+ * @param value - candidate JSON payload.
+ * @throws when the payload is not safe JSON or exceeds `MAX_PANEL_DATA_BYTES`.
+ */
+export function assertPanelData(value: unknown): asserts value is Json {
+  assertSourceJson(value)
+  const serialized = JSON.stringify(value)
+  if (typeof serialized !== 'string') throw new Error('输出包含不支持的 JSON 值')
+  const bytes = textEncoder.encode(serialized).length
+  if (bytes > MAX_PANEL_DATA_BYTES) {
+    throw new Error(`数据超过 ${MAX_PANEL_DATA_BYTES / 1024}KB，只保留面板要显示的字段`)
+  }
+}
 
 export class PanelValidationError extends Error {
   constructor(readonly problems: readonly string[]) {
@@ -59,6 +81,9 @@ function checkSource(raw: unknown, index: number, limits: Limits, problems: stri
   }
   if (kind === 'http') {
     const { url, method, headers, body } = raw
+    if (typeof url === 'string' && url.length > MAX_HTTP_URL_CHARS) {
+      problems.push(`${at}.url 不能超过 ${MAX_HTTP_URL_CHARS} 字符`)
+    }
     let parsed: URL | undefined
     try {
       parsed = typeof url === 'string' ? new URL(url) : undefined
@@ -70,11 +95,31 @@ function checkSource(raw: unknown, index: number, limits: Limits, problems: stri
     }
     if (method !== undefined && method !== 'GET' && method !== 'POST') problems.push(`${at}.method 只能是 GET / POST`)
     if (headers !== undefined) {
-      if (!isRecord(headers) || Object.keys(headers).length > 20 || Object.values(headers).some(v => typeof v !== 'string')) {
-        problems.push(`${at}.headers 必须是字符串到字符串的对象（≤20 项）`)
+      if (!isRecord(headers)) {
+        problems.push(`${at}.headers 必须是字符串到字符串的对象（≤${MAX_HTTP_HEADERS} 项）`)
+      } else {
+        const entries = Object.entries(headers)
+        if (entries.length > MAX_HTTP_HEADERS) {
+          problems.push(`${at}.headers 必须是字符串到字符串的对象（≤${MAX_HTTP_HEADERS} 项）`)
+        } else {
+          const invalidEntry = entries.some(([key, value]) =>
+            key.trim() === ''
+            || key.length > MAX_HTTP_HEADER_NAME_CHARS
+            || /[\r\n]/.test(key)
+            || typeof value !== 'string'
+            || value.length > MAX_HTTP_HEADER_VALUE_CHARS
+            || /[\r\n]/.test(value))
+          if (invalidEntry) {
+            problems.push(`${at}.headers 键长 ≤${MAX_HTTP_HEADER_NAME_CHARS}、值长 ≤${MAX_HTTP_HEADER_VALUE_CHARS} 且不能含换行符`)
+          }
+        }
       }
     }
-    if (body !== undefined && (typeof body !== 'string' || body.length > 20_000)) problems.push(`${at}.body 必须是字符串（≤20000 字符）`)
+    if (body !== undefined && (typeof body !== 'string' || body.length > 20_000)) {
+      problems.push(`${at}.body 必须是字符串（≤20000 字符）`)
+    } else if ((method === undefined || method === 'GET') && typeof body === 'string' && body !== '') {
+      problems.push(`${at}.body 不能用于 GET 请求，请改用 POST 或省略 body`)
+    }
     if (problems.length !== before) return undefined
     return {
       ...common,

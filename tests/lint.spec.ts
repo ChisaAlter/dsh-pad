@@ -127,8 +127,10 @@ describe('no-anchor', () => {
 })
 
 describe('hardcoded-color', () => {
-  it('allows token colours, including a var() fallback', () => {
+  it('allows token colours, including nested var() fallbacks, and does not hide colours behind unclosed var()', () => {
     expect(rules(panel('', '.pad-label{color:var(--pad-fg-3, #888)}'))).not.toContain('hardcoded-color')
+    expect(rules(panel('', '.pad-label{color:var(--a, var(--b, rgb(10, 20, 30)))}'))).not.toContain('hardcoded-color')
+    expect(rules(panel('', '.pad-label{color:var(--a, #fff'))).toContain('hardcoded-color')
   })
 
   it('reports a literal hex colour', () => {
@@ -222,5 +224,14 @@ describe('formatLint', () => {
       { rule: 'prose', severity: 'error', message: '错误二' },
     ]
     expect(formatLint(issues)).toBe('- [error] 错误一\n- [error] 错误二\n- [warn] 警告一')
+  })
+
+  it('handles pathological unclosed comments, hidden tags, code tags and var() in linear time', () => {
+    const started = performance.now()
+    const html = '<!--'.repeat(5000) + '<script>'.repeat(5000) + '<code>'.repeat(5000)
+    const css = 'var('.repeat(5000) + '#fff'
+    const issues = lintPanel(panel(html, css))
+    expect(performance.now() - started).toBeLessThan(500)
+    expect(issues.some(i => i.rule === 'hardcoded-color')).toBe(true)
   })
 })

@@ -18,7 +18,7 @@ afterEach(async () => {
 async function entry(version: string, beforeBody = ''): Promise<string> {
   const result = await buildHost({
     write: false,
-    bodySource: `${beforeBody}\nglobalThis.__padBodies.push(${JSON.stringify(version)});export const name=${JSON.stringify(version)};export const inject=[];export const Config={};export function apply(){}`,
+    bodySource: `${beforeBody}\nglobalThis.__padBodies.push(${JSON.stringify(version)});export const name=${JSON.stringify(version)};export const inject=[];export const Config={};export function apply(){};export function registerTools(){return ${JSON.stringify(version)}}`,
   })
   return result.outputFiles.find((file: { path: string }) => file.path.endsWith('index.js')).text
 }
@@ -42,7 +42,7 @@ async function setup(oldPrefix = '', nextPrefix = '') {
 }
 
 function load(root: string, expressionPrefix = ''): string {
-  const expression = `globalThis.__padBodies=[];${expressionPrefix};const m=await import(${JSON.stringify(pathToFileURL(join(root, 'lib/index.js')).href)});console.log(JSON.stringify({name:m.name,bodies:globalThis.__padBodies}));`
+  const expression = `globalThis.__padBodies=[];${expressionPrefix};const m=await import(${JSON.stringify(pathToFileURL(join(root, 'lib/index.js')).href)});console.log(JSON.stringify({name:m.name,hasRegisterTools:typeof m.registerTools==='function',bodies:globalThis.__padBodies}));`
   return execFileSync(process.execPath, ['--input-type=module', '--eval', expression], { encoding: 'utf8' }).trim()
 }
 
@@ -58,7 +58,7 @@ describe('shipped Host entry recovery', () => {
   it.each(['lib/index.js', 'lib/client.js'])('recovers before evaluating a body when replacement stops at %s', async (blockedFile) => {
     const { root, contents } = await setup()
     await pending(root, contents, blockedFile)
-    expect(JSON.parse(load(root))).toEqual({ name: 'new', bodies: ['new'] })
+    expect(JSON.parse(load(root))).toEqual({ name: 'new', hasRegisterTools: true, bodies: ['new'] })
     for (const file of UPDATE_FILES) expect(await readFile(join(root, file), 'utf8')).toBe(contents.get(file))
     await expect(readFile(join(root, UPDATE_JOURNAL))).rejects.toMatchObject({ code: 'ENOENT' })
   })
@@ -66,7 +66,7 @@ describe('shipped Host entry recovery', () => {
   it('recovers before resolving an unavailable platform dependency from the obsolete body', async () => {
     const { root, contents } = await setup('import { removed } from "@deepseek-ai/audit-missing-package";globalThis.__missingExport=removed;')
     await pending(root, contents)
-    expect(JSON.parse(load(root))).toEqual({ name: 'new', bodies: ['new'] })
+    expect(JSON.parse(load(root))).toEqual({ name: 'new', hasRegisterTools: true, bodies: ['new'] })
   })
 
   it('detects another process consuming the journal after this entry was read', async () => {
@@ -82,8 +82,39 @@ describe('shipped Host entry recovery', () => {
     // The stale copy's marker is irrelevant: it verifies the canonical entry.
     const stale = withoutMarker + '\n// dsh-pad-build:' + createHash('sha256').update(withoutMarker).digest('hex') + '\n'
     await writeFile(join(root, 'stale.mjs'), stale)
-    const expression = `globalThis.__padBodies=[];const m=await import(${JSON.stringify(pathToFileURL(join(root, 'stale.mjs')).href)});console.log(JSON.stringify({name:m.name,bodies:globalThis.__padBodies}))`
-    expect(JSON.parse(execFileSync(process.execPath, ['--input-type=module', '--eval', expression], { encoding: 'utf8' }))).toEqual({ name: 'new', bodies: ['new'] })
+    const expression = `globalThis.__padBodies=[];const m=await import(${JSON.stringify(pathToFileURL(join(root, 'stale.mjs')).href)});console.log(JSON.stringify({name:m.name,hasRegisterTools:typeof m.registerTools==='function',bodies:globalThis.__padBodies}))`
+    expect(JSON.parse(execFileSync(process.execPath, ['--input-type=module', '--eval', expression], { encoding: 'utf8' }))).toEqual({ name: 'new', hasRegisterTools: true, bodies: ['new'] })
+  })
+
+  it('fails closed instead of recursing infinitely when already on a ?recovered= reload', async () => {
+    const { root, contents, old } = await setup()
+    await replaceUpdateFiles(root, contents)
+    // Simulate a module already loaded with ?recovered=... whose embedded body still mismatches disk.
+    const recoveredUrl = pathToFileURL(join(root, 'lib/index.js')).href + '?recovered=already-tried'
+    const { createHash } = await import('node:crypto')
+    const diskModule = old.replace('var entryUrl = new URL(import.meta.url);', `var entryUrl = new URL(${JSON.stringify(recoveredUrl)});`)
+    const withoutMarker = diskModule.replace(/\n\/\/ dsh-pad-build:[a-f0-9]{64}\n?$/, '')
+    const staleRecovered = withoutMarker + '\n// dsh-pad-build:' + createHash('sha256').update(withoutMarker).digest('hex') + '\n'
+    await writeFile(join(root, 'stale-recovered.mjs'), staleRecovered)
+    const expression = `globalThis.__padBodies=[];try{await import(${JSON.stringify(pathToFileURL(join(root, 'stale-recovered.mjs')).href)});process.exitCode=2}catch(error){console.log(JSON.stringify({error:error.message,bodies:globalThis.__padBodies}))}`
+    const result = JSON.parse(execFileSync(process.execPath, ['--input-type=module', '--eval', expression], { encoding: 'utf8' }))
+    expect(result.bodies).toEqual([])
+    expect(result.error).toContain('无限递归')
+  })
+
+  it('rejects a mid-file forged dsh-pad-body marker that is not EOF-anchored', async () => {
+    const { root, old } = await setup()
+    const { createHash } = await import('node:crypto')
+    const stripped = old
+      .replace(/\n\/\/ dsh-pad-build:[a-f0-9]{64}\n?$/, '')
+      .replace(/\n\/\/ dsh-pad-body:[a-f0-9]{64}\n?$/, '')
+    const forgedPrefix = `// dsh-pad-body:${'a'.repeat(64)}\n` + stripped + '\n// trailing junk\n'
+    const forged = forgedPrefix + '\n// dsh-pad-build:' + createHash('sha256').update(forgedPrefix).digest('hex') + '\n'
+    await writeFile(join(root, 'lib/index.js'), forged)
+    const expression = `globalThis.__padBodies=[];try{await import(${JSON.stringify(pathToFileURL(join(root, 'lib/index.js')).href)});process.exitCode=2}catch(error){console.log(JSON.stringify({error:error.message,bodies:globalThis.__padBodies}))}`
+    const result = JSON.parse(execFileSync(process.execPath, ['--input-type=module', '--eval', expression], { encoding: 'utf8' }))
+    expect(result.bodies).toEqual([])
+    expect(result.error).toContain('dsh-pad-body')
   })
 
   it('fails closed without evaluating a body when staged files are corrupt', async () => {

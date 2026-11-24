@@ -12,6 +12,12 @@ export interface PanelRunOptions {
   readonly maxTokens: number
   /** Concurrent calls allowed for one panel. */
   readonly concurrency: number
+  /** Concurrent calls allowed across all panels. Defaults to 4. */
+  readonly globalConcurrency?: number
+  /** Maximum calls allowed across all panels within `windowMs`. Defaults to 30. */
+  readonly windowLimit?: number
+  /** Sliding quota window in milliseconds. Defaults to 60000. */
+  readonly windowMs?: number
   readonly maxPromptChars: number
   readonly maxSystemChars: number
   readonly maxOutputChars: number
@@ -24,6 +30,9 @@ export const DEFAULT_RUN_OPTIONS: PanelRunOptions = {
   timeoutMs: 120_000,
   maxTokens: 2048,
   concurrency: 2,
+  globalConcurrency: 4,
+  windowLimit: 30,
+  windowMs: 60_000,
   maxPromptChars: 24_000,
   maxSystemChars: 8_000,
   maxOutputChars: 32_000,
@@ -60,7 +69,9 @@ interface DefaultModelService {
 export class PanelRunner {
   private readonly active = new Map<string, number>()
   private readonly lastRun = new Map<string, number>()
+  private readonly recentRuns: number[] = []
   private readonly controllers = new Set<AbortController>()
+  private totalActive = 0
   private disposed = false
 
   constructor(
@@ -91,14 +102,29 @@ export class PanelRunner {
     if (running >= this.options.concurrency) {
       return { ok: false, error: '这个面板同时进行的模型调用太多了，请稍后再试' }
     }
+    const globalConcurrency = this.options.globalConcurrency ?? DEFAULT_RUN_OPTIONS.globalConcurrency!
+    if (this.totalActive >= globalConcurrency) {
+      return { ok: false, error: '当前全局同时进行的模型调用太多了，请稍后再试' }
+    }
     const now = Date.now()
     if (now - (this.lastRun.get(panel.id) ?? 0) < this.options.minIntervalMs) {
       return { ok: false, error: '刚调用过模型，请稍后再试' }
     }
+    const windowMs = this.options.windowMs ?? DEFAULT_RUN_OPTIONS.windowMs!
+    const windowLimit = this.options.windowLimit ?? DEFAULT_RUN_OPTIONS.windowLimit!
+    while (this.recentRuns.length > 0 && now - this.recentRuns[0]! >= windowMs) {
+      this.recentRuns.shift()
+    }
+    if (this.recentRuns.length >= windowLimit) {
+      return { ok: false, error: '模型调用频率已达时间窗上限，请稍后再试' }
+    }
     this.lastRun.set(panel.id, now)
+    this.recentRuns.push(now)
     this.active.set(panel.id, running + 1)
+    this.totalActive += 1
     let streaming: Promise<PanelRunResult> | undefined
     const release = (): void => {
+      this.totalActive = Math.max(0, this.totalActive - 1)
       const left = (this.active.get(panel.id) ?? 1) - 1
       if (left <= 0) this.active.delete(panel.id)
       else this.active.set(panel.id, left)
@@ -115,12 +141,18 @@ export class PanelRunner {
     }
   }
 
+  /** Forget per-panel rate-limit state after a panel is deleted. */
+  forgetPanel(panelId: string): void {
+    this.lastRun.delete(panelId)
+  }
+
   /** Abort open model calls when the plugin unloads. */
   dispose(): void {
     this.disposed = true
     for (const controller of this.controllers) controller.abort()
     this.controllers.clear()
     this.lastRun.clear()
+    this.recentRuns.length = 0
   }
 
   private async call(panel: PanelRecord, prompt: string, system: string | undefined, signal: AbortSignal | undefined, track: (work: Promise<PanelRunResult>) => void): Promise<PanelRunResult> {
@@ -132,13 +164,19 @@ export class PanelRunner {
     const controller = new AbortController()
     this.controllers.add(controller)
     let timedOut = false
+    let truncated = false
+    let output = ''
+    const finalizeOutput = (): PanelRunResult => {
+      const text = output.trim()
+      return text === '' ? { ok: false, error: '模型没有返回文本' } : { ok: true, text }
+    }
     const abortFailure = (): PanelRunResult => ({ ok: false, error: timedOut ? '模型调用超时' : '模型调用被中止' })
     const cancel = (): void => controller.abort()
     signal?.addEventListener('abort', cancel, { once: true })
     if (signal?.aborted) cancel()
     let onAbort: () => void = () => {}
     const aborted = new Promise<PanelRunResult>(resolve => {
-      onAbort = () => resolve(abortFailure())
+      onAbort = () => resolve(truncated ? finalizeOutput() : abortFailure())
       controller.signal.addEventListener('abort', onAbort, { once: true })
       if (controller.signal.aborted) onAbort()
     })
@@ -147,10 +185,9 @@ export class PanelRunner {
       controller.abort()
     }, this.options.timeoutMs)
     const consume = async (): Promise<PanelRunResult> => {
-      let output = ''
       let failure: string | undefined
       try {
-        if (controller.signal.aborted) return abortFailure()
+        if (controller.signal.aborted) return truncated ? finalizeOutput() : abortFailure()
         for await (const chunk of llm.stream({
           provider: selection.provider,
           model: selection.model,
@@ -160,10 +197,16 @@ export class PanelRunner {
           maxTokens: this.options.maxTokens,
           signal: controller.signal,
         })) {
-          if (controller.signal.aborted) return abortFailure()
+          if (controller.signal.aborted) return truncated ? finalizeOutput() : abortFailure()
           if (chunk.type === 'text-delta' && typeof chunk.text === 'string') {
-            // Enforce the output bound while streaming, not only at the end.
-            output += chunk.text.slice(0, Math.max(0, this.options.maxOutputChars - output.length))
+            // Enforce the output bound while streaming and abort upstream immediately on saturation.
+            const remaining = this.options.maxOutputChars - output.length
+            if (remaining > 0) output += chunk.text.slice(0, remaining)
+            if (output.length >= this.options.maxOutputChars) {
+              truncated = true
+              controller.abort()
+              break
+            }
           } else if (chunk.type === 'finish') {
             if (chunk.reason?.kind === 'error') {
               failure = chunk.reason.failure?.message ?? '模型调用出错'
@@ -177,11 +220,10 @@ export class PanelRunner {
           ? timedOut ? '模型调用超时' : '模型调用被中止'
           : error instanceof Error ? error.message : String(error)
       }
+      if (truncated) return finalizeOutput()
       if (controller.signal.aborted) return abortFailure()
       if (failure !== undefined) return { ok: false, error: failure }
-      const text = output.trim()
-      if (text === '') return { ok: false, error: '模型没有返回文本' }
-      return { ok: true, text }
+      return finalizeOutput()
     }
     const work = consume()
     track(work)

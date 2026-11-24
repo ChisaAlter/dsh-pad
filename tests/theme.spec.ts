@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { readTheme } from '../src/client/theme.ts'
+import { readTheme, watchTheme } from '../src/client/theme.ts'
 
 /** `readTheme` only asks `getComputedStyle` for the element, so any node will do. */
 const element = {} as unknown as Element
@@ -86,6 +86,29 @@ describe('theme snapshot', () => {
       const { css } = readTheme(element)
       expect(/:root\{([^}]*)\}/.exec(css)?.[1] ?? '').not.toContain('color-scheme')
       expect(css).toContain(`body{color-scheme:${mode}}`)
+    }
+  })
+
+  it('watches desktop dark theme and skin attributes', () => {
+    const observed: Array<{ attributeFilter?: string[] }> = []
+    class FakeMutationObserver {
+      observe(_target: unknown, options: { attributeFilter?: string[] }) { observed.push(options) }
+      disconnect() {}
+    }
+    vi.stubGlobal('MutationObserver', FakeMutationObserver)
+    vi.stubGlobal('document', { documentElement: {}, body: {} })
+    vi.stubGlobal('matchMedia', () => ({ addEventListener() {}, removeEventListener() {} }))
+    vi.stubGlobal('requestAnimationFrame', () => 0)
+    vi.stubGlobal('cancelAnimationFrame', () => {})
+    const stop = watchTheme(() => {})
+    try {
+      expect(observed.length).toBeGreaterThan(0)
+      for (const options of observed) {
+        expect(options.attributeFilter).toContain('data-ds-dark-theme')
+        expect(options.attributeFilter).toContain('data-dsh-skin')
+      }
+    } finally {
+      stop()
     }
   })
 })

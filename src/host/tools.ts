@@ -1,13 +1,15 @@
 /**
  * Model-facing tools: the conversation creates, inspects, edits and removes
- * panels through these. A panel's data sources belong to that panel, so a
- * create or update that carries sources runs them at once and reports the
- * first readings; nothing waits for a separate confirmation.
+ * panels through these. Risky data sources (local shell commands or HTTP
+ * sources referencing `{{env:...}}` secrets) and panel deletion pass desktop
+ * main-process confirmation when running inside Whale Isle, or Harness
+ * interactive approval when running standalone.
  */
 import type { Context } from '@deepseek-ai/cordis'
-import { defineTool } from '@deepseek-ai/dsh-tools'
-import type { Json, PanelDefinition, PanelRecord } from '../shared/types.ts'
-import { type Limits, PanelValidationError, validateDefinition } from '../shared/validate.ts'
+import { defineTool, type ToolRunContext } from '@deepseek-ai/dsh-tools'
+import type {} from '@deepseek-ai/dsh-user-approval'
+import type { Json, PanelDefinition, PanelRecord, PanelSource } from '../shared/types.ts'
+import { assertPanelData, type Limits, PanelValidationError, validateDefinition } from '../shared/validate.ts'
 import type { AgentRefresher } from './agent-refresh.ts'
 import { PANEL_GUIDE, PANEL_TOPICS, panelManual, type PanelTopic } from './guide.ts'
 import type { DataHub } from './hub.ts'
@@ -23,9 +25,20 @@ export interface ToolDeps {
   readonly refresher: AgentRefresher | undefined
   readonly limits: Limits
   readonly resolveSecret: SecretResolver
+  /** Skip Harness approval prompts outside Whale Isle desktop. Defaults to false. */
+  readonly autoApprove?: boolean
+  /** Allow loopback/private HTTP targets (for automated tests). Defaults to false. */
+  readonly allowPrivateHttp?: boolean
+  /** Notified after a panel is deleted through `pad_delete`. */
+  readonly onDeletePanel?: (panelId: string) => void
 }
 
 const SAMPLE_CHARS = 1500
+const BODY_PREVIEW_CHARS = 300
+const DESKTOP_CONFIRM_TIMEOUT_MS = 240_000
+const DESKTOP_DECLINED_TEXT = '用户拒绝了这次操作，不要重试，除非用户再次明确要求。'
+const SECRET_REF = /\{\{\s*env:([A-Za-z_][A-Za-z0-9_]*)\s*\}\}/g
+const WHALEISLE_INTERNAL_SECRETS = Symbol.for('whaleisle.internalSecrets')
 
 const sourceItem = {
   type: 'object',
@@ -76,6 +89,94 @@ function sample(value: Json | undefined): string {
   return text.length > SAMPLE_CHARS ? `${text.slice(0, SAMPLE_CHARS)}…（共 ${text.length} 字符，已截断）` : text
 }
 
+function sourceSecretNames(source: PanelSource): string[] {
+  const text = source.kind === 'command'
+    ? source.command
+    : [source.url, ...Object.entries(source.headers ?? {}).flat(), source.body ?? ''].join('\n')
+  return [...new Set([...text.matchAll(SECRET_REF)].map(match => match[1]!))]
+}
+
+function isRiskySource(source: PanelSource): boolean {
+  return source.kind === 'command' || sourceSecretNames(source).length > 0
+}
+
+function describeSources(sources: readonly PanelSource[]): string {
+  return sources.map((source) => {
+    const lines: string[] = []
+    if (source.kind === 'command') {
+      lines.push(`• [${source.id}] 每 ${source.intervalSec} 秒运行命令：${source.command}`)
+    } else {
+      lines.push(`• [${source.id}] 每 ${source.intervalSec} 秒请求：${source.method ?? 'GET'} ${source.url}`)
+      for (const [key, value] of Object.entries(source.headers ?? {})) {
+        lines.push(`  请求头 ${key}: ${value}`)
+      }
+      if (source.body !== undefined && source.body !== '') {
+        lines.push(`  请求体 ${source.body.length > BODY_PREVIEW_CHARS
+          ? `${source.body.slice(0, BODY_PREVIEW_CHARS)}…（共 ${source.body.length} 字符，已截断）`
+          : source.body}`)
+      }
+    }
+    const secrets = sourceSecretNames(source)
+    if (secrets.length > 0) lines.push(`  使用密钥：${secrets.join(', ')}`)
+    return lines.join('\n')
+  }).join('\n')
+}
+
+function readDesktopConfirmToken(): string {
+  const secrets = Reflect.get(globalThis, WHALEISLE_INTERNAL_SECRETS) as
+    | { get?: (name: string) => unknown }
+    | Record<string, unknown>
+    | undefined
+  if (secrets === null || typeof secrets !== 'object') return ''
+  const value = typeof (secrets as { get?: unknown }).get === 'function'
+    ? (secrets as { get(name: string): unknown }).get('DSH_DESKTOP_INSTALL_TOKEN')
+    : Reflect.get(secrets, 'DSH_DESKTOP_INSTALL_TOKEN')
+  return typeof value === 'string' ? value.trim() : ''
+}
+
+interface DesktopConfirmRequest {
+  readonly tool: string
+  readonly action: string
+  readonly effect: 'code' | 'destructive'
+  readonly summary: string
+  readonly details: string
+}
+
+async function confirmModelAction(request: DesktopConfirmRequest, signal?: AbortSignal): Promise<void> {
+  const url = String(process.env['DSH_DESKTOP_INSTALL_URL'] ?? '').trim()
+  const token = readDesktopConfirmToken()
+  if (!url || !token) throw new Error(DESKTOP_DECLINED_TEXT)
+  let endpoint: URL
+  try {
+    endpoint = new URL('/desktop/confirm', url)
+  } catch {
+    throw new Error(DESKTOP_DECLINED_TEXT)
+  }
+  const timeout = AbortSignal.timeout(DESKTOP_CONFIRM_TIMEOUT_MS)
+  const requestSignal = signal ? AbortSignal.any([signal, timeout]) : timeout
+  let response: Response
+  try {
+    response = await fetch(endpoint, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+      body: JSON.stringify(request),
+      signal: requestSignal,
+    })
+  } catch {
+    throw new Error(signal?.aborted ? '操作已取消' : DESKTOP_DECLINED_TEXT)
+  }
+  if (!response.ok) throw new Error(DESKTOP_DECLINED_TEXT)
+  let payload: unknown
+  try {
+    payload = await response.json()
+  } catch {
+    throw new Error(DESKTOP_DECLINED_TEXT)
+  }
+  if (typeof payload !== 'object' || payload === null || (payload as Record<string, unknown>)['ok'] !== true) {
+    throw new Error(DESKTOP_DECLINED_TEXT)
+  }
+}
+
 function panelSummary(panel: PanelRecord, refresher: AgentRefresher | undefined, hub: DataHub): Json {
   const view = hub.views().find(v => v.id === panel.id)
   return {
@@ -106,7 +207,49 @@ function panelSummary(panel: PanelRecord, refresher: AgentRefresher | undefined,
  * @param deps - services and limits.
  */
 export function registerTools(deps: ToolDeps): void {
-  const { ctx, store, hub, refresher, limits, resolveSecret } = deps
+  const { ctx, store, hub, refresher, limits, resolveSecret, autoApprove = false, onDeletePanel } = deps
+
+  const isDesktopConfirmEnabled = (): boolean => String(process.env['DSH_DESKTOP_INSTALL_URL'] ?? '').trim() !== ''
+
+  async function requestHarnessApproval(request: DesktopConfirmRequest, exec?: Partial<ToolRunContext>): Promise<void> {
+    if (autoApprove) return
+    const approval = ctx.get('approval')
+    if (approval !== undefined && exec?.agent !== undefined) {
+      const outcome = await approval.request({
+        agent: exec.agent,
+        toolName: request.tool,
+        ...(exec.callId === undefined ? {} : { callId: exec.callId }),
+        reason: request.details ? `${request.summary}\n${request.details}` : request.summary,
+        ...(exec.signal === undefined ? {} : { signal: exec.signal }),
+      })
+      if (outcome !== 'allowed-once') {
+        throw new Error(outcome === 'cancelled' ? '操作已取消' : DESKTOP_DECLINED_TEXT)
+      }
+    }
+  }
+
+  async function gateRiskySources(
+    tool: 'pad_test_source' | 'pad_create' | 'pad_update',
+    title: string,
+    sources: readonly PanelSource[],
+    exec?: Partial<ToolRunContext>,
+  ): Promise<void> {
+    const risky = sources.filter(isRiskySource)
+    if (risky.length === 0) return
+    const summary = `面板「${title}」的数据源要在本机运行命令或携带密钥发出请求`
+    const details = describeSources(risky)
+    if (isDesktopConfirmEnabled()) {
+      await confirmModelAction({
+        tool,
+        action: 'run-sources',
+        effect: 'code',
+        summary,
+        details,
+      }, exec?.signal)
+      return
+    }
+    await requestHarnessApproval({ tool, action: 'run-sources', effect: 'code', summary, details }, exec)
+  }
 
   function readingsReport(readings: readonly { id: string, ok: boolean, value?: Json, error?: string }[]): string[] {
     return readings.map(r => r.ok ? `- ${r.id}: ✓ ${sample(r.value)}` : `- ${r.id}: ✗ ${r.error}`)
@@ -193,7 +336,8 @@ export function registerTools(deps: ToolDeps): void {
     async execute(args, exec) {
       const probe = validate({ title: 'test', html: '', css: '', script: '', height: 'auto', sources: [{ intervalSec: limits.minIntervalSec, ...(args.source as Record<string, unknown>) }] })
       const source = probe.sources[0]!
-      const reading = await runSource(source, resolveSecret, exec.signal)
+      await gateRiskySources('pad_test_source', '试跑数据源', [source], exec)
+      const reading = await runSource(source, resolveSecret, exec.signal, { allowPrivateHttp: deps.allowPrivateHttp })
       return reading.ok ? `✓ 用时 ${reading.durationMs}ms，输出：\n${sample(reading.value)}` : `✗ ${reading.error}`
     },
   })), 'dsh-pad: pad_test_source')
@@ -243,33 +387,44 @@ export function registerTools(deps: ToolDeps): void {
       plain: { type: 'boolean', description: '用户明确只要一张文字卡片（便签、引用、说明）时传 true，跳过排版检查' },
     },
     output: textOutput,
-    async execute(args) {
+    async execute(args, exec) {
       const definition = validate({ css: '', script: '', height: 'auto', sources: [], ...args })
+      if (args.data !== undefined) {
+        assertPanelData(args.data)
+        if (!definition.agent) {
+          throw new Error(`面板「${definition.title}」没有 AI 刷新，data 只适用于有 agent 的面板`)
+        }
+      }
       if (definition.model) await assertModel(ctx, definition.model)
-      // A repeated pad_create for a title that already exists is almost
-      // always the same request replayed in another session; minting a second
-      // record leaves the dock with confusing duplicates. Reuse the existing
-      // panel instead and refresh its definition, so the caller sees the new
-      // design without multiplying cards. Identical calls are pure no-ops.
-      const duplicate = store.list().find(p => p.definition.title === definition.title)
-      if (duplicate && JSON.stringify(duplicate.definition) === JSON.stringify(definition)) {
-        // The definition is identical, so the call itself is a no-op — but a
-        // replayed create may still carry fresh seed data. Apply it like the
-        // data-only path of pad_update instead of dropping it silently.
-        const lines = [`面板 ${duplicate.id}「${definition.title}」已存在，定义相同，没有新建。`]
-        if (args.data !== undefined) {
-          await store.setAgentData(duplicate.id, args.data as Json)
-          hub.pushData(duplicate.id)
+      const existingSame = store.list().find(p => p.definition.title === definition.title
+        && JSON.stringify(p.definition) === JSON.stringify(definition))
+      if (existingSame === undefined) {
+        await gateRiskySources('pad_create', definition.title, definition.sources, exec)
+      }
+      let notes: string[] = []
+      const result = typeof store.createOrUpdate === 'function'
+        ? await store.createOrUpdate(definition, {
+            data: args.data as Json | undefined,
+            beforeWrite: () => {
+              notes = lintNotes(definition, args.plain === true)
+            },
+          })
+        : await (async () => {
+            notes = lintNotes(definition, args.plain === true)
+            const panel = await store.create(definition, args.data as Json | undefined)
+            return { status: 'created' as const, panel, dataUpdated: args.data !== undefined }
+          })()
+      if (result.status === 'unchanged') {
+        const lines = [`面板 ${result.panel.id}「${definition.title}」已存在，定义相同，没有新建。`]
+        if (result.dataUpdated) {
+          hub.pushData(result.panel.id)
           lines.push('已把这次提交的 data 更新到面板上。')
         }
-        lines.push(`要改内容请用 pad_update 传 id；要并排再放一张请先给新面板换个标题。`)
+        lines.push('要改内容请用 pad_update 传 id；要并排再放一张请先给新面板换个标题。')
         return lines.join('\n')
       }
-      const notes = lintNotes(definition, args.plain === true)
-      const panel = duplicate
-        ? await store.update(duplicate.id, definition, args.data as Json | undefined)
-        : await store.create(definition, args.data as Json | undefined)
-      const lines = duplicate
+      const panel = result.panel
+      const lines = result.status === 'updated'
         ? [`已有同名面板 ${panel.id}「${definition.title}」，已把内容更新为这次提交的版本（版本 ${panel.version}），没有新建重复面板。`]
         : [`已创建面板 ${panel.id}「${definition.title}」，已经出现在悬浮面板坞。`]
       lines.push(...await firstReadings(panel))
@@ -297,12 +452,13 @@ export function registerTools(deps: ToolDeps): void {
       plain: { type: 'boolean', description: '用户明确只要一张文字卡片时传 true，跳过排版检查' },
     },
     output: textOutput,
-    async execute(args) {
+    async execute(args, exec) {
       const current = store.get(args.id)
       const { id, data, plain, ...fields } = args
       const changesDefinition = Object.keys(fields).length > 0
       if (!changesDefinition) {
         if (data === undefined) throw new Error('没有要改的字段')
+        assertPanelData(data)
         // A panel without agent refresh never reads agentData — writing it
         // would silently discard the payload. Reject so the caller notices.
         await store.setAgentData(id, data as Json, latest => {
@@ -313,6 +469,19 @@ export function registerTools(deps: ToolDeps): void {
         return `已更新面板「${current.definition.title}」的数据。`
       }
       const candidate = validate({ ...current.definition, ...fields })
+      if (data !== undefined) {
+        assertPanelData(data)
+        if (!candidate.agent) {
+          throw new Error(`面板「${candidate.title}」没有 AI 刷新，data 只适用于有 agent 的面板`)
+        }
+      }
+      if (fields.sources !== undefined) {
+        const existingKeys = new Set(current.definition.sources.map(source => sourcesFingerprint([source])))
+        const changedRisky = candidate.sources.filter(source => isRiskySource(source) && !existingKeys.has(sourcesFingerprint([source])))
+        if (changedRisky.length > 0) {
+          await gateRiskySources('pad_update', candidate.title, candidate.sources, exec)
+        }
+      }
       if (candidate.model) await assertModel(ctx, candidate.model)
       // Model lookup is asynchronous. Merge only the requested fields into the
       // latest committed definition after it returns, inside the store transaction.
@@ -357,9 +526,32 @@ export function registerTools(deps: ToolDeps): void {
     description: '删除一张面板（用户明确要删时才用）。',
     parameters: { id: { type: 'string', required: true, description: '面板 id' } },
     output: textOutput,
-    async execute(args) {
+    async execute(args, exec) {
       const panel = store.get(args.id)
+      const sourceSummary = panel.definition.sources.length > 0
+        ? `\n${describeSources(panel.definition.sources)}`
+        : ''
+      const summary = `删除面板「${panel.definition.title}」（${panel.id}）`
+      const details = `面板 ID：${panel.id}\n标题：${panel.definition.title}\n数据源数量：${panel.definition.sources.length}${sourceSummary}`
+      if (isDesktopConfirmEnabled()) {
+        await confirmModelAction({
+          tool: 'pad_delete',
+          action: 'delete',
+          effect: 'destructive',
+          summary,
+          details,
+        }, exec.signal)
+      } else {
+        await requestHarnessApproval({
+          tool: 'pad_delete',
+          action: 'delete',
+          effect: 'destructive',
+          summary,
+          details,
+        }, exec)
+      }
       await store.remove(args.id)
+      onDeletePanel?.(args.id)
       return `已删除面板「${panel.definition.title}」。`
     },
   })), 'dsh-pad: pad_delete')

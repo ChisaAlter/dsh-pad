@@ -12,6 +12,7 @@ export const FRAME_RUNTIME = String.raw`
   'use strict';
   var root = document.documentElement;
   var token = root.getAttribute('data-token');
+  if (typeof root.removeAttribute === 'function') root.removeAttribute('data-token');
   var parentWin = window.parent;
   var init = JSON.parse(document.getElementById('pad-init').textContent || '{}');
   var current = init.data || null;
@@ -84,6 +85,11 @@ export const FRAME_RUNTIME = String.raw`
     if (!a) return;
     e.preventDefault();
     post({ kind: 'open', url: a.href });
+  });
+  window.addEventListener('keydown', function (e) {
+    if (e && e.key === 'Escape' && !e.defaultPrevented) {
+      post({ kind: 'escape' });
+    }
   });
 
   var lastHeight = -1;
@@ -167,15 +173,41 @@ export const FRAME_RUNTIME = String.raw`
     });
   }
   function clamp01(x) { x = Number(x); return isFinite(x) ? Math.max(0, Math.min(1, x)) : 0; }
+  function clampNum(v, fallback, min, max) {
+    if (v == null || v === '') return fallback;
+    var n = Number(v);
+    if (!isFinite(n)) return fallback;
+    return Math.max(min, Math.min(max, n));
+  }
+  var SAFE_CSS_VAR = /^var\(--[a-zA-Z0-9_-]+\)$/;
+  var SAFE_HEX = /^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{4}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})$/;
+  var SAFE_RGB = /^rgba?\(\s*\d{1,3}(?:\.\d+)?%?(?:\s*,\s*|\s+)\d{1,3}(?:\.\d+)?%?(?:\s*,\s*|\s+)\d{1,3}(?:\.\d+)?%?(?:\s*(?:,|\/)\s*(?:0|1|0?\.\d+|\d{1,3}%))?\s*\)$/;
+  var SAFE_HSL = /^hsla?\(\s*-?\d+(?:\.\d+)?(?:deg|rad|grad|turn)?(?:\s*,\s*|\s+)\d{1,3}(?:\.\d+)?%(?:\s*,\s*|\s+)\d{1,3}(?:\.\d+)?%(?:\s*(?:,|\/)\s*(?:0|1|0?\.\d+|\d{1,3}%))?\s*\)$/;
+  var SAFE_NAMED = /^[a-zA-Z]{3,24}$/;
+  function safeColor(value, fallback) {
+    if (typeof value === 'string') {
+      var trimmed = value.trim();
+      var tone = toneColor(trimmed);
+      if (tone) return esc(tone);
+      if (SAFE_CSS_VAR.test(trimmed) || SAFE_HEX.test(trimmed) || SAFE_RGB.test(trimmed) || SAFE_HSL.test(trimmed) || SAFE_NAMED.test(trimmed)) {
+        return esc(trimmed);
+      }
+    }
+    return esc(fallback);
+  }
   var gradientSeq = 0;
   var chart = {
     sparkline: function (values, opt) {
       opt = opt || {};
-      var w = opt.width || 120, h = opt.height || 28, color = opt.color || 'var(--pad-accent)';
+      var w = clampNum(opt.width, 120, 1, 2000);
+      var h = clampNum(opt.height, 28, 4, 1000);
+      var color = safeColor(opt.color, 'var(--pad-accent)');
       var nums = (values || []).map(Number).filter(function (v) { return isFinite(v); });
       if (nums.length < 2) return '<svg width="' + w + '" height="' + h + '"></svg>';
-      var min = opt.min != null ? opt.min : Math.min.apply(null, nums);
-      var max = opt.max != null ? opt.max : Math.max.apply(null, nums);
+      var optMin = opt.min != null && opt.min !== '' ? Number(opt.min) : NaN;
+      var optMax = opt.max != null && opt.max !== '' ? Number(opt.max) : NaN;
+      var min = isFinite(optMin) ? optMin : Math.min.apply(null, nums);
+      var max = isFinite(optMax) ? optMax : Math.max.apply(null, nums);
       if (max === min) { max = min + 1; }
       var step = w / (nums.length - 1);
       var pts = nums.map(function (v, i) {
@@ -192,13 +224,16 @@ export const FRAME_RUNTIME = String.raw`
     },
     bar: function (fraction, opt) {
       opt = opt || {};
-      var f = clamp01(fraction), color = opt.color || dsh.tone(f), h = opt.height || 6;
+      var f = clamp01(fraction), color = safeColor(opt.color, dsh.tone(f)), h = clampNum(opt.height, 6, 1, 200);
       return '<div style="height:' + h + 'px;border-radius:' + h + 'px;background:var(--pad-bg-2);overflow:hidden">' +
         '<div style="height:100%;width:' + (f * 100).toFixed(1) + '%;border-radius:inherit;background:' + color + ';transition:width .3s ease"></div></div>';
     },
     ring: function (fraction, opt) {
       opt = opt || {};
-      var f = clamp01(fraction), size = opt.size || 44, sw = opt.stroke || 5, color = opt.color || dsh.tone(f);
+      var f = clamp01(fraction);
+      var size = clampNum(opt.size, 44, 12, 512);
+      var sw = clampNum(opt.stroke, 5, 1, Math.max(1, size / 2));
+      var color = safeColor(opt.color, dsh.tone(f));
       var r = (size - sw) / 2, c = 2 * Math.PI * r;
       var label = opt.label != null ? opt.label : Math.round(f * 100) + '%';
       return '<svg width="' + size + '" height="' + size + '" viewBox="0 0 ' + size + ' ' + size + '" style="display:block">' +
@@ -302,7 +337,12 @@ export const FRAME_RUNTIME = String.raw`
     },
     state: {
       get: function (key) { return stateStore[key]; },
-      set: function (key, value) { stateStore[key] = value; post({ kind: 'state', key: String(key), value: value }); }
+      set: function (key, value) {
+        var name = String(key);
+        if (name === '__proto__' || name === 'constructor' || name === 'prototype') return;
+        stateStore[name] = value;
+        post({ kind: 'state', key: name, value: value });
+      }
     },
     tone: function (fraction, warnAt, dangerAt) {
       var f = Number(fraction);

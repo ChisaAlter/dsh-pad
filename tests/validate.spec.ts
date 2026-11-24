@@ -1,5 +1,13 @@
 import { describe, expect, it } from 'vitest'
-import { PanelValidationError, validateDefinition } from '../src/shared/validate.ts'
+import {
+  assertPanelData,
+  MAX_HTTP_HEADER_NAME_CHARS,
+  MAX_HTTP_HEADER_VALUE_CHARS,
+  MAX_HTTP_URL_CHARS,
+  MAX_PANEL_DATA_BYTES,
+  PanelValidationError,
+  validateDefinition,
+} from '../src/shared/validate.ts'
 
 const limits = { minIntervalSec: 2, minAgentMinutes: 15 }
 const base = { title: '服务器性能', html: '<div></div>', css: '', script: '', height: 'auto', sources: [] }
@@ -78,5 +86,54 @@ describe('validateDefinition', () => {
 
   it('caps the code size', () => {
     expect(problems({ ...base, script: 'x'.repeat(200_001) })[0]).toMatch(/合计不能超过/)
+  })
+
+  it('enforces HTTP url, header and GET body bounds', () => {
+    const longUrl = `https://example.org/${'a'.repeat(MAX_HTTP_URL_CHARS)}`
+    expect(problems({
+      ...base,
+      sources: [{ id: 'api', kind: 'http', url: longUrl, parse: 'json', intervalSec: 5 }],
+    }).join('\n')).toMatch(/sources\[0\]\.url 不能超过/)
+
+    expect(problems({
+      ...base,
+      sources: [{
+        id: 'api', kind: 'http', url: 'https://example.org/x', parse: 'json', intervalSec: 5,
+        headers: { ['k'.repeat(MAX_HTTP_HEADER_NAME_CHARS + 1)]: 'v' },
+      }],
+    }).join('\n')).toMatch(/sources\[0\]\.headers/)
+
+    expect(problems({
+      ...base,
+      sources: [{
+        id: 'api', kind: 'http', url: 'https://example.org/x', parse: 'json', intervalSec: 5,
+        headers: { 'x-big': 'v'.repeat(MAX_HTTP_HEADER_VALUE_CHARS + 1) },
+      }],
+    }).join('\n')).toMatch(/sources\[0\]\.headers/)
+
+    expect(problems({
+      ...base,
+      sources: [{ id: 'api', kind: 'http', url: 'https://example.org/x', body: '{"a":1}', parse: 'json', intervalSec: 5 }],
+    }).join('\n')).toMatch(/不能用于 GET/)
+
+    expect(problems({
+      ...base,
+      sources: [{ id: 'api', kind: 'http', url: 'https://example.org/x', method: 'GET', body: '{"a":1}', parse: 'json', intervalSec: 5 }],
+    }).join('\n')).toMatch(/不能用于 GET/)
+
+    expect(problems({
+      ...base,
+      sources: [{ id: 'api', kind: 'http', url: 'https://example.org/x', method: 'POST', body: '{"a":1}', parse: 'json', intervalSec: 5 }],
+    })).toEqual([])
+  })
+})
+
+describe('assertPanelData', () => {
+  it('accepts safe JSON within the 256 KiB limit and rejects deep or oversized values', () => {
+    expect(() => assertPanelData({ ok: true, items: [1, 2, 3] })).not.toThrow()
+    const deep = JSON.parse('['.repeat(200) + '1' + ']'.repeat(200))
+    expect(() => assertPanelData(deep)).toThrow(/JSON 嵌套超过/)
+    expect(() => assertPanelData('x'.repeat(MAX_PANEL_DATA_BYTES + 1))).toThrow(/数据超过 256KB/)
+    expect(() => assertPanelData(Number.NaN)).toThrow(/不支持的 JSON 值/)
   })
 })

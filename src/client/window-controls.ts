@@ -19,6 +19,9 @@ const CONTROLS_ID = 'dshd-shell-controls'
 
 export function readViewport(): Viewport {
   const viewport = { width: window.innerWidth, height: window.innerHeight }
+  if (typeof document === 'undefined' || typeof document.getElementById !== 'function' || typeof getComputedStyle !== 'function') {
+    return viewport
+  }
   const controls = document.getElementById(CONTROLS_ID)
   if (controls !== null) {
     const rect = controls.getBoundingClientRect()

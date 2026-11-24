@@ -11,7 +11,7 @@
  */
 import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-client-connection'
-import { type PanelAction, type PanelModelSelection, ROUTES, type StreamEvent } from '../shared/types.ts'
+import { type PanelAction, type PanelModelSelection, type PanelView, type ReadingPoint, ROUTES, type StreamEvent } from '../shared/types.ts'
 import type { AgentRefresher } from './agent-refresh.ts'
 import type { DataHub, Subscriber } from './hub.ts'
 import { assertModel, modelCatalog } from './models.ts'
@@ -23,10 +23,73 @@ const HEARTBEAT_MS = 20_000
 /** Total encoded backlog, including the frame held inside ReadableStream. */
 export const MAX_SSE_QUEUED_BYTES = 8 * 1024 * 1024
 export const SSE_STALL_MS = 30_000
+/** Maximum concurrent SSE clients; exceeding it evicts the oldest stream. */
+export const MAX_SSE_STREAMS = 32
 
 interface SseFrame {
   readonly key: string
   readonly bytes: Uint8Array
+}
+
+function trimSnapshotHistoryToBudget(
+  panels: readonly PanelView[],
+  budget: number,
+  encoder: TextEncoder,
+): Uint8Array | undefined {
+  const hasHistory = panels.some(panel => Object.values(panel.history).some(points => points.length > 0))
+  if (!hasHistory) return undefined
+  const barePanels = panels.map(panel => ({ ...panel, history: {} }))
+  const bareBytes = encoder.encode(`data: ${JSON.stringify({ type: 'panels', panels: barePanels })}\n\n`)
+  if (bareBytes.byteLength > budget) return undefined
+  const remaining = budget - bareBytes.byteLength
+  interface Cursor {
+    readonly panelIndex: number
+    readonly sourceId: string
+    readonly points: readonly ReadingPoint[]
+    nextFromEnd: number
+    kept: ReadingPoint[]
+    overhead: number
+  }
+  const cursors: Cursor[] = []
+  for (let i = 0; i < panels.length; i += 1) {
+    for (const [sourceId, points] of Object.entries(panels[i]!.history)) {
+      if (points.length === 0) continue
+      cursors.push({
+        panelIndex: i,
+        sourceId,
+        points,
+        nextFromEnd: points.length - 1,
+        kept: [],
+        overhead: encoder.encode(`${JSON.stringify(sourceId)}:[],`).byteLength,
+      })
+    }
+  }
+  let used = 0
+  let progress = true
+  while (progress) {
+    progress = false
+    for (const cursor of cursors) {
+      if (cursor.nextFromEnd < 0) continue
+      const point = cursor.points[cursor.nextFromEnd]!
+      const cost = (cursor.kept.length === 0 ? cursor.overhead : 1) + encoder.encode(JSON.stringify(point)).byteLength
+      if (used + cost <= remaining) {
+        cursor.kept.push(point)
+        cursor.nextFromEnd -= 1
+        used += cost
+        progress = true
+      } else {
+        cursor.nextFromEnd = -1
+      }
+    }
+  }
+  const trimmedPanels = barePanels.map(panel => ({ ...panel, history: {} as Record<string, readonly ReadingPoint[]> }))
+  for (const cursor of cursors) {
+    if (cursor.kept.length > 0) {
+      trimmedPanels[cursor.panelIndex]!.history[cursor.sourceId] = cursor.kept.reverse()
+    }
+  }
+  const trimmedBytes = encoder.encode(`data: ${JSON.stringify({ type: 'panels', panels: trimmedPanels })}\n\n`)
+  return trimmedBytes.byteLength <= budget ? trimmedBytes : bareBytes
 }
 
 function json(value: unknown, status = 200): Response {
@@ -83,18 +146,42 @@ export interface RouteDeps {
   readonly hub: DataHub
   readonly refresher: AgentRefresher | undefined
   readonly runOptions?: PanelRunOptions
+  readonly runner?: PanelRunner
   readonly update?: UpdateService
+  readonly maxSseStreams?: number
 }
 
 /**
  * Register the routes; each registration is a Cordis effect removed on unload.
  * @param deps - services.
  */
-export function registerRoutes({ ctx, store, hub, runOptions, update }: RouteDeps): void {
+export function registerRoutes({ ctx, store, hub, runOptions, runner: providedRunner, update, maxSseStreams = MAX_SSE_STREAMS }: RouteDeps): void {
   const connection = ctx.connection
-  const runner = new PanelRunner(ctx, runOptions)
+  const runner = providedRunner ?? new PanelRunner(ctx, runOptions)
   const streams = new Set<() => void>()
-  ctx.effect(() => () => runner.dispose(), 'dsh-pad: model cleanup')
+  const sharedEncoder = new TextEncoder()
+  const encodedEvents = new WeakMap<StreamEvent, Uint8Array>()
+  const retryBytes = sharedEncoder.encode('retry: 3000\n\n')
+  const heartbeatBytes = sharedEncoder.encode(': ping\n\n')
+  const encodeSseEvent = (event: StreamEvent): Uint8Array => {
+    let bytes = encodedEvents.get(event)
+    if (bytes === undefined) {
+      bytes = sharedEncoder.encode(`data: ${JSON.stringify(event)}\n\n`)
+      encodedEvents.set(event, bytes)
+    }
+    return bytes
+  }
+  if (providedRunner === undefined) {
+    ctx.effect(() => () => runner.dispose(), 'dsh-pad: model cleanup')
+  }
+  let knownPanelIds = new Set(store.list().map(panel => panel.id))
+  ctx.effect(() => store.onChange(() => {
+    const current = new Set(store.list().map(panel => panel.id))
+    for (const id of knownPanelIds) {
+      if (!current.has(id)) runner.forgetPanel(id)
+    }
+    knownPanelIds = current
+  }), 'dsh-pad: runner panel cleanup')
   ctx.effect(() => () => {
     for (const close of [...streams]) close()
     streams.clear()
@@ -114,7 +201,7 @@ export function registerRoutes({ ctx, store, hub, runOptions, update }: RouteDep
     fetch: async (request) => {
       const watchParam = new URL(request.url).searchParams.get('watch') ?? ''
       const watch = new Set(watchParam.split(',').map(id => id.trim()).filter(Boolean))
-      const encoder = new TextEncoder()
+      const limit = Math.max(1, maxSseStreams)
       let cleanup: (() => void) | undefined
       let drain: (() => void) | undefined
       const body = new ReadableStream<Uint8Array>({
@@ -150,6 +237,11 @@ export function registerRoutes({ ctx, store, hub, runOptions, update }: RouteDep
             close()
             return
           }
+          while (streams.size >= limit) {
+            const oldest = streams.values().next().value
+            if (oldest === undefined) break
+            oldest()
+          }
           streams.add(cleanup)
           request.signal.addEventListener('abort', cleanup, { once: true })
           const updateStall = (): void => {
@@ -180,9 +272,8 @@ export function registerRoutes({ ctx, store, hub, runOptions, update }: RouteDep
               close()
             }
           }
-          const write = (key: string, text: string): void => {
+          const writeBytes = (key: string, bytes: Uint8Array): void => {
             if (!open) return
-            const bytes = encoder.encode(text)
             const previous = queue.findIndex(frame => frame.key === key)
             if (previous >= 0) queuedBytes -= queue.splice(previous, 1)[0]!.bytes.byteLength
             if ((controller.desiredSize ?? 0) > 0) streamBytes = 0
@@ -201,24 +292,30 @@ export function registerRoutes({ ctx, store, hub, runOptions, update }: RouteDep
               if (!open) return
               try {
                 // A new full snapshot supersedes every queued data update.
-                const text = `data: ${JSON.stringify(event)}\n\n`
+                let bytes = encodeSseEvent(event)
                 if (event.type === 'panels') {
                   queue.length = 0
                   queuedBytes = 0
+                  if ((controller.desiredSize ?? 0) > 0) streamBytes = 0
+                  const budget = MAX_SSE_QUEUED_BYTES - streamBytes
+                  if (bytes.byteLength > budget) {
+                    const trimmed = trimSnapshotHistoryToBudget(event.panels, budget, sharedEncoder)
+                    if (trimmed !== undefined) bytes = trimmed
+                  }
                 }
-                write(event.type === 'data' ? `data:${event.panelId}` : 'panels', text)
+                writeBytes(event.type === 'data' ? `data:${event.panelId}` : 'panels', bytes)
               } catch {
                 close(new Error('SSE 数据无法序列化，请重新连接'))
               }
             },
           }
-          write('retry', 'retry: 3000\n\n')
+          writeBytes('retry', retryBytes)
           unsubscribe = hub.subscribe(subscriber)
           if (!open) {
             unsubscribe()
             return
           }
-          heartbeat = setInterval(() => write('heartbeat', ': ping\n\n'), HEARTBEAT_MS)
+          heartbeat = setInterval(() => writeBytes('heartbeat', heartbeatBytes), HEARTBEAT_MS)
         },
         pull() {
           drain?.()
@@ -316,6 +413,7 @@ export function registerRoutes({ ctx, store, hub, runOptions, update }: RouteDep
             break
           case 'delete':
             await store.remove(action.panelId)
+            runner.forgetPanel(action.panelId)
             break
           case 'undo':
             await store.undo(action.panelId)

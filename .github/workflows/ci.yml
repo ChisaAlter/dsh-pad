@@ -21,3 +21,6 @@ jobs:
       - run: npm run typecheck
       - run: npm test
       - run: npm run build
+      - name: Verify committed bundles match sources
+        run: git diff --exit-code -- lib/
+        shell: bash

@@ -14,9 +14,15 @@ const platform = (id: string): unknown => {
   if (id === '@deepseek-ai/dsh-client-ui-slots') return slots
   // These tests inspect registration rather than rendering. The application
   // supplies React at runtime; no browser-only dependency is needed here.
-  if (id === 'react') return { Component: class {}, createContext: () => ({}) }
+  if (id === 'react') return {
+    Component: class {},
+    createContext: () => ({}),
+    createElement: (type: unknown, props: unknown, ...children: unknown[]) => ({ type, props, children }),
+    useSyncExternalStore: (_sub: unknown, get: () => unknown) => get(),
+  }
   if (id === 'react/jsx-runtime') return { jsx: (type: unknown, props: unknown) => ({ type, props }), jsxs: (type: unknown, props: unknown) => ({ type, props }) }
   if (id === 'react-dom' || id === 'react-dom/client') return {}
+  if (id === '@deepseek-ai/dsh-client-ui-primitives') return {}
   return require(id)
 }
 
@@ -69,6 +75,49 @@ async function environment(declared = true) {
 const tick = async (): Promise<void> => { for (let n = 0; n < 12; n++) await Promise.resolve() }
 
 describe('dock activation and recovery', () => {
+  it('adds the same Pad to a Whale sidebar declared after startup, and releases it on disable', async () => {
+    const env = await environment()
+    const plugin = moduleExports(source, { document: env.document, EventSource: class { close() {} } })
+    const fiber = env.ctx.plugin(plugin as any).ctx.fiber
+    try {
+      await fiber.await()
+      expect(env.registry.entries('shell.overlay')).toHaveLength(1)
+      expect(env.registry.spec('whale.panels')).toBeUndefined()
+      const removeWhale = env.registry.register({ name: 'shell.overlay', id: 'whale', children: {
+        'whale.panels': { kind: 'single', scope: 'root' },
+      } }, () => null)
+      await tick()
+      expect(env.registry.entries('whale.panels')).toHaveLength(1)
+      const entry = env.registry.entries('whale.panels')[0]
+      expect(entry.options.id).toBe('dsh-pad.whale')
+      // Top-level RenderBoundary protects the Whale sidebar slot from crashing the host.
+      const rendered = entry.component({ t: (key: string) => key })
+      expect(rendered.type?.name).toBe('RenderBoundary')
+      await fiber.dispose()
+      expect(env.registry.entries('whale.panels')).toHaveLength(0)
+      removeWhale()
+      expect(env.registry.spec('whale.panels')).toBeUndefined()
+    } finally { await env.ctx.fiber.dispose() }
+  })
+
+  it('also registers into a list-kind whale.panels slot with id dsh-pad.whale', async () => {
+    const env = await environment()
+    const plugin = moduleExports(source, { document: env.document, EventSource: class { close() {} } })
+    const fiber = env.ctx.plugin(plugin as any).ctx.fiber
+    try {
+      await fiber.await()
+      const removeWhale = env.registry.register({ name: 'shell.overlay', id: 'whale', children: {
+        'whale.panels': { kind: 'list', scope: 'root' },
+      } }, () => null)
+      await tick()
+      const entries = env.registry.entries('whale.panels')
+      expect(entries).toHaveLength(1)
+      expect(entries[0].options.id).toBe('dsh-pad.whale')
+      await fiber.dispose()
+      removeWhale()
+    } finally { await env.ctx.fiber.dispose() }
+  })
+
   it('keeps its entrance when the first stream construction fails, then reconnects', async () => {
     vi.useFakeTimers()
     const env = await environment()

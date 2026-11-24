@@ -21,16 +21,15 @@ import {
 } from 'react'
 import { composer } from './composer.ts'
 import { clampBall, nearestBallEdge, positionAtBallEdge, type BallEdge } from './ball-position.ts'
-import { attachedDock, retainedDockControl, resizedDockControl } from './dock-position.ts'
 import { dockSafeTop, readViewport, watchViewport, type Viewport } from './window-controls.ts'
 import {
-  BALL_SIZE,
   BALL_MARGIN,
+  BALL_SIZE,
   MAX_WIDTH,
   MIN_DOCK_HEIGHT,
   MIN_WIDTH,
   awaitingFirstData,
-  type DockControl,
+  defaultBall,
   type PadClient,
   type Point,
 } from './pad-client.ts'
@@ -75,7 +74,6 @@ const Icon = {
 }
 
 const STAR_PATH = 'M14 6.3C14.8 10.8 17.2 13.2 21.7 14C17.2 14.8 14.8 17.2 14 21.7C13.2 17.2 10.8 14.8 6.3 14C10.8 13.2 13.2 10.8 14 6.3Z'
-const OPPOSITE_EDGE: Record<BallEdge, BallEdge> = { left: 'right', right: 'left', top: 'bottom', bottom: 'top' }
 
 /** A round free ball or a tab flush against its attached edge. The symbol
  * stays in a separate overlay while the ball and dock cross-fade. */
@@ -98,8 +96,9 @@ function BallDisc({ edge }: { readonly edge?: BallEdge | null }) {
 }
 
 function usePageVisible(): boolean {
-  const [visible, setVisible] = useState(() => document.visibilityState !== 'hidden')
+  const [visible, setVisible] = useState(() => typeof document === 'undefined' ? true : document.visibilityState !== 'hidden')
   useEffect(() => {
+    if (typeof document === 'undefined') return
     const update = (): void => setVisible(document.visibilityState !== 'hidden')
     document.addEventListener('visibilitychange', update)
     return () => document.removeEventListener('visibilitychange', update)
@@ -152,26 +151,20 @@ export function createDock(client: PadClient) {
     const rootRef = useRef<HTMLDivElement>(null)
     const asideRef = useRef<HTMLElement>(null)
     const shieldRef = useRef<HTMLDivElement>(null)
+    const focusPanelRef = useRef<HTMLDivElement>(null)
     const [theme, setTheme] = useState<ThemeSnapshot>({ mode: 'light', css: ':root{}' })
     const [notice, setNotice] = useState<string>()
     const [viewport, setViewport] = useState<Viewport>(readViewport)
-    const [measuredHeight, setMeasuredHeight] = useState<number>()
-    const initialBallEdge = useRef(snap.layout.ballEdge === undefined
-      ? nearestBallEdge(snap.layout.ball, viewport.width, viewport.height, viewport.controls)
-      : snap.layout.ballEdge)
-    useEffect(() => {
-      if (snap.layout.ballEdge === undefined) client.setLayout({ ballEdge: initialBallEdge.current })
-    }, [snap.layout.ballEdge])
     const [ballDrag, setBallDrag] = useState<Point>()
     const [dockDrag, setDockDrag] = useState<Point>()
     const [dragHeight, setDragHeight] = useState<number>()
     const [dragWidth, setDragWidth] = useState<number>()
-    const [dragControl, setDragControl] = useState<DockControl>()
     const [splitDragging, setSplitDragging] = useState(false)
     const [drag, setDrag] = useState<{ id: string, x: number, y: number, target?: string, zone?: DropZone, blank: boolean }>()
     const [focusedId, setFocusedId] = useState<string>()
+    const [focusedScriptError, setFocusedScriptError] = useState<string>()
     const [closing, setClosing] = useState(false)
-    const [ballTransition, setBallTransition] = useState<{ point: Point, mode: 'opening' | 'closing' }>()
+    const [ballTransition, setBallTransition] = useState<{ point: Point, edge: BallEdge | null, mode: 'opening' | 'closing' }>()
     const [update, setUpdate] = useState<PadUpdateInfo>()
     const [updateOpen, setUpdateOpen] = useState(false)
     const [updateBusy, setUpdateBusy] = useState(false)
@@ -203,22 +196,6 @@ export function createDock(client: PadClient) {
       // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [treeSignature])
 
-    // Automatic content height can be shorter than the viewport allowance.
-    // Observe the actual dock so retained edge controls stay inside it after
-    // restoring auto height, folding a card or resizing panel content.
-    useLayoutEffect(() => {
-      const dock = asideRef.current
-      if (!snap.layout.expanded || dock === null) return
-      const measure = (): void => {
-        const height = dock.getBoundingClientRect().height
-        setMeasuredHeight(previous => previous === height ? previous : height)
-      }
-      measure()
-      const observer = new ResizeObserver(measure)
-      observer.observe(dock)
-      return () => observer.disconnect()
-    }, [snap.layout.expanded])
-
     useEffect(() => watchViewport(() => {
       const next = readViewport()
       setViewport(previous => previous.width === next.width && previous.height === next.height
@@ -248,13 +225,27 @@ export function createDock(client: PadClient) {
     }, [gestures, snap.layout.expanded, pageVisible])
 
     useEffect(() => {
+      setFocusedScriptError(undefined)
       if (focusedId === undefined) return
+      focusPanelRef.current?.focus()
       const onKey = (event: KeyboardEvent): void => {
         if (event.key === 'Escape') setFocusedId(undefined)
       }
       document.addEventListener('keydown', onKey)
       return () => document.removeEventListener('keydown', onKey)
     }, [focusedId])
+
+    useEffect(() => {
+      if (!updateOpen || focusedId !== undefined) return
+      const onKey = (event: KeyboardEvent): void => {
+        if (event.key === 'Escape') {
+          event.stopPropagation()
+          setUpdateOpen(false)
+        }
+      }
+      document.addEventListener('keydown', onKey, { capture: true })
+      return () => document.removeEventListener('keydown', onKey, { capture: true })
+    }, [updateOpen, focusedId])
 
     useEffect(() => {
       // The panel was deleted (or the list reloaded) while zoomed.
@@ -332,10 +323,23 @@ export function createDock(client: PadClient) {
     }
 
     const attention = snap.panels.some(needsAttention)
+    const viewportReady = viewport.width > 0 && viewport.height > 0
+    const rawBall = snap.layout.ball ?? (viewportReady ? defaultBall(viewport.width, viewport.height) : { x: BALL_MARGIN, y: BALL_MARGIN })
+    const resolvedBallEdge: BallEdge | null = snap.layout.ballEdge !== undefined
+      ? snap.layout.ballEdge
+      : !viewportReady
+        ? null
+        : nearestBallEdge(rawBall, viewport.width, viewport.height, viewport.controls)
+    useEffect(() => {
+      if (!viewportReady) return
+      if (snap.layout.ballEdge === undefined) client.setLayout({ ballEdge: resolvedBallEdge })
+    }, [viewportReady, snap.layout.ballEdge, resolvedBallEdge])
     const ballEdge = ballDrag === undefined
-      ? snap.layout.ballEdge === undefined ? initialBallEdge.current : snap.layout.ballEdge
+      ? resolvedBallEdge
       : nearestBallEdge(ballDrag, viewport.width, viewport.height, viewport.controls)
-    const ballPoint = positionAtBallEdge(ballDrag ?? snap.layout.ball, ballEdge, viewport.width, viewport.height, viewport.controls)
+    const ballPoint = viewportReady
+      ? positionAtBallEdge(ballDrag ?? rawBall, ballEdge, viewport.width, viewport.height, viewport.controls)
+      : (ballDrag ?? rawBall)
     const widthLimit = Math.max(120, viewport.width - EDGE_GAP * 2)
     const requestedDockWidth = Math.min(dragWidth ?? snap.layout.width, widthLimit)
     const openHeight = snap.layout.dockHeight ?? Math.min(560, Math.max(MIN_DOCK_HEIGHT, viewport.height - EDGE_GAP * 2))
@@ -348,14 +352,10 @@ export function createDock(client: PadClient) {
       ? Math.max(MIN_DOCK_HEIGHT, Math.min(openHeight, belowBall))
       : openHeight
     const savedHeight = dragHeight ?? snap.layout.dockHeight
-    const edgeAnchor = ballEdge !== null && snap.layout.dock === null && dockDrag === undefined
-    const attached = edgeAnchor ? attachedDock(ballPoint, ballEdge, viewport, requestedDockWidth, savedHeight ?? openHeight) : undefined
-    const dockWidth = attached?.width ?? requestedDockWidth
-    const retainedControl = dragControl ?? snap.layout.dockControl
-    const dockMargin = attached !== undefined || retainedControl != null ? BALL_MARGIN : EDGE_GAP
-    const controlEdge = attached === undefined ? retainedControl?.edge : ballEdge
+    const dockWidth = requestedDockWidth
+    const dockMargin = EDGE_GAP
     const baseDock = snap.layout.dock ?? defaultDockPoint(ballPoint, dockWidth, viewport, defaultOpenHeight)
-    const dockPoint = attached?.point ?? clampDock(
+    const dockPoint = clampDock(
       dockDrag ?? baseDock,
       dockWidth,
       viewport,
@@ -363,31 +363,25 @@ export function createDock(client: PadClient) {
       dockMargin,
     )
     const availableHeight = Math.max(BALL_SIZE, viewport.height - dockPoint.y - dockMargin)
-    const renderedHeight = attached?.height ?? (savedHeight === undefined ? undefined : Math.min(savedHeight, availableHeight))
+    const renderedHeight = savedHeight === undefined ? undefined : Math.min(savedHeight, availableHeight)
     const maxHeight = renderedHeight ?? availableHeight
-    const controlHeight = renderedHeight ?? Math.min(measuredHeight ?? maxHeight, maxHeight)
-    const control = attached?.control ?? (retainedControl == null ? undefined : retainedDockControl(retainedControl, dockWidth, controlHeight))
-    // A side control inside the toolbar needs no gutter beside the cards.
-    const controlInHeader = control !== undefined && control.y + BALL_SIZE <= 32
-    const controlGutter = (controlEdge === 'left' || controlEdge === 'right') && !controlInHeader
     // Rewrite inaccessible persisted positions after load/resize, without
-    // interfering with a pointer gesture that is still choosing its position.
+    // interfering with a pointer gesture or a 0x0 desktop boot view.
     useEffect(() => {
-      if (ballDrag !== undefined || dockDrag !== undefined || closing) return
+      if (!viewportReady || ballDrag !== undefined || dockDrag !== undefined || closing) return
       const patch: { ball?: Point, dock?: Point } = {}
-      if (snap.layout.ball.x !== ballPoint.x || snap.layout.ball.y !== ballPoint.y) patch.ball = ballPoint
+      if (snap.layout.ball === null || snap.layout.ball.x !== ballPoint.x || snap.layout.ball.y !== ballPoint.y) patch.ball = ballPoint
       if (snap.layout.expanded && snap.layout.dock !== null
         && (snap.layout.dock.x !== dockPoint.x || snap.layout.dock.y !== dockPoint.y)) patch.dock = dockPoint
       if (Object.keys(patch).length > 0) client.setLayout(patch)
-    }, [ballDrag, dockDrag, closing, snap.layout.ball, snap.layout.dock, snap.layout.expanded, ballPoint.x, ballPoint.y, dockPoint.x, dockPoint.y])
-    const starPoint = !snap.layout.expanded ? ballPoint
-      : control === undefined ? {
+    }, [viewportReady, ballDrag, dockDrag, closing, snap.layout.ball, snap.layout.dock, snap.layout.expanded, ballPoint.x, ballPoint.y, dockPoint.x, dockPoint.y])
+    const starPoint = !snap.layout.expanded
+      ? ballPoint
+      : {
           x: dockPoint.x + dockWidth - COLLAPSE_RIGHT - COLLAPSE_SIZE,
           y: dockPoint.y + COLLAPSE_TOP,
-        } : { x: dockPoint.x + control.x, y: dockPoint.y + control.y }
-    const arrowEdge = snap.layout.expanded
-      ? controlEdge == null ? null : OPPOSITE_EDGE[controlEdge]
-      : ballEdge
+        }
+    const arrowEdge = snap.layout.expanded ? null : ballEdge
     const arrowRotation = arrowEdge === 'right' ? 180 : arrowEdge === 'top' ? 90 : arrowEdge === 'bottom' ? -90 : 0
     const starAnchor = (
       <div className={`dshpad-star-anchor${arrowEdge === null ? '' : ' is-arrow'}`} style={{ left: starPoint.x, top: starPoint.y }} aria-hidden="true">
@@ -404,15 +398,8 @@ export function createDock(client: PadClient) {
       width: dockWidth,
       height: renderedHeight,
       maxHeight,
-      ...(attached === undefined ? {} : { maxHeight: attached.height }),
-      ...(control === undefined ? {} : {
-        '--dshpad-control-x': `${control.x}px`,
-        '--dshpad-control-y': `${control.y}px`,
-        '--dshpad-head-left': control.y < 32 && control.x < 32 ? '36px' : '4px',
-        '--dshpad-head-right': control.y < 32 && control.x + BALL_SIZE > dockWidth - 100 ? '36px' : '6px',
-      }),
     } as CSSProperties
-    const reserve = snap.layout.expanded
+    const reserve = !snap.embeddedMode && snap.layout.expanded
       && dockPoint.x + dockWidth >= viewport.width - EDGE_GAP - 2
       ? Math.round(dockWidth) + 12
       : 0
@@ -552,26 +539,30 @@ export function createDock(client: PadClient) {
     }
 
     // Replace the collapse control in place with the ball or edge tab.
+    // If the dock was never dragged since opening (`snap.layout.dock === null`),
+    // return cleanly to the pre-expand ball and edge attachment.
     const collapse = (): void => {
       if (closing) return
       gestures.cancel()
-      const buttonRect = rootRef.current?.querySelector<HTMLElement>('.dshpad-collapse')?.getBoundingClientRect()
-      const center = buttonRect === undefined
-        ? { x: dockPoint.x + dockWidth - COLLAPSE_CENTER_FROM_RIGHT, y: dockPoint.y + COLLAPSE_CENTER_Y }
-        : { x: buttonRect.left + buttonRect.width / 2, y: buttonRect.top + buttonRect.height / 2 }
-      const collapsePoint = edgeAnchor ? ballPoint : { x: center.x - BALL_SIZE / 2, y: center.y - BALL_SIZE / 2 }
-      // Do not move a header control a second time on collapse. If it is merely
-      // near an edge, keep its actual position until the next explicit drag.
-      const nearbyEdge = nearestBallEdge(collapsePoint, viewport.width, viewport.height, viewport.controls)
-      const attachedPoint = positionAtBallEdge(collapsePoint, nearbyEdge, viewport.width, viewport.height, viewport.controls)
-      const nextEdge = edgeAnchor ? ballEdge
-        : attachedPoint.x === collapsePoint.x && attachedPoint.y === collapsePoint.y ? nearbyEdge : null
-      const nextBall = clampBall(collapsePoint, viewport.width, viewport.height, viewport.controls)
+      let nextEdge: BallEdge | null
+      let nextBall: Point
+      if (snap.layout.dock === null) {
+        nextEdge = ballEdge
+        nextBall = ballPoint
+      } else {
+        const buttonRect = rootRef.current?.querySelector<HTMLElement>('.dshpad-collapse')?.getBoundingClientRect()
+        const center = buttonRect === undefined
+          ? { x: dockPoint.x + dockWidth - COLLAPSE_CENTER_FROM_RIGHT, y: dockPoint.y + COLLAPSE_CENTER_Y }
+          : { x: buttonRect.left + buttonRect.width / 2, y: buttonRect.top + buttonRect.height / 2 }
+        const collapsePoint = { x: center.x - BALL_SIZE / 2, y: center.y - BALL_SIZE / 2 }
+        nextEdge = null
+        nextBall = clampBall(collapsePoint, viewport.width, viewport.height, viewport.controls)
+      }
       if (transitionTimer.current !== undefined) {
         clearTimeout(transitionTimer.current)
         transitionTimer.current = undefined
       }
-      setBallTransition({ point: nextBall, mode: 'closing' })
+      setBallTransition({ point: nextBall, edge: nextEdge, mode: 'closing' })
       setClosing(true)
       closeTimer.current = setTimeout(() => {
         setClosing(false)
@@ -584,8 +575,8 @@ export function createDock(client: PadClient) {
      * in; the star is a separate persistent layer and never blinks. */
     const openFromBall = (point: Point): void => {
       if (transitionTimer.current !== undefined) clearTimeout(transitionTimer.current)
-      setBallTransition({ point, mode: 'opening' })
-      client.setLayout({ expanded: true, ...(ballEdge === null ? {} : { dock: null, dockControl: null }) })
+      setBallTransition({ point, edge: ballEdge, mode: 'opening' })
+      client.setLayout({ expanded: true, ...(ballEdge === null ? {} : { dock: null }) })
       transitionTimer.current = setTimeout(() => {
         setBallTransition(undefined)
         transitionTimer.current = undefined
@@ -618,7 +609,7 @@ export function createDock(client: PadClient) {
         setBallDrag(undefined)
         // A moved ball is the new anchor for the window; drop any old window
         // position so the next open puts the collapse button under the ball.
-        client.setLayout({ ball: snapped, ballEdge: edge, dock: null, dockControl: null })
+        client.setLayout({ ball: snapped, ballEdge: edge, dock: null })
       }
       gestures.start(event, { move, end: up, cancel: () => setBallDrag(undefined) })
     }
@@ -647,7 +638,6 @@ export function createDock(client: PadClient) {
           // Detaching a top-edge dock must keep the width that fitted beside
           // the window buttons, rather than restoring the wider saved request.
           setDragWidth(width)
-          if (control !== undefined && controlEdge != null) setDragControl({ edge: controlEdge, point: control })
         }
         final = clampDock({ x: start.x + pointer.clientX - startX, y: start.y + pointer.clientY - startY }, width, viewport, height, dockMargin)
         setDockDrag(final)
@@ -656,14 +646,11 @@ export function createDock(client: PadClient) {
         setDockDrag(undefined)
         setDragHeight(undefined)
         setDragWidth(undefined)
-        setDragControl(undefined)
       }
       const end = (): void => {
         cancel()
         if (!moved) return
-        client.setLayout({ dock: final, dockHeight: height, width,
-          ...(control === undefined || controlEdge == null ? {} : { dockControl: { edge: controlEdge, point: control } }),
-        })
+        client.setLayout({ dock: final, dockHeight: height, width })
       }
       return { move, end, cancel }
     }
@@ -731,30 +718,27 @@ export function createDock(client: PadClient) {
       const right = dockPoint.x + startWidth
       const maxWidth = Math.max(BALL_SIZE, Math.min(MAX_WIDTH, right - dockMargin))
       const minWidth = Math.min(MIN_WIDTH, maxWidth)
-      const startControl = control === undefined || controlEdge == null ? undefined : { edge: controlEdge, point: control }
-      let finalControl = startControl
+      let moved = false
       let finalWidth = startWidth
       let finalPoint = dockPoint
       const move = (pointer: PointerEvent): void => {
+        if (!moved && Math.abs(pointer.clientX - startX) < DRAG_THRESHOLD) return
+        moved = true
         finalWidth = Math.round(clamp(startWidth + (startX - pointer.clientX), minWidth, maxWidth))
         finalPoint = clampDock({ x: Math.round(right - finalWidth), y: dockPoint.y }, finalWidth, viewport, savedHeight ?? maxHeight, dockMargin)
-        if (startControl !== undefined) {
-          finalControl = resizedDockControl(startControl, dockPoint, finalPoint, finalWidth, controlHeight)
-          setDragControl(finalControl)
-        }
         setDragWidth(finalWidth)
         setDockDrag(finalPoint)
       }
       const cancel = (): void => {
         setDragWidth(undefined)
         setDockDrag(undefined)
-        setDragControl(undefined)
       }
       gestures.start(event, {
         move,
         end: () => {
           cancel()
-          client.setLayout({ width: finalWidth, dock: finalPoint, ...(finalControl === undefined ? {} : { dockControl: finalControl }) })
+          if (!moved) return
+          client.setLayout({ width: finalWidth, dock: finalPoint })
         },
         cancel,
       })
@@ -770,18 +754,15 @@ export function createDock(client: PadClient) {
       const startTop = dockPoint.y
       const minTop = dockSafeTop(dockPoint.x, dockWidth, viewport, dockMargin)
       const maxTop = Math.max(minTop, bottom - Math.min(MIN_DOCK_HEIGHT, boxHeight))
-      const startControl = control === undefined || controlEdge == null ? undefined : { edge: controlEdge, point: control }
-      let finalControl = startControl
+      let moved = false
       let finalHeight = bottom - startTop
       let finalPoint = dockPoint
       const move = (pointer: PointerEvent): void => {
+        if (!moved && Math.abs(pointer.clientY - startY) < DRAG_THRESHOLD) return
+        moved = true
         const nextTop = Math.round(clamp(startTop + pointer.clientY - startY, minTop, maxTop))
         finalHeight = Math.round(bottom - nextTop)
         finalPoint = { x: dockPoint.x, y: nextTop }
-        if (startControl !== undefined) {
-          finalControl = resizedDockControl(startControl, dockPoint, finalPoint, dockWidth, finalHeight)
-          setDragControl(finalControl)
-        }
         setDragWidth(dockWidth)
         setDragHeight(finalHeight)
         setDockDrag(finalPoint)
@@ -790,13 +771,13 @@ export function createDock(client: PadClient) {
         setDragHeight(undefined)
         setDragWidth(undefined)
         setDockDrag(undefined)
-        setDragControl(undefined)
       }
       gestures.start(event, {
         move,
         end: () => {
           cancel()
-          client.setLayout({ dockHeight: finalHeight, dock: finalPoint, width: dockWidth, ...(finalControl === undefined ? {} : { dockControl: finalControl }) })
+          if (!moved) return
+          client.setLayout({ dockHeight: finalHeight, dock: finalPoint, width: dockWidth })
         },
         cancel,
       })
@@ -809,13 +790,15 @@ export function createDock(client: PadClient) {
       const startY = event.clientY
       const startHeight = asideRef.current?.getBoundingClientRect().height ?? savedHeight ?? MIN_DOCK_HEIGHT
       const maxHeight = Math.max(BALL_SIZE, viewport.height - dockPoint.y - dockMargin)
+      let moved = false
       let finalHeight = startHeight
       let finalPoint = dockPoint
       const move = (pointer: PointerEvent): void => {
+        if (!moved && Math.abs(pointer.clientY - startY) < DRAG_THRESHOLD) return
+        moved = true
         finalHeight = Math.round(clamp(startHeight + pointer.clientY - startY, Math.min(MIN_DOCK_HEIGHT, maxHeight), maxHeight))
         finalPoint = clampDock(dockPoint, dockWidth, viewport, finalHeight, dockMargin)
         setDragWidth(dockWidth)
-        if (control !== undefined && controlEdge != null) setDragControl({ edge: controlEdge, point: control })
         setDragHeight(finalHeight)
         setDockDrag(finalPoint)
       }
@@ -823,15 +806,13 @@ export function createDock(client: PadClient) {
         setDragHeight(undefined)
         setDragWidth(undefined)
         setDockDrag(undefined)
-        setDragControl(undefined)
       }
       gestures.start(event, {
         move,
         end: () => {
           cancel()
-          client.setLayout({ dockHeight: finalHeight, dock: finalPoint, width: dockWidth,
-            ...(control === undefined || controlEdge == null ? {} : { dockControl: { edge: controlEdge, point: control } }),
-          })
+          if (!moved) return
+          client.setLayout({ dockHeight: finalHeight, dock: finalPoint, width: dockWidth })
         },
         cancel,
       })
@@ -914,7 +895,7 @@ export function createDock(client: PadClient) {
     }
 
     const collapseControl = (
-      <button type="button" className={`dshpad-collapse${control === undefined ? '' : ' is-attached'}`} title={`${t('dock.collapse')} · ${t('dock.holdDrag')}`} aria-label={t('dock.collapse')}
+      <button type="button" className="dshpad-collapse" title={`${t('dock.collapse')} · ${t('dock.holdDrag')}`} aria-label={t('dock.collapse')}
         disabled={closing}
         onClick={onCollapseClick}
         onPointerDown={onCollapsePointerDown}
@@ -933,9 +914,58 @@ export function createDock(client: PadClient) {
         : drag.blank
           ? t(DROP_LABEL.root)
           : t(DROP_LABEL.hint)
+    const focusOverlay = focusedView
+      ? (
+        <div className="dshpad-focus" role="dialog" aria-modal="true" aria-label={focusedView.definition.title}
+          onClick={event => { if (event.target === event.currentTarget) setFocusedId(undefined) }}>
+          <div className="dshpad-focus-panel" ref={focusPanelRef} tabIndex={-1}>
+            <header className="dshpad-focus-head">
+              {focusedView.definition.icon ? <span className="dshpad-card-icon">{focusedView.definition.icon}</span> : null}
+              <span className="dshpad-focus-title">{focusedView.definition.title}</span>
+              <button type="button" className="dshpad-icon-btn" aria-label={t('card.close')} title={t('card.close')}
+                onClick={() => setFocusedId(undefined)}>
+                {Icon.close}
+              </button>
+            </header>
+            <RenderBoundary resetKey={focusedView.version} title={focusedView.definition.title} t={t}>
+            {awaitingFirstData(focusedView.definition, focusedView.data)
+              ? <p className="dshpad-card-note">{t('card.firstData')}</p>
+              : (
+                <PanelFrame
+                  view={focusedView}
+                  histories={() => client.historiesOf(focusedView.id) as Record<string, readonly HistoryPoint[]>}
+                  theme={theme}
+                  lang={lang}
+                  onRefresh={() => void client.act({ op: 'refresh', panelId: focusedView.id })}
+                  onAsk={text => { ask(text, false) }}
+                  onRun={(prompt, system, signal) => client.run(focusedView.id, prompt, system, signal)}
+                  onScriptError={setFocusedScriptError}
+                  onEscape={() => setFocusedId(undefined)}
+                  resizeLabel={t('card.resize')}
+                  resizable={false}
+                />
+                )}
+            {focusedScriptError ? <p className="dshpad-card-note is-alert">{focusedScriptError.split('\n')[0]}</p> : null}
+            </RenderBoundary>
+          </div>
+        </div>
+        )
+      : null
+    let portalFocus: ReactNode = focusOverlay
+    if (focusOverlay && typeof document !== 'undefined' && document.body) {
+      try {
+        // eslint-disable-next-line @typescript-eslint/no-require-imports
+        const reactDom = require('react-dom') as { createPortal?: (node: ReactNode, container: Element) => ReactNode } | undefined
+        if (typeof reactDom?.createPortal === 'function') {
+          portalFocus = reactDom.createPortal(focusOverlay, document.body)
+        }
+      } catch {
+        // Fall back to inline rendering when react-dom is unavailable.
+      }
+    }
     return (
       <div className="dshpad-root" data-mode={theme.mode} ref={rootRef}>
-        <aside ref={asideRef} className={`dshpad-dock${control === undefined ? '' : ` is-attached is-attached-${controlEdge}`}${controlGutter ? ' has-control-gutter' : ''}${dockWidth < 160 ? ' is-narrow' : ''}${dockDrag !== undefined ? ' is-moving' : ''}${closing ? ' is-closing' : ''}`}
+        <aside ref={asideRef} className={`dshpad-dock${dockWidth < 160 ? ' is-narrow' : ''}${dockDrag !== undefined ? ' is-moving' : ''}${closing ? ' is-closing' : ''}`}
           style={dockStyle} aria-label={t('dock.title')}>
           <div className="dshpad-dock-edge is-top" role="separator" aria-orientation="horizontal" title={t('dock.resizeHeight')} onPointerDown={onTopEdgePointerDown}
             onDoubleClick={() => { setDragHeight(undefined); client.setDockHeight(undefined) }} />
@@ -1047,7 +1077,7 @@ export function createDock(client: PadClient) {
               style={{ left: ballTransition.point.x, top: ballTransition.point.y }}
               aria-hidden="true"
             >
-              <BallDisc />
+              <BallDisc edge={ballTransition.edge} />
             </div>
             )}
         {starAnchor}
@@ -1067,41 +1097,7 @@ export function createDock(client: PadClient) {
             )
           : null}
 
-        {focusedView
-          ? (
-            <div className="dshpad-focus" role="dialog" aria-modal="true" aria-label={focusedView.definition.title}
-              onClick={event => { if (event.target === event.currentTarget) setFocusedId(undefined) }}>
-              <div className="dshpad-focus-panel">
-                <header className="dshpad-focus-head">
-                  {focusedView.definition.icon ? <span className="dshpad-card-icon">{focusedView.definition.icon}</span> : null}
-                  <span className="dshpad-focus-title">{focusedView.definition.title}</span>
-                  <button type="button" className="dshpad-icon-btn" aria-label={t('card.close')} title={t('card.close')}
-                    onClick={() => setFocusedId(undefined)}>
-                    {Icon.close}
-                  </button>
-                </header>
-                <RenderBoundary resetKey={focusedView.version} title={focusedView.definition.title} t={t}>
-                {awaitingFirstData(focusedView.definition, focusedView.data)
-                  ? <p className="dshpad-card-note">{t('card.firstData')}</p>
-                  : (
-                    <PanelFrame
-                      view={focusedView}
-                      histories={() => client.historiesOf(focusedView.id) as Record<string, readonly HistoryPoint[]>}
-                      theme={theme}
-                      lang={lang}
-                      onRefresh={() => void client.act({ op: 'refresh', panelId: focusedView.id })}
-                      onAsk={text => { ask(text, false) }}
-                      onRun={(prompt, system) => client.run(focusedView.id, prompt, system)}
-                      onScriptError={() => {}}
-                      resizeLabel={t('card.resize')}
-                      resizable={false}
-                    />
-                    )}
-                </RenderBoundary>
-              </div>
-            </div>
-            )
-          : null}
+        {portalFocus}
       </div>
     )
   }

@@ -413,4 +413,23 @@ describe('DataHub source concurrency', () => {
     await hub.runAll(panel.id)
     expect(runSource).toHaveBeenCalledTimes(2)
   })
+
+  it('polls immediately after wall-clock rollback and clamps intervalSec >= 1', async () => {
+    const { hub, panel, subscriber } = await setup([source('a', 'echo ok', 0)])
+    const first = hub.runAll(panel.id)
+    // Future reading timestamp simulates wall-clock moving backwards.
+    pending[0]!.resolve({ ok: true, value: 'future', at: new Date(Date.now() + 3_600_000).toISOString() })
+    await first
+    hub.rewatch(subscriber, new Set([panel.id]))
+    await vi.advanceTimersByTimeAsync(0)
+    expect(runSource).toHaveBeenCalledTimes(2)
+    pending[1]!.resolve(reading('now'))
+    await Promise.resolve()
+    await Promise.resolve()
+    // Clamped to >= 1s: should not re-fire at 999ms, should fire at 1000ms.
+    await vi.advanceTimersByTimeAsync(999)
+    expect(runSource).toHaveBeenCalledTimes(2)
+    await vi.advanceTimersByTimeAsync(1)
+    expect(runSource).toHaveBeenCalledTimes(3)
+  })
 })

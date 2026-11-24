@@ -17,12 +17,17 @@ import { AgentRefresher } from './host/agent-refresh.ts'
 import { DataHub } from './host/hub.ts'
 import { ReadingCache } from './host/readings.ts'
 import { registerRoutes } from './host/routes.ts'
+import { PanelRunner } from './host/run.ts'
 import { PanelStore } from './host/store.ts'
 import { registerTools } from './host/tools.ts'
 import { readPluginVersion, UpdateService } from './host/update.ts'
 
+export { registerTools } from './host/tools.ts'
+
 export const name = 'dsh-pad'
 export const inject = ['tools', 'connection']
+
+const RESERVED_SECRET_NAME = /^DSHD?_/i
 
 export interface Config {
   /** Where panels are stored. Defaults to `$DSH_HOME/dsh-pad/panels.json`. */
@@ -111,6 +116,7 @@ async function start(ctx: Context, config: Config): Promise<void> {
   const restored = await cache.load(store.list())
 
   const resolveSecret = async (name: string): Promise<string | undefined> => {
+    if (RESERVED_SECRET_NAME.test(name)) return undefined
     const credentials = ctx.get('credentials')
     if (credentials !== undefined) {
       try {
@@ -148,7 +154,7 @@ async function start(ctx: Context, config: Config): Promise<void> {
   const update = new UpdateService({
     current: await readPluginVersion(root),
     root,
-    enabled: config.updateCheck,
+    enabled: config.updateCheck && !process.env['DSH_DESKTOP_INSTALL_URL']?.trim(),
     checkHours: config.updateCheckHours,
   })
   ctx.effect(() => {
@@ -156,22 +162,25 @@ async function start(ctx: Context, config: Config): Promise<void> {
     return () => update.dispose()
   }, 'dsh-pad: updater')
 
+  const runner = new PanelRunner(ctx, {
+    enabled: config.interactiveModel,
+    timeoutMs: config.runTimeoutSec * 1000,
+    maxTokens: config.runMaxTokens,
+    concurrency: config.runConcurrency,
+    maxPromptChars: 24_000,
+    maxSystemChars: 8_000,
+    maxOutputChars: 32_000,
+    minIntervalMs: 1000,
+  })
+  ctx.effect(() => () => runner.dispose(), 'dsh-pad: model cleanup')
+
   registerRoutes({
     ctx,
     store,
     hub,
     refresher,
+    runner,
     update,
-    runOptions: {
-      enabled: config.interactiveModel,
-      timeoutMs: config.runTimeoutSec * 1000,
-      maxTokens: config.runMaxTokens,
-      concurrency: config.runConcurrency,
-      maxPromptChars: 24_000,
-      maxSystemChars: 8_000,
-      maxOutputChars: 32_000,
-      minIntervalMs: 1000,
-    },
   })
   registerTools({
     ctx,
@@ -180,5 +189,6 @@ async function start(ctx: Context, config: Config): Promise<void> {
     refresher,
     limits: { minIntervalSec: config.minIntervalSec, minAgentMinutes: config.minAgentMinutes },
     resolveSecret,
+    onDeletePanel: panelId => runner.forgetPanel(panelId),
   })
 }

@@ -1,4 +1,4 @@
-import { mkdtemp } from 'node:fs/promises'
+import { mkdtemp, rm } from 'node:fs/promises'
 import { createServer } from 'node:http'
 import type { AddressInfo } from 'node:net'
 import { tmpdir } from 'node:os'
@@ -12,12 +12,14 @@ import { PanelStore } from '../src/host/store.ts'
 import { ROUTES, type Json, type PanelView, type StreamEvent } from '../src/shared/types.ts'
 
 const cleanups: (() => void)[] = []
-afterEach(() => {
+const tempDirs: string[] = []
+afterEach(async () => {
   for (const cleanup of cleanups.splice(0).reverse()) cleanup()
   vi.useRealTimers()
+  for (const dir of tempDirs.splice(0)) await rm(dir, { recursive: true, force: true })
 })
 
-async function setup() {
+async function setup(options: { allowPrivateHttp?: boolean, maxSseStreams?: number } = {}) {
   const routes = new Map<string, (request: Request) => Promise<Response>>()
   const ctx = {
     effect: (fn: () => unknown) => {
@@ -30,10 +32,12 @@ async function setup() {
       return () => routes.delete(entry.path)
     } } },
   } as unknown as Context
-  const store = new PanelStore(join(await mkdtemp(join(tmpdir(), 'dsh-pad-routes-')), 'panels.json'))
-  const hub = new DataHub(store, async () => undefined, () => {})
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-pad-routes-'))
+  tempDirs.push(dir)
+  const store = new PanelStore(join(dir, 'panels.json'))
+  const hub = new DataHub(store, async () => undefined, () => {}, { allowPrivateHttp: options.allowPrivateHttp })
   cleanups.push(() => hub.dispose())
-  registerRoutes({ ctx, store, hub, refresher: undefined })
+  registerRoutes({ ctx, store, hub, refresher: undefined, maxSseStreams: options.maxSseStreams })
   return { routes, hub, store }
 }
 
@@ -77,7 +81,7 @@ describe('SSE subscription lifetime', () => {
   })
 
   it('turns a real deep HTTP source into a serializable failure and keeps polling', async () => {
-    const { routes, hub, store } = await setup()
+    const { routes, hub, store } = await setup({ allowPrivateHttp: true })
     const server = createServer((_req, res) => {
       res.setHeader('connection', 'close')
       res.end('['.repeat(10_000) + '1' + ']'.repeat(10_000))
@@ -257,5 +261,86 @@ describe('SSE subscription lifetime', () => {
     for (const cleanup of cleanups.splice(0).reverse()) cleanup()
     expect(vi.getTimerCount()).toBe(0)
     await response.body!.cancel()
+  })
+
+  it('evicts the oldest SSE stream when concurrent connections exceed the cap', async () => {
+    vi.useFakeTimers()
+    const { routes } = await setup({ maxSseStreams: 2 })
+    const first = await routes.get(ROUTES.stream)!(new Request('http://local' + ROUTES.stream))
+    const second = await routes.get(ROUTES.stream)!(new Request('http://local' + ROUTES.stream))
+    const third = await routes.get(ROUTES.stream)!(new Request('http://local' + ROUTES.stream))
+    const firstReader = first.body!.getReader()
+    // Drain whatever was enqueued before eviction, then expect stream closure.
+    let closed = false
+    for (let i = 0; i < 4; i += 1) {
+      const next = await firstReader.read()
+      if (next.done) { closed = true; break }
+    }
+    expect(closed).toBe(true)
+    await second.body!.cancel()
+    await third.body!.cancel()
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
+  it('serializes a broadcast StreamEvent only once across multiple SSE subscribers', async () => {
+    vi.useFakeTimers()
+    const { routes, hub } = await setup()
+    const subscribers: Subscriber[] = []
+    vi.spyOn(hub, 'subscribe').mockImplementation(sub => {
+      subscribers.push(sub)
+      return () => {}
+    })
+    const a = await routes.get(ROUTES.stream)!(new Request('http://local' + ROUTES.stream))
+    const b = await routes.get(ROUTES.stream)!(new Request('http://local' + ROUTES.stream))
+    const stringify = vi.spyOn(JSON, 'stringify')
+    const sharedEvent: StreamEvent = { type: 'data', panelId: 'p_1', data: { sources: {}, agent: null } }
+    for (const sub of subscribers) sub.send(sharedEvent)
+    expect(stringify).toHaveBeenCalledTimes(1)
+    stringify.mockRestore()
+    await a.body!.cancel()
+    await b.body!.cancel()
+  })
+
+  it('trims oversized history from the initial SSE snapshot while preserving latest readings', async () => {
+    vi.useFakeTimers()
+    const { routes, hub } = await setup()
+    const bigChunk = 'h'.repeat(1024 * 1024)
+    const historyPoints = Array.from({ length: 10 }, (_, idx) => ({
+      value: `${idx}:${bigChunk}`,
+      at: `2026-10-31T00:0${idx}:00Z`,
+    }))
+    const panel: PanelView = {
+      id: 'p_hist',
+      version: 1,
+      position: 0,
+      collapsed: false,
+      span: 1,
+      updatedAt: '2026-10-31T00:10:00Z',
+      definition: { title: 'Hist', html: '', css: '', script: '', height: 'auto', sources: [] },
+      canUndo: false,
+      agentRun: null,
+      data: { sources: { s: { ok: true, value: 'latest-reading', at: '2026-10-31T00:10:00Z' } }, agent: null },
+      history: { s: historyPoints },
+    }
+    vi.spyOn(hub, 'subscribe').mockImplementation(next => {
+      next.send({ type: 'panels', panels: [panel] })
+      return () => {}
+    })
+    const response = await routes.get(ROUTES.stream)!(new Request('http://local' + ROUTES.stream))
+    const reader = response.body!.getReader()
+    const decoder = new TextDecoder()
+    expect(decoder.decode((await reader.read()).value)).toContain('retry:')
+    const snapshotChunk = (await reader.read()).value!
+    expect(snapshotChunk.byteLength).toBeLessThanOrEqual(MAX_SSE_QUEUED_BYTES)
+    const payload = JSON.parse(decoder.decode(snapshotChunk).replace(/^data: /, '').trim()) as {
+      type: 'panels'
+      panels: PanelView[]
+    }
+    expect(payload.panels[0]?.data.sources['s']?.value).toBe('latest-reading')
+    const kept = payload.panels[0]?.history['s'] ?? []
+    expect(kept.length).toBeGreaterThan(0)
+    expect(kept.length).toBeLessThan(historyPoints.length)
+    expect(String(kept.at(-1)?.value).startsWith('9:')).toBe(true)
+    await reader.cancel()
   })
 })

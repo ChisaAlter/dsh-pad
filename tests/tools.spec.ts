@@ -1,25 +1,42 @@
-import { mkdtemp } from 'node:fs/promises'
+import { mkdtemp, rm } from 'node:fs/promises'
+import { createServer } from 'node:http'
+import type { AddressInfo } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import type { ToolDefinition } from '@deepseek-ai/dsh-tools'
-import { describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { DataHub } from '../src/host/hub.ts'
 import { PanelStore } from '../src/host/store.ts'
 import { registerTools } from '../src/host/tools.ts'
 
+const tempDirs: string[] = []
+afterEach(async () => {
+  for (const dir of tempDirs.splice(0)) await rm(dir, { recursive: true, force: true })
+})
+
 /** A Context stand-in carrying only what registerTools touches. */
-async function setup(services: Record<string, unknown> = {}) {
+async function setup(services: Record<string, unknown> = {}, options: { autoApprove?: boolean, execExtra?: Record<string, unknown> } = {}) {
   const tools = new Map<string, ToolDefinition>()
   const ctx = {
     effect: (fn: () => unknown) => fn(),
     tools: { register: (def: ToolDefinition) => { tools.set(def.name, def); return () => tools.delete(def.name) } },
     get: (name: string) => services[name],
   } as unknown as Context
-  const store = new PanelStore(join(await mkdtemp(join(tmpdir(), 'dsh-pad-tools-')), 'panels.json'))
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-pad-tools-'))
+  tempDirs.push(dir)
+  const store = new PanelStore(join(dir, 'panels.json'))
   const hub = new DataHub(store, async () => undefined, () => {})
-  registerTools({ ctx, store, hub, refresher: undefined, limits: { minIntervalSec: 2, minAgentMinutes: 15 }, resolveSecret: async () => undefined })
-  const exec = { signal: new AbortController().signal }
+  registerTools({
+    ctx,
+    store,
+    hub,
+    refresher: undefined,
+    limits: { minIntervalSec: 2, minAgentMinutes: 15 },
+    resolveSecret: async () => undefined,
+    ...(options.autoApprove === undefined ? {} : { autoApprove: options.autoApprove }),
+  })
+  const exec = { signal: new AbortController().signal, ...(options.execExtra ?? {}) }
   const call = async (name: string, args: Record<string, unknown>): Promise<string> => {
     const tool = tools.get(name) as unknown as { execute(args: unknown, exec: unknown): Promise<string> }
     return await tool.execute(args, exec)
@@ -211,5 +228,158 @@ describe('pad_* tools', () => {
   it('test-runs a source with the minimum interval filled in', async () => {
     const { call } = await setup()
     expect(await call('pad_test_source', { source: { id: 'x', kind: 'command', command: 'echo ok', parse: 'text' } })).toMatch(/✓ .*\n"ok"/)
+  })
+
+  it('rejects data on pad_create without agent and validates data depth/size', async () => {
+    const { call, store, hub } = await setup()
+    try {
+      await expect(call('pad_create', { title: '静态', html: '<b></b>', sources: [], data: { v: 1 } }))
+        .rejects.toThrow(/没有 AI 刷新/)
+      const deep = JSON.parse('['.repeat(200) + '1' + ']'.repeat(200))
+      await expect(call('pad_create', {
+        title: 'AI', html: '', sources: [], agent: { instruction: 'x', everyMinutes: 60 }, data: deep,
+      })).rejects.toThrow(/JSON 嵌套超过/)
+      await expect(call('pad_create', {
+        title: 'AI', html: '', sources: [], agent: { instruction: 'x', everyMinutes: 60 }, data: 'x'.repeat(260 * 1024),
+      })).rejects.toThrow(/数据超过 256KB/)
+      expect(store.list()).toHaveLength(0)
+    } finally {
+      hub.dispose()
+    }
+  })
+
+  it('gates risky sources and pad_delete behind Harness approval when not autoApproved', async () => {
+    const request = vi.fn(async (): Promise<'allowed-once' | 'rejected' | 'cancelled' | 'unavailable'> => 'rejected')
+    const { call, store, hub } = await setup({ approval: { request } }, { execExtra: { agent: { id: 's_1' } } })
+    try {
+      await expect(call('pad_create', perf)).rejects.toThrow(/用户拒绝/)
+      expect(store.list()).toHaveLength(0)
+      expect(request).toHaveBeenCalledTimes(1)
+
+      request.mockResolvedValueOnce('allowed-once')
+      expect(await call('pad_create', perf)).toMatch(/已创建面板/)
+      const id = store.list()[0]!.id
+
+      // Changing non-source fields does not re-prompt approval.
+      expect(await call('pad_update', { id, css: 'b{margin:0}' })).toMatch(/已更新面板/)
+      expect(request).toHaveBeenCalledTimes(2)
+
+      // Deleting requires approval and fails closed on rejection.
+      request.mockResolvedValueOnce('rejected')
+      await expect(call('pad_delete', { id })).rejects.toThrow(/用户拒绝/)
+      expect(store.list()).toHaveLength(1)
+
+      request.mockResolvedValueOnce('allowed-once')
+      expect(await call('pad_delete', { id })).toMatch(/已删除面板/)
+      expect(store.list()).toHaveLength(0)
+    } finally {
+      hub.dispose()
+    }
+  })
+
+  it('skips Harness approval when autoApprove is true outside desktop', async () => {
+    const request = vi.fn(async () => 'rejected' as const)
+    const { call, store, hub } = await setup(
+      { approval: { request } },
+      { autoApprove: true, execExtra: { agent: { id: 's_1' } } },
+    )
+    try {
+      expect(await call('pad_create', perf)).toMatch(/已创建面板/)
+      expect(request).not.toHaveBeenCalled()
+      const id = store.list()[0]!.id
+      expect(await call('pad_delete', { id })).toMatch(/已删除面板/)
+      expect(request).not.toHaveBeenCalled()
+    } finally {
+      hub.dispose()
+    }
+  })
+
+  it('enforces Whale Isle /desktop/confirm fail-closed and sends full source/delete details', async () => {
+    const seen: Array<{ auth?: string, body: Record<string, unknown> }> = []
+    let allow = false
+    const server = createServer(async (req, res) => {
+      const parts: Buffer[] = []
+      for await (const part of req) parts.push(part as Buffer)
+      seen.push({
+        auth: req.headers.authorization,
+        body: JSON.parse(Buffer.concat(parts).toString('utf8')) as Record<string, unknown>,
+      })
+      res.writeHead(200, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({ ok: allow }))
+    })
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve))
+    const baseUrl = `http://127.0.0.1:${(server.address() as AddressInfo).port}`
+    const secretsSym = Symbol.for('whaleisle.internalSecrets')
+    const savedUrl = process.env['DSH_DESKTOP_INSTALL_URL']
+    const savedEnvToken = process.env['DSH_DESKTOP_INSTALL_TOKEN']
+    const savedSecrets = Reflect.get(globalThis, secretsSym)
+    process.env['DSH_DESKTOP_INSTALL_URL'] = baseUrl
+    // Must NEVER fall back to process.env token.
+    process.env['DSH_DESKTOP_INSTALL_TOKEN'] = 'env-token-must-not-be-used'
+    Reflect.deleteProperty(globalThis, secretsSym)
+
+    const { call, store, hub } = await setup({}, { autoApprove: true })
+    try {
+      // Missing internal secret fails closed without even contacting server.
+      await expect(call('pad_create', perf)).rejects.toThrow(/用户拒绝/)
+      expect(seen).toHaveLength(0)
+
+      // Provide token via Whale Isle read-only internalSecrets view.
+      Reflect.set(globalThis, secretsSym, {
+        get: (name: string) => (name === 'DSH_DESKTOP_INSTALL_TOKEN' ? 'desktop-secret-tok' : undefined),
+      })
+
+      // Server returns { ok: false } -> fails closed.
+      await expect(call('pad_test_source', {
+        source: {
+          id: 'api',
+          kind: 'http',
+          url: 'https://example.com/api?k={{env:API_KEY}}',
+          method: 'POST',
+          headers: { Authorization: 'Bearer {{env:BEARER_TOK}}' },
+          body: 'b'.repeat(400),
+          parse: 'json',
+        },
+      })).rejects.toThrow(/用户拒绝/)
+      expect(seen).toHaveLength(1)
+      expect(seen[0]?.auth).toBe('Bearer desktop-secret-tok')
+      expect(seen[0]?.body).toMatchObject({
+        tool: 'pad_test_source',
+        action: 'run-sources',
+        effect: 'code',
+      })
+      const details = String(seen[0]?.body['details'] ?? '')
+      expect(details).toContain('POST https://example.com/api?k={{env:API_KEY}}')
+      expect(details).toContain('Authorization: Bearer {{env:BEARER_TOK}}')
+      expect(details).toContain('已截断')
+      expect(details).toContain('API_KEY')
+      expect(details).toContain('BEARER_TOK')
+
+      // Allow create, then verify pad_delete sends effect: 'destructive'.
+      allow = true
+      expect(await call('pad_create', perf)).toMatch(/已创建面板/)
+      expect(seen.at(-1)?.body).toMatchObject({ tool: 'pad_create', action: 'run-sources', effect: 'code' })
+      expect(String(seen.at(-1)?.body['details'])).toContain(perf.sources[0]!.command)
+      const id = store.list()[0]!.id
+
+      allow = false
+      await expect(call('pad_delete', { id })).rejects.toThrow(/用户拒绝/)
+      expect(seen.at(-1)?.body).toMatchObject({ tool: 'pad_delete', action: 'delete', effect: 'destructive' })
+      expect(store.list()).toHaveLength(1)
+
+      allow = true
+      expect(await call('pad_delete', { id })).toMatch(/已删除面板/)
+      expect(store.list()).toHaveLength(0)
+    } finally {
+      hub.dispose()
+      server.closeAllConnections()
+      await new Promise<void>(resolve => server.close(() => resolve()))
+      if (savedUrl === undefined) delete process.env['DSH_DESKTOP_INSTALL_URL']
+      else process.env['DSH_DESKTOP_INSTALL_URL'] = savedUrl
+      if (savedEnvToken === undefined) delete process.env['DSH_DESKTOP_INSTALL_TOKEN']
+      else process.env['DSH_DESKTOP_INSTALL_TOKEN'] = savedEnvToken
+      if (savedSecrets === undefined) Reflect.deleteProperty(globalThis, secretsSym)
+      else Reflect.set(globalThis, secretsSym, savedSecrets)
+    }
   })
 })

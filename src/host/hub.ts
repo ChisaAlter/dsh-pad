@@ -25,6 +25,8 @@ export interface DataHubOptions {
   readonly restored?: ReadonlyMap<string, ReadonlyMap<string, SourceReading>> | undefined
   /** Cache that keeps the newest reading of every source on disk. */
   readonly cache?: ReadingCache | undefined
+  /** Allow loopback / private / link-local HTTP targets (explicit test opt-in). Defaults to false. */
+  readonly allowPrivateHttp?: boolean | undefined
 }
 
 interface SourceTimer {
@@ -52,6 +54,7 @@ export class DataHub {
   private readonly inFlight = new Map<string, Map<string, SourceRun>>()
   private readonly subscribers = new Set<Subscriber>()
   private readonly cache: ReadingCache | undefined
+  private readonly allowPrivateHttp: boolean
   private disposed = false
 
   constructor(
@@ -61,6 +64,7 @@ export class DataHub {
     options: DataHubOptions = {},
   ) {
     this.cache = options.cache
+    this.allowPrivateHttp = options.allowPrivateHttp === true
     // Panels paint from the last session's readings until the first poll lands.
     for (const [panelId, sources] of options.restored ?? []) {
       const panel = this.store.find(panelId)
@@ -226,9 +230,11 @@ export class DataHub {
         const entry: SourceTimer = { key, timer: undefined }
         timers.set(source.id, entry)
         // Start immediately unless a reading of this exact source is still fresh.
+        // Also reset to 0 if the wall clock stepped backwards (age < 0) or timestamp is invalid.
+        const intervalMs = Math.max(1, Number.isFinite(source.intervalSec) ? source.intervalSec : 1) * 1000
         const last = existing === undefined ? this.readings.get(panel.id)?.get(source.id) : undefined
         const age = last?.key === key ? Date.now() - Date.parse(last.reading.at) : Infinity
-        const wait = Math.max(0, source.intervalSec * 1000 - age)
+        const wait = !Number.isFinite(age) || age < 0 ? 0 : Math.max(0, intervalMs - age)
         entry.timer = setTimeout(() => { void this.tick(panel.id, source.id).catch(() => {}) }, wait)
       }
     }
@@ -254,7 +260,8 @@ export class DataHub {
       // A failing source/observer must not permanently stop polling. Re-arm
       // only if this timer still belongs to the current source and watcher.
       if (this.timers.get(panelId)?.get(sourceId) === entry && !this.disposed) {
-        entry.timer = setTimeout(() => { void this.tick(panelId, sourceId).catch(() => {}) }, source.intervalSec * 1000)
+        const intervalMs = Math.max(1, Number.isFinite(source.intervalSec) ? source.intervalSec : 1) * 1000
+        entry.timer = setTimeout(() => { void this.tick(panelId, sourceId).catch(() => {}) }, intervalMs)
       }
     }
   }
@@ -292,7 +299,9 @@ export class DataHub {
     existing?.controller.abort()
     const controller = new AbortController()
     const promise = (async () => {
-      const reading = await runSource(source, this.resolveSecret, controller.signal)
+      const reading = this.allowPrivateHttp
+        ? await runSource(source, this.resolveSecret, controller.signal, { allowPrivateHttp: true })
+        : await runSource(source, this.resolveSecret, controller.signal)
       const current = this.store.find(panel.id)
       // A superseded run must not replace a new reading or erase its cache.
       const still = current?.definition.sources.find(s => s.id === sourceId)

@@ -20,8 +20,12 @@ import { PadClient } from './pad-client.ts'
 import { DOCK_CSS } from './styles.ts'
 import { recoverableSlot } from './recoverable-slot.ts'
 import { RenderBoundary } from './RenderBoundary.tsx'
+import { createWhalePanels, type WhalePanelProps } from './WhalePanels.tsx'
 
 declare module '@deepseek-ai/dsh-client-ui-slots' {
+  interface SlotMap {
+    'whale.panels': { kind: 'list'; scope: 'root'; owner: WhalePanelProps }
+  }
   interface LocaleNamespaceMap {
     /** The panel dock's copy. */
     'dsh-pad': PadKey
@@ -85,6 +89,21 @@ function start(ctx: ClientContext): void {
     order: 50,
     locale: NS,
   }, DockEntrance))
+
+  // Standalone Harness need not declare this slot. Whale Isle can declare it
+  // before or after Pad starts; register against the declaration's lifetime.
+  const WhalePanels = createWhalePanels(client)
+  function WhalePanelsEntrance(props: PropsRuntime<'whale.panels'> & PropsLocale<'dsh-pad'>) {
+    const snapshot = useSyncExternalStore(client.subscribe, client.getSnapshot)
+    const resetKey = JSON.stringify(snapshot.panels.map(panel => [panel.id, panel.version]))
+    return createElement(RenderBoundary, { t: props.t, resetKey }, createElement(WhalePanels, props))
+  }
+  ctx.slots.inject('whale.panels', () => ctx.slots.register({
+    name: 'whale.panels',
+    id: 'dsh-pad.whale',
+    registrant: 'dsh-pad.whale',
+    locale: NS,
+  }, WhalePanelsEntrance))
 
   recoverableSlot(ctx, 'conversation.input.overlay', 'dsh-pad.composer-bridge', () => ctx.slots.register({
     name: 'conversation.input.overlay',

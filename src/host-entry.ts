@@ -3,42 +3,51 @@ import { createHash, randomUUID } from 'node:crypto'
 import { readFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { fileURLToPath } from 'node:url'
+import { verifyHostBundle } from './host/bundle-integrity.ts'
 import { withRecoveredUpdate } from './host/update-transaction.ts'
 
 declare const __DSH_PAD_HOST_BODY__: string
 
+type HostPluginModule = typeof import('./index.ts') & {
+  readonly registerTools?: typeof import('./host/tools.ts').registerTools
+}
+
 const entryUrl = new URL(import.meta.url)
+const alreadyRecovered = entryUrl.searchParams.has('recovered')
 entryUrl.search = ''
 entryUrl.hash = ''
 const root = fileURLToPath(new URL('../', entryUrl))
-const body = __DSH_PAD_HOST_BODY__
-// Hold the same kernel mutex through recovery, identity verification and body
-// evaluation. Another updater cannot replace half the release in this window.
+const __dshPadHostBody = __DSH_PAD_HOST_BODY__
+const body = __dshPadHostBody
+// Hold recovery, identity verification and body evaluation together.
 const loaded = await withRecoveredUpdate(root, recovered => {
   const disk = readFileSync(entryUrl, 'utf8')
-  const marker = /\n\/\/ dsh-pad-build:([a-f0-9]{64})\n?$/.exec(disk)
-  if (marker === null || createHash('sha256').update(disk.slice(0, marker.index)).digest('hex') !== marker[1]) {
-    throw new Error('dsh-pad Host bundle is incomplete or corrupt; reinstall the complete release')
-  }
+  const markers = verifyHostBundle(disk)
   // A different process may have consumed the journal after this file was read.
   const bodyDigest = createHash('sha256').update(body).digest('hex')
-  const diskBodyDigest = /\/\/ dsh-pad-body:([a-f0-9]{64})\n/.exec(disk)?.[1]
-  return recovered || diskBodyDigest !== bodyDigest ? undefined : evaluateBody()
+  if (recovered || markers.bodyDigest !== bodyDigest) {
+    if (alreadyRecovered) {
+      throw new Error('宿主 bundle 重载后仍与磁盘版本不一致，已中止以避免无限递归')
+    }
+    return undefined
+  }
+  return evaluateBody()
 })
 // Release the mutex before self-importing: the new entry acquires it afresh.
-const plugin: typeof import('./index.ts') = loaded
-  ?? await import(`${entryUrl.href}?recovered=${randomUUID()}`)
+const plugin: HostPluginModule = loaded
+  ?? await import(`${entryUrl.href}?recovered=${randomUUID()}`) as HostPluginModule
 
-function evaluateBody(): typeof import('./index.ts') {
+function evaluateBody(): HostPluginModule {
   const module = { exports: {} }
   // Resolve platform peers relative to the installed plugin after recovery.
   // The platform packages support Node 22 require(ESM).
   const run = new Function('require', 'module', 'exports', '__dshPadModuleUrl', body)
   run(createRequire(entryUrl), module, module.exports, entryUrl.href)
-  return module.exports as typeof import('./index.ts')
+  return module.exports as HostPluginModule
 }
 
 export const name = plugin.name
 export const inject = plugin.inject
 export const Config = plugin.Config
 export const apply = plugin.apply
+export const registerTools = plugin.registerTools

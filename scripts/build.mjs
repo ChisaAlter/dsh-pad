@@ -10,11 +10,14 @@
  *   everything else is inlined, mirroring dsh's own client bundle preset.
  */
 import { readFileSync } from 'node:fs'
+import { fileURLToPath } from 'node:url'
 import { build, context } from 'esbuild'
 import { buildHost } from './host-build.mjs'
 
+const root = fileURLToPath(new URL('../', import.meta.url))
 const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'))
 const watch = process.argv.includes('--watch')
+const dev = process.argv.includes('--dev')
 
 /** Specifiers the dsh web shell seeds into the client module table. */
 const PLATFORM_MODULES = [
@@ -26,6 +29,7 @@ const PLATFORM_MODULES = [
 ]
 
 const client = {
+  absWorkingDir: root,
   entryPoints: ['src/client/index.ts'],
   outfile: 'lib/client.js',
   bundle: true,
@@ -35,7 +39,7 @@ const client = {
   jsx: 'automatic',
   sourcemap: 'linked',
   external: PLATFORM_MODULES,
-  define: { 'process.env.NODE_ENV': JSON.stringify(process.env.NODE_ENV ?? 'production') },
+  define: { 'process.env.NODE_ENV': JSON.stringify(dev ? 'development' : 'production') },
   banner: {
     js: `window.__ModuleLoader__.load({ id: ${JSON.stringify(pkg.name)}, factory: (require) => {\nvar module = { exports: {} }; var exports = module.exports;`,
   },

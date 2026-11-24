@@ -4,13 +4,66 @@
  * the in-memory copy loaded once at start.
  */
 import { createHash, randomUUID } from 'node:crypto'
-import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, rename, unlink, writeFile } from 'node:fs/promises'
 import { dirname } from 'node:path'
-import type { AgentRunState, Json, PanelDefinition, PanelModelSelection, PanelRecord, PanelSource } from '../shared/types.ts'
+import type { AgentRunState, Json, PanelDefinition, PanelModelSelection, PanelRecord, PanelSource, SourceParse } from '../shared/types.ts'
+import { assertPanelData } from '../shared/validate.ts'
+import { assertSourceJson } from './source-json.ts'
+
+export const MAX_PANELS = 32
+
+const RETRYABLE_RENAME_CODES = new Set(['EPERM', 'EACCES', 'EBUSY'])
+const RENAME_RETRY_DELAYS_MS = [20, 60, 150, 300]
+const PARSES = new Set<SourceParse>(['text', 'json', 'lines'])
+
+/**
+ * Atomically write a UTF-8 file via a unique temporary sibling and rename,
+ * retrying transient Windows file-lock errors (`EPERM`/`EACCES`/`EBUSY`) and
+ * always removing the temporary file if the rename does not succeed.
+ */
+export async function atomicWriteFile(file: string, content: string): Promise<void> {
+  await mkdir(dirname(file), { recursive: true })
+  const temp = `${file}.${process.pid}.${randomUUID()}.tmp`
+  let renamed = false
+  try {
+    await writeFile(temp, content, 'utf8')
+    for (let attempt = 0; ; attempt += 1) {
+      try {
+        await rename(temp, file)
+        renamed = true
+        return
+      } catch (error) {
+        const code = (error as NodeJS.ErrnoException).code
+        if (code === undefined || !RETRYABLE_RENAME_CODES.has(code) || attempt >= RENAME_RETRY_DELAYS_MS.length) {
+          throw error
+        }
+        await new Promise(resolve => setTimeout(resolve, RENAME_RETRY_DELAYS_MS[attempt]))
+      }
+    }
+  } finally {
+    if (!renamed) await unlink(temp).catch(() => {})
+  }
+}
 
 interface StoreFile {
   readonly version: 1
   readonly panels: readonly PanelRecord[]
+}
+
+export interface CreateOrUpdateOptions {
+  readonly data?: Json | undefined
+  /** Optional synchronous guard/lint hook invoked inside the transaction when creating or changing the definition. */
+  readonly beforeWrite?: (existing: PanelRecord | undefined) => void
+}
+
+export interface CreateOrUpdateResult {
+  readonly status: 'created' | 'updated' | 'unchanged'
+  readonly panel: PanelRecord
+  readonly dataUpdated: boolean
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
 
 /** Read a stored card span, defaulting to one column. */
@@ -18,16 +71,164 @@ function clampSpan(value: unknown): 1 | 2 | 3 {
   return value === 2 || value === 3 ? value : 1
 }
 
+function clampPositiveInt(value: unknown, fallback: number): number {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return fallback
+  return Math.max(1, Math.floor(value))
+}
+
+function normalizeSource(raw: unknown): PanelSource | undefined {
+  if (!isRecord(raw)) return undefined
+  const { id, kind, parse, intervalSec, timeoutMs } = raw
+  if (typeof id !== 'string' || id.trim() === '') return undefined
+  if (typeof parse !== 'string' || !PARSES.has(parse as SourceParse)) return undefined
+  const clampedInterval = clampPositiveInt(intervalSec, 1)
+  const validTimeout = typeof timeoutMs === 'number' && Number.isFinite(timeoutMs) && timeoutMs > 0
+    ? Math.floor(timeoutMs)
+    : undefined
+  const common = {
+    id,
+    parse: parse as SourceParse,
+    intervalSec: clampedInterval,
+    ...(validTimeout === undefined ? {} : { timeoutMs: validTimeout }),
+  }
+  if (kind === 'command') {
+    if (typeof raw['command'] !== 'string' || raw['command'].trim() === '') return undefined
+    return { ...common, kind: 'command', command: raw['command'] }
+  }
+  if (kind === 'http') {
+    const { url, method, headers, body } = raw
+    if (typeof url !== 'string') return undefined
+    let parsed: URL
+    try {
+      parsed = new URL(url)
+    } catch {
+      return undefined
+    }
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return undefined
+    if (method !== undefined && method !== 'GET' && method !== 'POST') return undefined
+    let normalizedHeaders: Record<string, string> | undefined
+    if (headers !== undefined) {
+      if (!isRecord(headers)) return undefined
+      normalizedHeaders = {}
+      for (const [k, v] of Object.entries(headers)) {
+        if (typeof v !== 'string') return undefined
+        normalizedHeaders[k] = v
+      }
+    }
+    if (body !== undefined && typeof body !== 'string') return undefined
+    return {
+      ...common,
+      kind: 'http',
+      url,
+      ...(method === undefined ? {} : { method }),
+      ...(normalizedHeaders === undefined ? {} : { headers: normalizedHeaders }),
+      ...(body === undefined ? {} : { body }),
+    }
+  }
+  return undefined
+}
+
+function normalizeModel(raw: unknown): PanelModelSelection | undefined {
+  if (!isRecord(raw)) return undefined
+  const { provider, model, reasoningEffort } = raw
+  if (typeof provider !== 'string' || provider.trim() === '') return undefined
+  if (typeof model !== 'string' || model.trim() === '') return undefined
+  if (reasoningEffort !== undefined && typeof reasoningEffort !== 'string') return undefined
+  return {
+    provider,
+    model,
+    ...(reasoningEffort === undefined ? {} : { reasoningEffort }),
+  }
+}
+
+function normalizeDefinition(raw: unknown): PanelDefinition | undefined {
+  if (!isRecord(raw)) return undefined
+  const { title, icon, html, css, script, height, sources, model, agent } = raw
+  if (typeof title !== 'string' || title.trim() === '') return undefined
+  if (typeof html !== 'string' || typeof css !== 'string' || typeof script !== 'string') return undefined
+  if (height !== 'auto' && (typeof height !== 'number' || !Number.isFinite(height) || height <= 0)) return undefined
+  if (!Array.isArray(sources)) return undefined
+  const normalizedSources: PanelSource[] = []
+  for (const item of sources) {
+    const checked = normalizeSource(item)
+    if (checked === undefined) return undefined
+    normalizedSources.push(checked)
+  }
+  let normalizedAgent: PanelDefinition['agent']
+  if (agent === null) {
+    normalizedAgent = null
+  } else if (agent !== undefined) {
+    if (!isRecord(agent) || typeof agent['instruction'] !== 'string' || agent['instruction'].trim() === '') return undefined
+    normalizedAgent = {
+      instruction: agent['instruction'],
+      everyMinutes: clampPositiveInt(agent['everyMinutes'], 15),
+    }
+  }
+  const normalizedModel = normalizeModel(model)
+  return {
+    title,
+    ...(typeof icon === 'string' && icon !== '' ? { icon } : {}),
+    html,
+    css,
+    script,
+    height,
+    sources: normalizedSources,
+    ...(normalizedModel === undefined ? {} : { model: normalizedModel }),
+    ...(normalizedAgent === undefined ? {} : { agent: normalizedAgent }),
+  }
+}
+
+function normalizeAgentData(raw: unknown): PanelRecord['agentData'] | undefined {
+  if (!isRecord(raw) || typeof raw['at'] !== 'string') return undefined
+  try {
+    assertSourceJson(raw['value'])
+  } catch {
+    return undefined
+  }
+  return { value: raw['value'] as Json, at: raw['at'] }
+}
+
+function normalizeAgentRun(raw: unknown): AgentRunState | undefined {
+  if (!isRecord(raw)) return undefined
+  const { status, lastRunAt, nextRunAt, error } = raw
+  if (status !== 'idle' && status !== 'running' && status !== 'failed') return undefined
+  return {
+    status,
+    ...(typeof lastRunAt === 'string' ? { lastRunAt } : {}),
+    ...(typeof nextRunAt === 'string' ? { nextRunAt } : {}),
+    ...(typeof error === 'string' ? { error } : {}),
+  }
+}
+
 /**
- * Drop fields an earlier version wrote that this one no longer reads. A whole
- * record is written back on every commit, so a dead key would otherwise be
- * carried in `panels.json` forever.
- * @param panel - one record as stored.
- * @returns the record with the removed fields stripped.
+ * Validate and normalize one persisted panel record, stripping legacy fields
+ * such as `approvedSources` and clamping source `intervalSec` to >= 1.
  */
-function migrate(panel: PanelRecord & { readonly approvedSources?: string }): PanelRecord {
-  const { approvedSources: _removedApproval, ...rest } = panel
-  return { ...rest, span: clampSpan(rest.span) }
+function normalizeRecord(raw: unknown): PanelRecord | undefined {
+  if (!isRecord(raw)) return undefined
+  const { id, version, position, collapsed, span, createdAt, updatedAt, definition, previous, agentData, agentRun } = raw
+  if (typeof id !== 'string' || id.trim() === '') return undefined
+  if (typeof version !== 'number' || !Number.isInteger(version) || version < 1) return undefined
+  if (typeof position !== 'number' || !Number.isFinite(position)) return undefined
+  if (typeof createdAt !== 'string' || typeof updatedAt !== 'string') return undefined
+  const normalizedDef = normalizeDefinition(definition)
+  if (normalizedDef === undefined) return undefined
+  const normalizedPrev = previous === undefined ? undefined : normalizeDefinition(previous)
+  const normalizedData = agentData === undefined ? undefined : normalizeAgentData(agentData)
+  const normalizedRun = agentRun === undefined ? undefined : normalizeAgentRun(agentRun)
+  return {
+    id,
+    version,
+    position,
+    collapsed: typeof collapsed === 'boolean' ? collapsed : false,
+    span: clampSpan(span),
+    createdAt,
+    updatedAt,
+    definition: normalizedDef,
+    ...(normalizedPrev === undefined ? {} : { previous: normalizedPrev }),
+    ...(normalizedData === undefined ? {} : { agentData: normalizedData }),
+    ...(normalizedRun === undefined ? {} : { agentRun: normalizedRun }),
+  }
 }
 
 /**
@@ -70,10 +271,26 @@ export class PanelStore {
       throw error
     }
     try {
-      const parsed = JSON.parse(text) as StoreFile
-      this.panels = [...parsed.panels]
-        .sort((a, b) => a.position - b.position)
-        .map(migrate)
+      const parsed = JSON.parse(text) as Partial<StoreFile>
+      if (!isRecord(parsed) || !Array.isArray(parsed.panels)) {
+        throw new Error('panels.json 缺少 panels 数组')
+      }
+      const seen = new Set<string>()
+      const valid: PanelRecord[] = []
+      let skipped = 0
+      for (const raw of parsed.panels) {
+        const record = normalizeRecord(raw)
+        if (record === undefined || seen.has(record.id)) {
+          skipped += 1
+          continue
+        }
+        seen.add(record.id)
+        valid.push(record)
+      }
+      if (skipped > 0) {
+        console.warn(`[dsh-pad] 加载 ${this.file} 时跳过了 ${skipped} 条损坏或重复的面板记录`)
+      }
+      this.panels = valid.sort((a, b) => a.position - b.position)
     } catch {
       await rename(this.file, `${this.file}.corrupt-${Date.now()}`)
       this.panels = []
@@ -101,10 +318,45 @@ export class PanelStore {
   }
 
   async create(definition: PanelDefinition, data?: Json): Promise<PanelRecord> {
+    const result = await this.createOrUpdate(definition, { data })
+    return result.panel
+  }
+
+  /**
+   * Create a panel or update an existing panel with the same title inside one
+   * serialized transaction, eliminating TOCTOU between duplicate detection,
+   * capacity check, validation/lint and persistence.
+   */
+  async createOrUpdate(definition: PanelDefinition, options: CreateOrUpdateOptions = {}): Promise<CreateOrUpdateResult> {
+    const { data, beforeWrite } = options
     return this.transaction(async () => {
-      // Resolve duplicates inside the transaction, including concurrent creates.
       const existing = this.panels.find(p => p.definition.title === definition.title)
-      if (existing !== undefined) return this.replaceDefinition(existing, definition, data)
+      if (existing !== undefined && JSON.stringify(existing.definition) === JSON.stringify(definition)) {
+        if (data !== undefined) {
+          assertPanelData(data)
+          if (!existing.definition.agent) {
+            throw new Error(`面板「${existing.definition.title}」没有 AI 刷新，data 只适用于有 agent 的面板`)
+          }
+          const updated: PanelRecord = { ...existing, agentData: { value: data, at: new Date().toISOString() } }
+          await this.replace(updated)
+          return { status: 'unchanged', panel: updated, dataUpdated: true }
+        }
+        return { status: 'unchanged', panel: existing, dataUpdated: false }
+      }
+      if (data !== undefined) {
+        assertPanelData(data)
+        if (!definition.agent) {
+          throw new Error(`面板「${definition.title}」没有 AI 刷新，data 只适用于有 agent 的面板`)
+        }
+      }
+      if (existing === undefined && this.panels.length >= MAX_PANELS) {
+        throw new Error(`最多只能创建 ${MAX_PANELS} 张面板，请先删除不需要的面板`)
+      }
+      beforeWrite?.(existing)
+      if (existing !== undefined) {
+        const panel = await this.replaceDefinition(existing, definition, data)
+        return { status: 'updated', panel, dataUpdated: data !== undefined }
+      }
       const now = new Date().toISOString()
       const panel: PanelRecord = {
         id: `p_${randomUUID().slice(0, 8)}`,
@@ -119,7 +371,7 @@ export class PanelStore {
         ...(definition.agent ? { agentRun: { status: 'idle', nextRunAt: nextRun(definition, now) } } : {}),
       }
       await this.commit([...this.panels, panel])
-      return panel
+      return { status: 'created', panel, dataUpdated: data !== undefined }
     })
   }
 
@@ -131,7 +383,14 @@ export class PanelStore {
   async updateDefinition(id: string, edit: (current: PanelRecord) => PanelDefinition, data?: Json): Promise<PanelRecord> {
     return this.transaction(() => {
       const current = this.get(id)
-      return this.replaceDefinition(current, edit(current), data)
+      const nextDef = edit(current)
+      if (data !== undefined) {
+        assertPanelData(data)
+        if (!nextDef.agent) {
+          throw new Error(`面板「${nextDef.title}」没有 AI 刷新，data 只适用于有 agent 的面板`)
+        }
+      }
+      return this.replaceDefinition(current, nextDef, data)
     })
   }
 
@@ -260,10 +519,7 @@ export class PanelStore {
   private async commit(panels: PanelRecord[]): Promise<void> {
     const ordered = [...panels].sort((a, b) => a.position - b.position)
     const snapshot: StoreFile = { version: 1, panels: ordered }
-    await mkdir(dirname(this.file), { recursive: true })
-    const temp = `${this.file}.${process.pid}.tmp`
-    await writeFile(temp, `${JSON.stringify(snapshot, null, 2)}\n`, 'utf8')
-    await rename(temp, this.file)
+    await atomicWriteFile(this.file, `${JSON.stringify(snapshot, null, 2)}\n`)
     this.panels = ordered
     for (const listener of this.listeners) {
       try {

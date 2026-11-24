@@ -8,17 +8,35 @@ import { existsSync } from 'node:fs'
 import { readFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import type { PadUpdateInfo, PadUpdateResponse } from '../shared/types.ts'
+import { verifyHostBundle } from './bundle-integrity.ts'
 import { replaceUpdateFiles, UPDATE_FILES, UPDATE_JOURNAL } from './update-transaction.ts'
 
 const REPO = 'ChisaAlter/dsh-pad'
 const RELEASE_FEED = `https://github.com/${REPO}/releases.atom`
+const RELEASE_TAG_PREFIX = `https://github.com/${REPO}/releases/tag/`
+const RELEASES_URL = `https://github.com/${REPO}/releases`
 const RAW_ROOT = `https://raw.githubusercontent.com/${REPO}`
 const REQUEST_TIMEOUT_MS = 15_000
 const FIRST_CHECK_DELAY_MS = 7_000
+const MAX_FEED_BYTES = 1024 * 1024
+export const MAX_UPDATE_FILE_BYTES = 2 * 1024 * 1024
+
+const ESCAPED_REPO = REPO.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+const RELEASE_TAG_HREF = new RegExp(`^https:\\/\\/github\\.com\\/${ESCAPED_REPO}\\/releases\\/tag\\/([^"'\\s/#?]+)$`)
+const ATOM_ENTRY = /<entry\b[^>]*>([\s\S]*?)<\/entry>/gi
+const ATOM_LINK = /<link\b[^>]*>/gi
+const LINK_HREF = /\bhref=(?:"([^"]*)"|'([^']*)')/i
+const CLIENT_FOOTER = /return module\.exports; \} \}\);(?:\r?\n\/\/# sourceMappingURL=[^\r\n]+)?\s*$/
 
 interface ParsedVersion {
   readonly parts: readonly string[]
   readonly pre?: readonly string[]
+}
+
+export interface StableRelease {
+  readonly tag: string
+  readonly version: string
+  readonly url: string
 }
 
 function parseVersion(value: string): ParsedVersion | undefined {
@@ -27,6 +45,129 @@ function parseVersion(value: string): ParsedVersion | undefined {
   const pre = match[4]?.split('.')
   if (pre?.some(part => /^\d+$/.test(part) && part.length > 1 && part[0] === '0')) return undefined
   return { parts: [match[1]!, match[2]!, match[3]!], pre }
+}
+
+/**
+ * Extract the highest stable SemVer release from the GitHub Atom feed.
+ * Only links under `https://github.com/${REPO}/releases/tag/<tag>` are accepted;
+ * prereleases and malformed/encoded traversal tags are skipped, and the returned
+ * URL is always rebuilt from the allowlisted prefix + encoded tag.
+ */
+export function parseLatestStableRelease(xml: string): StableRelease | undefined {
+  let best: StableRelease | undefined
+  for (const entryMatch of xml.matchAll(ATOM_ENTRY)) {
+    const entry = entryMatch[1] ?? ''
+    for (const linkMatch of entry.matchAll(ATOM_LINK)) {
+      const hrefMatch = LINK_HREF.exec(linkMatch[0])
+      const href = hrefMatch?.[1] ?? hrefMatch?.[2]
+      if (href === undefined) continue
+      const tagMatch = RELEASE_TAG_HREF.exec(href.trim())
+      if (tagMatch === null) continue
+      let tag: string
+      try {
+        tag = decodeURIComponent(tagMatch[1]!)
+      } catch {
+        continue
+      }
+      if (tag === '' || /[/\\\s\u0000-\u001f\u007f]/.test(tag) || tag.includes('..')) continue
+      const parsed = parseVersion(tag)
+      if (parsed === undefined || parsed.pre !== undefined) continue
+      const version = tag.replace(/^v/i, '')
+      if (best === undefined || compareVersions(version, best.version) > 0) {
+        best = {
+          tag,
+          version,
+          url: `${RELEASE_TAG_PREFIX}${encodeURIComponent(tag)}`,
+        }
+      }
+    }
+  }
+  return best
+}
+
+async function readLimitedText(response: Response, maxBytes: number, label: string): Promise<string> {
+  const declared = response.headers.get('content-length')
+  if (declared !== null) {
+    const length = Number(declared)
+    if (Number.isFinite(length) && length > maxBytes) {
+      await response.body?.cancel().catch(() => {})
+      throw new Error(`${label}: 响应体积超过上限（${Math.round(maxBytes / 1024)} KB）`)
+    }
+  }
+  const reader = response.body?.getReader()
+  if (reader !== undefined) {
+    const chunks: Uint8Array[] = []
+    let total = 0
+    try {
+      for (;;) {
+        const { done, value } = await reader.read()
+        if (done) break
+        total += value.byteLength
+        if (total > maxBytes) {
+          await reader.cancel().catch(() => {})
+          throw new Error(`${label}: 响应体积超过上限（${Math.round(maxBytes / 1024)} KB）`)
+        }
+        chunks.push(value)
+      }
+    } finally {
+      reader.releaseLock()
+    }
+    return Buffer.concat(chunks).toString('utf8')
+  }
+  const text = await response.text()
+  if (Buffer.byteLength(text, 'utf8') > maxBytes) {
+    throw new Error(`${label}: 响应体积超过上限（${Math.round(maxBytes / 1024)} KB）`)
+  }
+  return text
+}
+
+function isRelativePath(value: unknown, expected: string): boolean {
+  return value === expected || value === `./${expected}`
+}
+
+function validateReleaseFiles(contents: ReadonlyMap<string, string>, latest: string): void {
+  const manifest = JSON.parse(contents.get('package.json') ?? '') as {
+    name?: unknown
+    version?: unknown
+    main?: unknown
+    exports?: Record<string, unknown>
+    dsh?: { bundle?: { patch?: unknown } }
+  }
+  if (manifest === null || typeof manifest !== 'object' || manifest.name !== 'dsh-pad' || manifest.version !== latest) {
+    throw new Error('release manifest does not match dsh-pad@' + latest)
+  }
+  if (!isRelativePath(manifest.main, 'lib/index.js')) {
+    throw new Error('release manifest main must point to lib/index.js')
+  }
+  if (!isRelativePath(manifest.exports?.['./client'], 'lib/client.js')) {
+    throw new Error('release manifest exports["./client"] must point to lib/client.js')
+  }
+  if (!isRelativePath(manifest.dsh?.bundle?.patch, 'cordis.patch.yml')) {
+    throw new Error('release manifest dsh.bundle.patch must point to cordis.patch.yml')
+  }
+
+  const hostBundle = contents.get('lib/index.js') ?? ''
+  const clientBundle = contents.get('lib/client.js') ?? ''
+  if (hostBundle.length < 1000 || clientBundle.length < 1000) {
+    throw new Error('release bundles are incomplete')
+  }
+  // The loader rejects a bundle without valid EOF-anchored markers; refuse to
+  // journal one that would leave the plugin unloadable after restart.
+  verifyHostBundle(hostBundle)
+
+  if (!clientBundle.trimStart().startsWith('window.__ModuleLoader__.load(') || !CLIENT_FOOTER.test(clientBundle)) {
+    throw new Error('client bundle closure is incomplete or invalid')
+  }
+
+  const patch = contents.get('cordis.patch.yml') ?? ''
+  if (
+    patch.trim() === '' ||
+    !/^\s*-\s+insert\s*:/m.test(patch) ||
+    !/^\s*(?:-\s+)?id\s*:\s*["']?dsh-pad["']?\s*$/m.test(patch) ||
+    !/^\s*(?:-\s+)?name\s*:\s*["']?dsh-pad["']?\s*$/m.test(patch)
+  ) {
+    throw new Error('cordis.patch.yml is missing a valid dsh-pad entry')
+  }
 }
 
 /** Compare decimal identifiers without losing precision for long numeric tags. */
@@ -161,20 +302,19 @@ export class UpdateService {
         signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
       })
       if (!response.ok) throw new Error(`GitHub ${response.status}`)
-      const xml = await response.text()
+      const xml = await readLimitedText(response, MAX_FEED_BYTES, 'releases.atom')
       // A check that started before apply must not replace its committed or
       // pending-recovery status when the delayed feed finally settles.
       if (this.applied !== undefined || this.state.requiresRestart || this.pendingRecovery()) return this.state
-      // The newest entry is first; its <link> is the release tag page.
-      const match = /<entry>[\s\S]*?<link[^>]+href="([^"]+\/releases\/tag\/([^"/]+))"/.exec(xml)
-      const tag = match?.[2] ?? ''
-      const url = match?.[1] ?? `https://github.com/${REPO}/releases`
-      const latest = tag.replace(/^v/i, '')
-      const available = latest !== '' && compareVersions(latest, this.current) > 0
+      const release = parseLatestStableRelease(xml)
+      const tag = release?.tag
+      const url = release?.url ?? RELEASES_URL
+      const latest = release?.version
+      const available = latest !== undefined && compareVersions(latest, this.current) > 0
       this.tag = tag
       this.state = {
         current: this.current,
-        latest: latest === '' ? undefined : latest,
+        latest,
         available,
         canApply: available && !this.source,
         reason: available ? (this.source ? 'source' : 'available') : 'up-to-date',
@@ -225,7 +365,7 @@ export class UpdateService {
           signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
         })
         if (!response.ok) throw new Error(`${file}: GitHub ${response.status}`)
-        return [file, await response.text()] as const
+        return [file, await readLimitedText(response, MAX_UPDATE_FILE_BYTES, file)] as const
       }))
       for (const [file, content] of fetched) contents.set(file, content)
     } catch (error) {
@@ -233,13 +373,7 @@ export class UpdateService {
     }
 
     try {
-      const manifest = JSON.parse(contents.get('package.json') ?? '') as { name?: unknown, version?: unknown }
-      if (manifest.name !== 'dsh-pad' || manifest.version !== latest) {
-        throw new Error('release manifest does not match dsh-pad@' + latest)
-      }
-      if ((contents.get('lib/index.js') ?? '').length < 1000 || (contents.get('lib/client.js') ?? '').length < 1000) {
-        throw new Error('release bundles are incomplete')
-      }
+      validateReleaseFiles(contents, latest)
     } catch (error) {
       return this.fail(`校验失败：${error instanceof Error ? error.message : String(error)}`)
     }

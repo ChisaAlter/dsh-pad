@@ -1,16 +1,22 @@
-import { mkdir, mkdtemp, readFile, rename, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { describe, expect, it } from 'vitest'
-import { PanelStore } from '../src/host/store.ts'
+import { afterEach, describe, expect, it } from 'vitest'
+import { MAX_PANELS, PanelStore } from '../src/host/store.ts'
 import type { PanelDefinition } from '../src/shared/types.ts'
 
 const definition: PanelDefinition = {
   title: 'T', html: '', css: '', script: '', height: 'auto', sources: [],
 }
 
+const tempDirs: string[] = []
+afterEach(async () => {
+  for (const dir of tempDirs.splice(0)) await rm(dir, { recursive: true, force: true })
+})
+
 async function fixture() {
   const dir = await mkdtemp(join(tmpdir(), 'dsh-pad-transactions-'))
+  tempDirs.push(dir)
   const file = join(dir, 'panels.json')
   return { dir, file, store: new PanelStore(file) }
 }
@@ -59,17 +65,62 @@ describe('PanelStore transactions', () => {
     expect(notifications).toHaveLength(4)
   })
 
-  it('does not leak a rejected update into a queued mutation or its undo definition', async () => {
-    const { store, dir } = await fixture()
+  it('does not leak a rejected update into a queued mutation or its undo definition and cleans up temp files', async () => {
+    const { store, dir, file } = await fixture()
     const panel = await store.create(definition)
-    const temp = join(dir, `panels.json.${process.pid}.tmp`)
-    await mkdir(temp)
+    // Replace the target file with a directory so atomic rename fails deterministically.
+    await rm(file, { force: true })
+    await mkdir(file)
     await expect(store.update(panel.id, { ...definition, title: 'Failed' })).rejects.toThrow()
     expect(store.get(panel.id)).toBe(panel)
-    await rename(temp, join(dir, 'blocking-temp-directory'))
+    const leftoverTmp = (await readdir(dir)).filter(name => name.endsWith('.tmp'))
+    expect(leftoverTmp).toEqual([])
+    await rm(file, { recursive: true, force: true })
     await store.setCollapsed(panel.id, true)
     expect(store.get(panel.id)).toMatchObject({ collapsed: true, version: 1, definition: { title: 'T' } })
     expect(store.get(panel.id).previous).toBeUndefined()
+  })
+
+  it('caps panel count at MAX_PANELS while still allowing updates to existing titles', async () => {
+    const { store } = await fixture()
+    for (let i = 0; i < MAX_PANELS; i += 1) {
+      await store.create({ ...definition, title: `Panel ${i}` })
+    }
+    await expect(store.create({ ...definition, title: 'One too many' })).rejects.toThrow(/最多只能创建/)
+    const updated = await store.create({ ...definition, title: 'Panel 0', css: 'b{}' })
+    expect(updated.version).toBe(2)
+    expect(store.list()).toHaveLength(MAX_PANELS)
+  })
+
+  it('validates loaded records, clamps invalid intervalSec >= 1 and skips malformed entries', async () => {
+    const { file } = await fixture()
+    await writeFile(file, JSON.stringify({
+      version: 1,
+      panels: [
+        {
+          id: 'p_good',
+          version: 1,
+          position: 0,
+          collapsed: false,
+          span: 1,
+          createdAt: '2026-01-01T00:00:00.000Z',
+          updatedAt: '2026-01-01T00:00:00.000Z',
+          definition: {
+            title: 'Good',
+            html: '',
+            css: '',
+            script: '',
+            height: 'auto',
+            sources: [{ id: 'a', kind: 'command', command: 'echo 1', parse: 'text', intervalSec: 0 }],
+          },
+        },
+        { id: 'p_bad', version: 1, position: 1, definition: { title: '', sources: 'not-an-array' } },
+      ],
+    }))
+    const loaded = new PanelStore(file)
+    await loaded.load()
+    expect(loaded.list()).toHaveLength(1)
+    expect(loaded.get('p_good').definition.sources[0]?.intervalSec).toBe(1)
   })
 
   it('deduplicates simultaneous creates using the latest committed titles', async () => {

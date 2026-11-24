@@ -184,4 +184,63 @@ describe('PanelRunner', () => {
     expect(result.ok).toBe(false)
     expect(result.error).toMatch(/关闭/)
   })
+
+  it('enforces global concurrency across panels and sliding-window quota', async () => {
+    let release: () => void = () => {}
+    const blocked = new Promise<void>(resolve => { release = resolve })
+    const ctx = { get: (name: string) => name === 'llm' ? {
+      stream: async function* () {
+        await blocked
+        yield { type: 'text-delta', text: 'ok' }
+      },
+    } : undefined } as unknown as Context
+    const panel2 = { ...panel, id: 'p_other' }
+    const runner = new PanelRunner(ctx, {
+      ...DEFAULT_RUN_OPTIONS,
+      concurrency: 2,
+      globalConcurrency: 1,
+      minIntervalMs: 0,
+      windowLimit: 2,
+      windowMs: 60_000,
+    })
+    const first = runner.run(panel, 'a')
+    expect((await runner.run(panel2, 'b')).error).toMatch(/全局同时进行/)
+    release()
+    expect(await first).toEqual({ ok: true, text: 'ok' })
+    expect(await runner.run(panel2, 'c')).toEqual({ ok: true, text: 'ok' })
+    expect((await runner.run(panel, 'd')).error).toMatch(/时间窗上限/)
+    runner.dispose()
+  })
+
+  it('aborts the upstream stream as soon as maxOutputChars is reached', async () => {
+    let signal: AbortSignal | undefined
+    let yieldedAfterLimit = false
+    const ctx = { get: (name: string) => name === 'llm' ? {
+      stream: async function* (options: { signal: AbortSignal }) {
+        signal = options.signal
+        yield { type: 'text-delta', text: '12345' }
+        yield { type: 'text-delta', text: '67890overflow' }
+        yieldedAfterLimit = true
+        yield { type: 'text-delta', text: 'never' }
+      },
+    } : undefined } as unknown as Context
+    const runner = new PanelRunner(ctx, { ...DEFAULT_RUN_OPTIONS, maxOutputChars: 8, minIntervalMs: 0 })
+    const result = await runner.run(panel, 'go')
+    expect(result).toEqual({ ok: true, text: '12345678' })
+    expect(signal?.aborted).toBe(true)
+    expect(yieldedAfterLimit).toBe(false)
+    runner.dispose()
+  })
+
+  it('clears per-panel rate limit state when forgetPanel is called', async () => {
+    const runner = new PanelRunner(context([{ type: 'text-delta', text: 'hi' }]), {
+      ...DEFAULT_RUN_OPTIONS,
+      minIntervalMs: 60_000,
+    })
+    expect(await runner.run(panel, 'one')).toEqual({ ok: true, text: 'hi' })
+    expect((await runner.run(panel, 'two')).error).toMatch(/刚调用过/)
+    runner.forgetPanel(panel.id)
+    expect(await runner.run(panel, 'three')).toEqual({ ok: true, text: 'hi' })
+    runner.dispose()
+  })
 })

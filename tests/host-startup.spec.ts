@@ -105,4 +105,63 @@ describe('Host activation ownership', () => {
       await env.ctx.fiber.dispose()
     }
   })
+
+  it('exports registerTools, blocks DSH_/DSHD_ secrets and disables updater when running in desktop', async () => {
+    const env = await environment()
+    expect(typeof env.plugin.registerTools).toBe('function')
+    env.unblock()
+    const savedUrl = process.env['DSH_DESKTOP_INSTALL_URL']
+    const savedDsh = process.env['DSH_INTERNAL_TEST']
+    const savedDshd = process.env['DSHD_INTERNAL_TEST']
+    const savedSafe = process.env['PAD_SAFE_TEST']
+    const secretsSym = Symbol.for('whaleisle.internalSecrets')
+    const savedSecrets = Reflect.get(globalThis, secretsSym)
+    process.env['DSH_INTERNAL_TEST'] = 'secret-dsh'
+    process.env['DSHD_INTERNAL_TEST'] = 'secret-dshd'
+    process.env['PAD_SAFE_TEST'] = 'safe-val'
+    delete process.env['DSH_DESKTOP_INSTALL_URL']
+    const fiber = env.ctx.plugin(env.plugin, { ...env.config, updateCheck: true }).ctx.fiber
+    try {
+      await fiber.await()
+      const testTool = env.tools.get('pad_test_source') as { execute(args: unknown, exec: unknown): Promise<string> }
+      const dshResult = await testTool.execute(
+        { source: { id: 'a', kind: 'http', url: 'https://example.com/?k={{env:DSH_INTERNAL_TEST}}', parse: 'text' } },
+        { signal: new AbortController().signal },
+      )
+      expect(dshResult).toMatch(/密钥 DSH_INTERNAL_TEST 没有配置/)
+      const dshdResult = await testTool.execute(
+        { source: { id: 'b', kind: 'http', url: 'https://example.com/?k={{env:dshd_internal_test}}', parse: 'text' } },
+        { signal: new AbortController().signal },
+      )
+      expect(dshdResult).toMatch(/密钥 dshd_internal_test 没有配置/)
+      await fiber.dispose()
+
+      // When DSH_DESKTOP_INSTALL_URL is present, UpdateService is disabled even if updateCheck is true.
+      process.env['DSH_DESKTOP_INSTALL_URL'] = 'http://127.0.0.1:1'
+      const desktopEnv = await environment()
+      desktopEnv.unblock()
+      const desktopFiber = desktopEnv.ctx.plugin(desktopEnv.plugin, { ...desktopEnv.config, updateCheck: true }).ctx.fiber
+      try {
+        await desktopFiber.await()
+        const updateRoute = desktopEnv.routes.get('/api/dsh-pad.update') as { fetch(req: Request): Promise<Response> }
+        const res = await updateRoute.fetch(new Request('http://local/api/dsh-pad.update'))
+        const body = await res.json() as { reason: string }
+        expect(body.reason).toBe('disabled')
+      } finally {
+        await desktopEnv.ctx.fiber.dispose()
+      }
+    } finally {
+      if (savedUrl === undefined) delete process.env['DSH_DESKTOP_INSTALL_URL']
+      else process.env['DSH_DESKTOP_INSTALL_URL'] = savedUrl
+      if (savedDsh === undefined) delete process.env['DSH_INTERNAL_TEST']
+      else process.env['DSH_INTERNAL_TEST'] = savedDsh
+      if (savedDshd === undefined) delete process.env['DSHD_INTERNAL_TEST']
+      else process.env['DSHD_INTERNAL_TEST'] = savedDshd
+      if (savedSafe === undefined) delete process.env['PAD_SAFE_TEST']
+      else process.env['PAD_SAFE_TEST'] = savedSafe
+      if (savedSecrets === undefined) Reflect.deleteProperty(globalThis, secretsSym)
+      else Reflect.set(globalThis, secretsSym, savedSecrets)
+      await env.ctx.fiber.dispose()
+    }
+  })
 })
